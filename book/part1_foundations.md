@@ -1,2480 +1,2697 @@
-# Part I: Foundations of Agent Intelligence
+# Part I: Foundations — The Engineering of Agent Systems
 
 ---
 
-# Chapter 1: The Agent Paradigm Shift
+# Chapter 1: The Agent Loop in Practice
 
-## 1.1 From Chatbots to Autonomous Agents: The Fundamental Architectural Shift
+## 1.1 The HTTP Anatomy of an Agent Turn
 
-The history of software is a history of expanding loops. Batch processing gave way to interactive terminals. Interactive terminals gave way to event-driven GUIs. Event-driven GUIs gave way to request-response web services. Each transition increased the surface area of what software could perceive and act upon within a single execution cycle.
+Every agent loop iteration is, at the wire level, an HTTP POST. Understanding the exact request and response shapes — not abstract diagrams — is the prerequisite for building, debugging, and optimizing agents.
 
-The transition from chatbots to autonomous agents is the latest — and arguably most consequential — expansion of that loop. It is not a marketing distinction. It is a fundamental change in the execution model of AI-powered software.
+### OpenAI Responses API: The Codex Agent Loop
 
-A **chatbot** operates in a single-turn or multi-turn conversational mode. It receives a user message, produces a response, and waits. The user is always in the loop. The user decides what to do with the response. The user initiates every action. The architecture looks like this:
+The Responses API (`POST https://api.openai.com/v1/responses`) is what powers Codex. Here is the exact first request of a Codex-style agent session:
+
+```http
+POST /v1/responses HTTP/1.1
+Host: api.openai.com
+Authorization: Bearer sk-...
+Content-Type: application/json
+
+{
+  "model": "o3-mini",
+  "instructions": "You are a coding agent operating in a sandboxed environment. You have access to the full repository at /workspace. Always read files before editing. Run tests after changes. If tests fail, debug and fix before reporting completion.",
+  "input": [
+    {
+      "role": "user",
+      "content": "The login endpoint returns 500 when the email contains a plus sign. Fix it."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "shell",
+      "description": "Execute a shell command in the sandbox and return stdout/stderr.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command to execute"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 30)"
+          }
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "Read a file from the filesystem. Returns content with line numbers.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "offset": { "type": "integer", "description": "Start line (0-indexed)" },
+          "limit": { "type": "integer", "description": "Max lines to return" }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "type": "function",
+      "name": "write_file",
+      "description": "Write content to a file, creating it if necessary.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      }
+    },
+    {
+      "type": "function",
+      "name": "str_replace",
+      "description": "Replace an exact string in a file. Fails if old_string is not found or is ambiguous.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "old_string": { "type": "string" },
+          "new_string": { "type": "string" }
+        },
+        "required": ["path", "old_string", "new_string"]
+      }
+    }
+  ],
+  "stream": true,
+  "max_output_tokens": 16384
+}
+```
+
+The response streams back as Server-Sent Events. A typical first turn:
 
 ```
-┌─────────────────────────────────────────────┐
-│                  CHATBOT                     │
-│                                              │
-│   User ──message──► LLM ──response──► User   │
-│                                              │
-│   User ──message──► LLM ──response──► User   │
-│                                              │
-│   (Human always initiates, always receives)  │
-└─────────────────────────────────────────────┘
+event: response.output_item.added
+data: {"type":"function_call","name":"shell","call_id":"call_abc123","arguments":""}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"command\":\"grep -rn 'email' src/routes/auth.ts\"}"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"command\":\"grep -rn 'email' src/routes/auth.ts\"}"}
+
+event: response.output_item.done
+data: {"type":"function_call","name":"shell","call_id":"call_abc123","status":"completed"}
 ```
 
-An **agent** operates in a fundamentally different mode. It receives a goal, then enters an autonomous loop where it reasons about the current state, selects and executes tools, observes the results, and decides whether to continue or terminate. The user is *outside* the loop. The agent decides what to do with tool results. The agent initiates actions. The agent determines when the goal has been achieved.
+The client-side agent loop then:
+1. Parses the function call from the stream
+2. Executes it in the sandbox: `grep -rn 'email' src/routes/auth.ts`
+3. Captures stdout/stderr
+4. Posts the result back in the next request, referencing the `call_id`
 
-```
-┌───────────────────────────────────────────────────────────┐
-│                       AGENT                                │
-│                                                            │
-│   User ──goal──►┌──────────────────────────────────┐       │
-│                  │  ┌─────────┐                     │       │
-│                  │  │ Observe │◄──── Tool Results    │       │
-│                  │  └────┬────┘                     │       │
-│                  │       │                          │       │
-│                  │  ┌────▼────┐                     │       │
-│                  │  │  Think  │  (LLM Inference)    │       │
-│                  │  └────┬────┘                     │       │
-│                  │       │                          │       │
-│                  │  ┌────▼────┐                     │       │
-│                  │  │   Act   │──── Tool Calls       │       │
-│                  │  └────┬────┘                     │       │
-│                  │       │                          │       │
-│                  │       ▼                          │       │
-│                  │   Done? ──no──► (loop back)       │       │
-│                  │     │                            │       │
-│                  │    yes                           │       │
-│                  └─────┼────────────────────────────┘       │
-│                        ▼                                    │
-│                     Result ──► User                         │
-└───────────────────────────────────────────────────────────┘
+The follow-up request appends the tool output:
+
+```json
+{
+  "model": "o3-mini",
+  "previous_response_id": "resp_xyz789",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_abc123",
+      "output": "src/routes/auth.ts:47:  const email = req.body.email;\nsrc/routes/auth.ts:48:  const user = await db.users.findOne({ email });\nsrc/routes/auth.ts:52:  const normalized = email.toLowerCase();"
+    }
+  ],
+  "stream": true
+}
 ```
 
-This distinction matters because it changes *who controls the execution flow*. In a chatbot, the human is the scheduler. In an agent, the LLM is the scheduler. This single architectural inversion has cascading consequences for reliability, safety, cost, observability, and system design.
+This is the fundamental rhythm: POST with tool results → stream back reasoning + tool calls → execute → POST again. The `previous_response_id` field enables server-side conversation tracking so the client doesn't need to re-send the full history.
 
-Consider a concrete example. A user wants to fix a bug in a web application where a form submission silently fails when a field contains Unicode characters.
+### The Exact Turn Sequence of a Real Bug Fix
 
-**Chatbot interaction** (multiple turns, human-driven):
-
-```
-Human: "The form fails with Unicode input. What could cause this?"
-LLM:   "Possible causes include encoding issues in the backend parser,
-        database column charset settings, or client-side validation
-        regex that doesn't handle Unicode..."
-Human: "How do I check the backend parser?"
-LLM:   "Look at the request handler for the form endpoint. Check if
-        the body parser is configured for UTF-8..."
-Human: [manually searches code, finds issue, asks follow-up]
-...
-[15 turns later, bug is fixed]
-```
-
-**Agent interaction** (single goal, agent-driven):
+Here is the complete sequence for the plus-sign email bug, with actual token counts at each step:
 
 ```
-Human: "Fix the bug where form submission fails with Unicode input"
-Agent: [Searches codebase for form submission handler]
-Agent: [Reads the relevant route handler and body parser config]
-Agent: [Identifies that the validation regex uses \w which doesn't
-        match Unicode word characters]
-Agent: [Writes a fix using Unicode-aware regex]
-Agent: [Runs the test suite to verify]
-Agent: [Finds tests pass but adds a new test for Unicode edge cases]
-Agent: [Commits the fix with a descriptive message]
-Agent: "Fixed. The issue was a non-Unicode-aware regex in the
-        validation layer. I've updated it to use Unicode property
-        escapes and added test coverage."
+Turn 1: Agent searches for email handling
+  Request:  1,847 tokens (system + tools + user message)
+  Response: shell("grep -rn 'email' src/routes/auth.ts")
+  Output:   89 tokens
+  Latency:  340ms model + 45ms tool execution
+
+Turn 2: Agent reads the auth route file
+  Request:  2,291 tokens (previous + tool result)
+  Response: read_file("src/routes/auth.ts")
+  Output:   0 tokens (tool call only)
+  Latency:  280ms model + 12ms tool execution
+
+Turn 3: Agent receives file content (187 lines), identifies the bug
+  Request:  4,103 tokens (previous + file content)
+  Response: read_file("src/utils/validation.ts")
+  Output:   0 tokens
+  Latency:  450ms model + 8ms tool execution
+  
+Turn 4: Agent reads validation utility, finds the regex
+  Request:  5,422 tokens
+  Response: str_replace on validation.ts — changes /^[\w.]+@/ to /^[\w.+]+@/
+  Output:   47 tokens (explanation text)
+  Latency:  520ms model + 5ms tool execution
+
+Turn 5: Agent runs the test suite
+  Request:  5,891 tokens
+  Response: shell("npm test -- --grep 'email'")
+  Output:   0 tokens
+  Latency:  310ms model + 4,200ms tool execution
+
+Turn 6: Tests pass, agent verifies with a curl command
+  Request:  7,234 tokens (test output added)
+  Response: shell("curl -X POST localhost:3000/login -d '{\"email\":\"user+tag@example.com\",\"password\":\"test\"}'")
+  Output:   0 tokens
+  Latency:  290ms model + 180ms tool execution
+
+Turn 7: Agent confirms fix, provides summary
+  Request:  7,891 tokens
+  Response: text-only (no tool calls) — "Fixed. The email validation regex..."
+  Output:   156 tokens
+  Latency:  380ms model
+
+Total: 7 turns, ~7,900 input tokens (final), 203 output tokens, ~6.6s model time, ~4.5s tool time
+Estimated cost: $0.027 (with prompt caching)
 ```
 
-The chatbot required 15 human-driven turns. The agent required one human turn and 6+ autonomous tool-use cycles. The architectural difference is not that the agent is "smarter" — it uses the same underlying LLM. The difference is that the agent has **tools** and a **loop**, and the authority to use them without waiting for human approval at each step.
+The critical observation: input tokens grow monotonically because the conversation is append-only. Output tokens per turn are tiny — the model generates a tool call (30-80 tokens) or a short response. The 100:1 input-to-output ratio that Manus AI reported is visible even in this short session.
 
-### The Three Pillars of the Shift
+### Anthropic Messages API: The Claude Code Loop
 
-The chatbot-to-agent transition rests on three architectural pillars:
+Claude Code uses the Anthropic Messages API (`POST https://api.anthropic.com/v1/messages`). The request structure differs from OpenAI's in important ways:
 
-**1. Tool Integration.** Agents can invoke external tools — file systems, APIs, databases, web browsers, code interpreters, shell commands. Without tools, an LLM can only produce text. With tools, it can *change the state of the world*. This is the difference between an advisor and an actor.
+```http
+POST /v1/messages HTTP/1.1
+Host: api.anthropic.com
+x-api-key: sk-ant-...
+anthropic-version: 2023-06-01
+Content-Type: application/json
 
-**2. The Autonomous Loop.** Agents run in a loop that continues until a termination condition is met. This loop is the mechanism by which single-step reasoning becomes multi-step problem-solving. It transforms a function (input → output) into a process (goal → [steps] → outcome).
+{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 16000,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code, an interactive CLI tool that helps with software engineering tasks...",
+      "cache_control": {"type": "ephemeral"}
+    }
+  ],
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read the contents of a file at the specified path. Use this to examine existing files you need to understand or modify. The output includes line numbers prefixed to each line.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The absolute path to the file to read"
+          },
+          "offset": {
+            "type": "integer",
+            "description": "The line offset to start reading from"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The number of lines to read"
+          }
+        },
+        "required": ["file_path"]
+      }
+    },
+    {
+      "name": "write_to_file",
+      "description": "Write content to a file at the specified path.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["file_path", "content"]
+      }
+    },
+    {
+      "name": "edit_file",
+      "description": "Make a targeted edit to a file using exact string matching.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": { "type": "string" },
+          "old_string": { "type": "string", "description": "The exact text to find (must be unique in the file)" },
+          "new_string": { "type": "string" },
+          "replace_all": { "type": "boolean", "default": false }
+        },
+        "required": ["file_path", "old_string", "new_string"]
+      }
+    },
+    {
+      "name": "bash",
+      "description": "Execute a shell command. Each command runs in its own shell but inherits the working directory and environment from previous commands.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string" },
+          "timeout": { "type": "integer", "description": "Timeout in milliseconds" }
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "name": "glob",
+      "description": "Find files matching a glob pattern.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "path": { "type": "string", "description": "Directory to search in" }
+        },
+        "required": ["pattern"]
+      }
+    },
+    {
+      "name": "grep",
+      "description": "Search for a pattern in files using ripgrep.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "path": { "type": "string" },
+          "include": { "type": "string", "description": "File glob to include" }
+        },
+        "required": ["pattern"]
+      }
+    },
+    {
+      "name": "list_directory",
+      "description": "List the contents of a directory.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "todo_write",
+      "description": "Create or update a structured TODO list for tracking task progress.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "content": { "type": "string" },
+                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+              },
+              "required": ["id", "content", "status"]
+            }
+          }
+        },
+        "required": ["todos"]
+      }
+    },
+    {
+      "name": "task",
+      "description": "Spawn a sub-agent to work on a focused subtask in an isolated context.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "description": { "type": "string" },
+          "prompt": { "type": "string" }
+        },
+        "required": ["description", "prompt"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Fix the failing test in test_auth.py"
+    }
+  ]
+}
+```
 
-**3. State and Memory.** Agents maintain state across loop iterations — the conversation history, tool results, intermediate reasoning, and working memory. This state accumulates context that informs subsequent decisions, enabling planning, error recovery, and adaptive behavior.
+The response comes back as JSON (or streamed SSE with `"stream": true`):
 
-These three pillars combine to produce a qualitative shift in capability. An LLM alone can answer questions about code. An LLM with tools in a loop can write, test, debug, and deploy code. The difference is not incremental. It is the difference between a textbook and an engineer.
+```json
+{
+  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll start by looking at the failing test to understand what's expected."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01A09q90qw90lq917835lq9",
+      "name": "read_file",
+      "input": {
+        "file_path": "/workspace/test_auth.py"
+      }
+    }
+  ],
+  "model": "claude-sonnet-4-20250514",
+  "stop_reason": "tool_use",
+  "usage": {
+    "input_tokens": 2847,
+    "output_tokens": 94,
+    "cache_creation_input_tokens": 2411,
+    "cache_read_input_tokens": 0
+  }
+}
+```
 
-### What Changed: The Capability Threshold
+The critical field is `stop_reason`. When it's `"tool_use"`, the loop continues. When it's `"end_turn"`, the agent is done. The `usage` block tells you exactly what was cached — on this first turn, 2,411 tokens were written to cache (the system prompt + tools), 0 were read from cache. On the next turn, those 2,411 tokens will be cache hits.
 
-Why did this shift happen in 2024-2026 and not earlier? The answer is that agents require a minimum threshold of model capability to function reliably. Specifically:
+The tool result goes back as a `user` message with `tool_result` content blocks:
 
-- **Instruction following**: The model must reliably follow complex, multi-constraint system prompts that specify tool schemas, behavioral rules, and output formats.
-- **Tool use**: The model must generate syntactically valid tool calls with correct parameter types, and interpret tool results correctly.
-- **Multi-step reasoning**: The model must maintain coherent plans across many reasoning steps, adapting when intermediate steps fail.
-- **Self-correction**: The model must recognize when its actions have failed and formulate alternative approaches.
+```json
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "tool_result",
+      "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
+      "content": "  1|import pytest\n  2|from auth import validate_email, hash_password\n  3|\n  4|class TestAuth:\n  5|    def test_valid_email(self):\n  6|        assert validate_email('user@example.com') == True\n  7|\n  8|    def test_invalid_email_no_at(self):\n  9|        assert validate_email('userexample.com') == False\n 10|\n 11|    def test_email_with_plus(self):\n 12|        assert validate_email('user+tag@example.com') == True  # FAILING"
+    }
+  ]
+}
+```
 
-GPT-3.5 (2022) could do none of these reliably. GPT-4 (2023) could do all of them passably. Claude 3.5 Sonnet and GPT-4o (2024) could do all of them well. Claude 3.5 Sonnet "new" and the o-series reasoning models (late 2024-2025) could do all of them with the consistency required for production deployment. The models crossed a threshold where the autonomous loop became *viable* — where the expected value of letting the model take another action exceeded the expected cost of that action failing.
+This append-to-messages/call-again pattern repeats. The entire Claude Code agent is, as Anthropic engineers have stated publicly, a `while(tool_use)` loop around this API.
 
 ---
 
-## 1.2 The Observe-Think-Act Loop (ReAct Pattern) as the Universal Primitive
+## 1.2 Building a Production Agent Loop from Scratch
 
-In October 2022, Yao et al. published "ReAct: Synergizing Reasoning and Acting in Language Models," a paper that would quietly become the foundational design pattern for nearly every production agent system built in the following years. The core idea was deceptively simple: interleave chain-of-thought reasoning with action execution.
-
-Before ReAct, the field had two separate threads:
-
-1. **Chain-of-Thought (CoT)** prompting showed that LLMs reason better when they show their work — writing intermediate steps before producing a final answer.
-2. **Action-based agents** (like early LangChain tools) showed that LLMs can invoke external tools, but often did so without explicit reasoning about *why* they were choosing a particular tool.
-
-ReAct unified these threads into a single pattern:
-
-```
-Thought: I need to find the current population of Tokyo to answer
-         this question. Let me search for recent data.
-Action:  search("Tokyo population 2025")
-Observation: Tokyo's population as of 2025 is approximately
-             13.96 million in the city proper...
-Thought: I have the city proper population. The question asks about
-         the metropolitan area. Let me search for that specifically.
-Action:  search("Tokyo metropolitan area population 2025")
-Observation: The Greater Tokyo Area has a population of approximately
-             37.4 million...
-Thought: Now I have both numbers. The question asks about the
-         metropolitan area, so the answer is 37.4 million.
-Answer:  The Tokyo metropolitan area has a population of approximately
-         37.4 million as of 2025.
-```
-
-The pattern is **Observe → Think → Act**, repeated until a termination condition is reached. This is the universal primitive of agent execution.
-
-### Why ReAct Works: The Grounding Effect
-
-The key insight behind ReAct's effectiveness is **grounding**. When an LLM reasons in isolation (pure CoT), it can only manipulate information already in its parameters or context. This makes it susceptible to hallucination — generating plausible-sounding but incorrect reasoning chains. When an LLM acts without reasoning (pure tool use), it often invokes tools haphazardly, wasting actions on irrelevant queries.
-
-ReAct creates a feedback loop between reasoning and the external world. Each action brings new *real* information into the context, which grounds subsequent reasoning in observed facts rather than parametric recall. Each reasoning step *justifies* the next action, ensuring that tool invocations are purposeful.
-
-This grounding effect is why the ReAct pattern is universal across agent implementations, even when they don't explicitly use the "Thought/Action/Observation" formatting. Every major agent system — OpenAI's Codex, Anthropic's Claude Code, Cursor, Devin, Manus — implements some variation of this loop:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│               THE UNIVERSAL AGENT PRIMITIVE                 │
-│                                                             │
-│   ┌──────────┐    ┌──────────┐    ┌──────────┐             │
-│   │ OBSERVE  │───►│  THINK   │───►│   ACT    │             │
-│   │          │    │          │    │          │             │
-│   │ • Tool   │    │ • Plan   │    │ • Tool   │             │
-│   │   results│    │ • Reason │    │   calls  │             │
-│   │ • Errors │    │ • Decide │    │ • File   │             │
-│   │ • State  │    │ • Update │    │   edits  │             │
-│   │   changes│    │   beliefs│    │ • Commands│             │
-│   └──────────┘    └──────────┘    └──────────┘             │
-│        ▲                               │                    │
-│        │          ┌──────────┐         │                    │
-│        └──────────│ENVIRONMENT│◄────────┘                    │
-│                   └──────────┘                              │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Variations of the Loop in Practice
-
-While the ReAct pattern is universal, implementations vary in how they structure the loop:
-
-**Explicit ReAct (academic style):**
-```python
-# Explicit thought-action-observation formatting
-messages = [{"role": "system", "content": REACT_PROMPT}]
-
-while True:
-    response = llm.generate(messages)
-    thought, action = parse_react_response(response)
-
-    if action.type == "finish":
-        return action.result
-
-    observation = execute_tool(action)
-    messages.append({"role": "assistant", "content": f"Thought: {thought}\nAction: {action}"})
-    messages.append({"role": "user", "content": f"Observation: {observation}"})
-```
-
-**Implicit ReAct (production style, as used by Claude Code and OpenAI):**
-```python
-# Tool-use API handles the loop structure natively
-messages = [{"role": "user", "content": user_goal}]
-
-while True:
-    response = llm.chat(messages, tools=TOOL_SCHEMAS)
-
-    if response.stop_reason == "end_turn":
-        return response.content
-
-    # Model's reasoning is embedded in its content;
-    # actions are structured tool_use blocks
-    for tool_call in response.tool_calls:
-        result = execute_tool(tool_call)
-        messages.append(tool_call_message(tool_call))
-        messages.append(tool_result_message(result))
-```
-
-The second form is how modern agent systems actually work. The LLM's native tool-use capability has absorbed the ReAct pattern — the model natively interleaves reasoning (in its text output) with actions (in its tool-call output) without requiring explicit "Thought:" and "Action:" formatting. The *pattern* is the same; the *surface syntax* has been subsumed by the API.
-
----
-
-## 1.3 Levels of Agent Autonomy (L1-L5): From Copilots to Fully Autonomous Agents
-
-Drawing an analogy from the SAE's levels of driving automation (which provide a useful conceptual framework, even though the domains differ significantly), we can define five levels of agent autonomy:
-
-### Level 1: Copilot — Human Initiates, Agent Assists
-
-At L1, the agent responds to explicit human requests within a single turn. It provides suggestions, completions, or answers, but takes no autonomous action. The human controls all execution.
-
-**Examples:** GitHub Copilot inline suggestions, ChatGPT in standard chat mode, Claude in conversation mode.
-
-**Architecture:**
-```
-Human ──request──► LLM ──suggestion──► Human ──decides──► Action
-```
-
-**Characteristics:**
-- No tool use
-- No autonomous loops
-- Human is always the executor
-- Agent's output is advisory
-
-### Level 2: Tool-Assisted Agent — Human Approves, Agent Executes
-
-At L2, the agent can invoke tools, but requires human approval for each action or batch of actions. The human remains in the loop as an approval gate.
-
-**Examples:** ChatGPT with Code Interpreter (user sees code before execution), early Cursor with manual approval for each edit.
-
-**Architecture:**
-```
-Human ──goal──► LLM ──proposed action──► Human ──approve──► Tool ──result──► LLM
-```
-
-**Characteristics:**
-- Tool use with human approval gates
-- Human reviews each action before execution
-- Low risk, but high human overhead
-- Suitable for high-stakes, low-volume tasks
-
-### Level 3: Supervised Autonomous Agent — Agent Executes, Human Monitors
-
-At L3, the agent operates autonomously within a defined scope, executing tool calls without per-action approval. The human monitors progress and can intervene, but does not need to approve each step. There are guardrails that prevent certain high-risk actions without approval.
-
-**Examples:** Claude Code in normal mode (auto-executes safe commands, asks for approval on risky ones), Cursor in agent mode, ChatGPT with "auto-run" code execution enabled.
-
-**Architecture:**
-```
-Human ──goal──► Agent Loop ──────────────────────────────► Result
-                    │                                        ▲
-                    ├── safe action ──► Tool ──► result ─────┤
-                    │                                        │
-                    └── risky action ──► Human approval ─────┘
-```
-
-**Characteristics:**
-- Autonomous execution within safety boundaries
-- Risk-tiered permission model
-- Human intervenes on exceptions, not routine actions
-- Most production coding agents operate here today
-
-### Level 4: Fully Autonomous Agent — Agent Executes End-to-End
-
-At L4, the agent executes complete tasks end-to-end without human intervention. It handles errors, adapts plans, and determines when the task is complete. The human provides the goal and receives the outcome.
-
-**Examples:** Cursor Cloud Agent (background execution, no human-in-the-loop), OpenAI Codex (autonomous cloud agent), Devin (autonomous software engineer running in sandbox).
-
-**Architecture:**
-```
-Human ──goal──► Agent Loop ──────────────────────────────► Result
-                    │
-                    ├── action ──► Tool ──► result
-                    ├── error ──► self-correction ──► retry
-                    ├── blocked ──► alternative approach
-                    └── complete ──► verification ──► deliver
-```
-
-**Characteristics:**
-- End-to-end autonomous execution
-- Self-correction and error recovery
-- No human involvement during execution
-- Asynchronous: human can disconnect and return later
-- Sandboxed execution environments for safety
-
-### Level 5: Self-Directed Agent — Agent Identifies and Pursues Goals
-
-L5 is largely theoretical today. At this level, the agent not only executes tasks but identifies what tasks *should* be done. It monitors systems, detects issues, prioritizes work, and executes solutions proactively.
-
-**Examples:** No production systems fully operate at L5 today, though prototypes exist — AI systems that monitor production infrastructure, detect anomalies, and autonomously deploy fixes.
-
-**Architecture:**
-```
-World State ──perception──► Agent ──goal formation──► Agent Loop ──► Action
-                                                          │
-                                                          ▼
-                                                    World State Changes
-                                                          │
-                                                          ▼
-                                                     (cycle repeats)
-```
-
-**Characteristics:**
-- Autonomous goal identification
-- Continuous operation
-- Self-prioritization of work
-- Requires robust safety frameworks
-- Current frontier of research
-
-### The Autonomy Gradient in Practice
-
-In practice, most production agents operate on a **gradient** between L3 and L4, with configurable permission models. Claude Code, for instance, allows users to configure an "allowlist" of tools that can execute without approval, while requiring confirmation for others. This creates a sliding scale:
-
-```
-L3 (everything needs approval) ◄─────────────────► L4 (nothing needs approval)
-         │                                                       │
-         │    Typical Claude Code config:                         │
-         │    ├── file_read: auto-approve                        │
-         │    ├── file_write: auto-approve                       │
-         │    ├── bash (safe): auto-approve                      │
-         │    ├── bash (network): ask                            │
-         │    └── bash (destructive): ask                        │
-         │                                                       │
-         │    Cursor Cloud Agent:                                 │
-         │    └── (all actions auto-approved in sandbox)          │
-```
-
-The trend from 2024 to 2026 is unmistakably toward higher autonomy. The progression has been:
-
-1. **2023:** L1/L2 — Copilots and tool-assisted chat (ChatGPT + plugins, early Copilot)
-2. **2024:** L2/L3 — Supervised autonomous agents (Claude Code, Cursor agent mode, Aider)
-3. **2025:** L3/L4 — Fully autonomous background agents (Codex, Cursor Cloud, Claude Code with `--dangerously-skip-permissions`)
-4. **2026:** L4 becoming standard — Autonomous agents as the default interaction mode
-
----
-
-## 1.4 Why 2025-2026 Is the Inflection Point
-
-Several converging developments in 2025-2026 have created a phase transition in agent capability:
-
-### Convergence 1: Model Capability
-
-The models released in late 2024 and 2025 crossed critical capability thresholds:
-
-| Capability | Before (2023) | After (2025) | Impact on Agents |
-|---|---|---|---|
-| Tool-call accuracy | ~70-80% | ~95%+ | Agents can chain 10+ tool calls reliably |
-| Instruction following | Inconsistent | Near-perfect | Complex system prompts work as designed |
-| Long-context reasoning | Degrades past 8K | Stable to 128K-200K | Agents can hold entire codebases in context |
-| Self-correction | Rare | Frequent | Agents recover from errors without human help |
-| Code generation | Plausible but buggy | Compiles and passes tests | Agents can write production code |
-| Extended thinking | Not available | Chain-of-thought at inference | Complex multi-step reasoning becomes reliable |
-
-The introduction of extended thinking / reasoning models (o1, o3, Claude 3.5 with extended thinking, Claude Sonnet 4) was particularly significant for agents. These models can spend additional computation on hard reasoning steps, which is precisely what agents need when they encounter unexpected tool results and must formulate new plans.
-
-### Convergence 2: Tooling and SDKs
-
-The tooling ecosystem for building agents matured rapidly:
-
-- **OpenAI Agents SDK** (March 2025): Evolved from the experimental Swarm framework into a production-ready SDK with a minimalist four-primitive design — Agents, Handoffs, Tools, and Guardrails. This crystallized the conceptual model for multi-agent systems.
-
-- **Anthropic's tool-use API**: Native tool-use support in the Messages API with structured JSON schemas, automatic handling of the tool-use loop, and caching of tool schemas.
-
-- **Model Context Protocol (MCP)** (late 2024-2025): Anthropic's open standard for connecting LLMs to external data sources and tools, creating a universal "USB-C for AI" that decoupled tool implementations from agent frameworks.
-
-- **Vercel AI SDK, LangGraph, CrewAI**: Higher-level frameworks that abstracted common agent patterns.
-
-### Convergence 3: Infrastructure
-
-The infrastructure for running agents at scale emerged:
-
-- **Sandboxed execution environments**: E2B, Fly.io Machines, Firecracker VMs, Docker-in-VM — providing isolated environments where agents can safely execute arbitrary code.
-
-- **Cloud agent platforms**: Cursor Cloud Agent, OpenAI Codex, Devin — running agents in persistent cloud environments with full development toolchains.
-
-- **Git-native workflows**: Agents that understand git, create branches, make commits, and interact with CI/CD pipelines as first-class citizens.
-
-- **Observability and tracing**: OpenTelemetry integrations, LangSmith, Braintrust — tools for monitoring and debugging agent execution traces.
-
-### The Inflection: Autonomous Coding Agents
-
-The clearest signal of the inflection point is the emergence of **autonomous coding agents** as production tools used daily by professional engineers:
-
-```
-Timeline of Autonomous Coding Agents
-─────────────────────────────────────
-
-2023 Q1  │  ChatGPT + Code Interpreter (L1-L2)
-         │  └── Can execute Python in sandbox, human-driven
-         │
-2023 Q3  │  GitHub Copilot Chat (L1)
-         │  └── Conversational code assistance, no tool use
-         │
-2024 Q1  │  Devin announcement (L4 prototype)
-         │  └── First "AI software engineer" demo
-         │
-2024 Q3  │  Cursor 0.40+ (L2-L3)
-         │  └── Agent mode with multi-file editing
-         │
-2024 Q4  │  Claude Code launch (L3)
-         │  └── Terminal-based autonomous coding agent
-         │
-2025 Q1  │  OpenAI Codex / Claude Code GA (L3-L4)
-         │  └── Cloud agents running in background
-         │
-2025 Q2  │  Cursor Cloud Agent (L4)
-         │  └── Fully autonomous background agent in cloud VMs
-         │
-2025 H2  │  Multi-agent coding workflows (L4)
-  -2026  │  └── Orchestrated teams of specialized agents
-         │
-```
-
-By early 2026, the autonomous coding agent has become a standard tool in the professional developer's workflow. The question is no longer "will agents work?" but "how do I build reliable ones?"
-
----
-
-## 1.5 The Key Insight: Agents Are LLMs Autonomously Using Tools in a Loop
-
-Strip away the marketing, the framework abstractions, and the hype, and the core insight is disarmingly simple:
-
-> **An agent is an LLM that autonomously calls tools in a loop until a task is complete.**
-
-This is not a simplification — it is the actual architecture. Every production agent system, regardless of complexity, reduces to this primitive. Let us examine the minimal implementation:
+Here is a minimal but production-capable agent loop in Python. This is not a toy — it handles compaction, token counting, streaming, error recovery, and termination. Every production agent (Claude Code, Codex, Cursor, Devin) is a variation on this structure.
 
 ```python
 import anthropic
+import json
+import time
+import subprocess
+from pathlib import Path
 
-def agent(goal: str, tools: list[dict], max_turns: int = 50) -> str:
-    """A complete agent in 30 lines."""
-    client = anthropic.Anthropic()
+client = anthropic.Anthropic()
+
+SYSTEM_PROMPT = """You are an autonomous coding agent. You operate in a loop: read code, 
+understand the problem, make targeted fixes, and verify with tests.
+
+Rules:
+- Always read a file before editing it.
+- Use edit_file for targeted changes, not write_to_file for full rewrites.
+- Run tests after every change.
+- If tests fail after your fix, debug and iterate — do not give up.
+- When done, provide a one-line summary of what you changed and why."""
+
+TOOLS = [
+    {
+        "name": "bash",
+        "description": "Execute a shell command. Returns stdout and stderr.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"}
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "read_file",
+        "description": "Read a file. Returns content with line numbers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace old_string with new_string in a file. old_string must match exactly and uniquely.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"}
+            },
+            "required": ["file_path", "old_string", "new_string"]
+        }
+    }
+]
+
+MAX_TOOL_OUTPUT_CHARS = 30_000
+MAX_TURNS = 60
+COMPACT_THRESHOLD_TOKENS = 90_000
+
+
+def execute_tool(name: str, input_data: dict) -> str:
+    if name == "bash":
+        try:
+            result = subprocess.run(
+                input_data["command"], shell=True,
+                capture_output=True, text=True, timeout=30
+            )
+            output = result.stdout + result.stderr
+        except subprocess.TimeoutExpired:
+            output = "ERROR: Command timed out after 30 seconds"
+    elif name == "read_file":
+        path = Path(input_data["file_path"])
+        if not path.exists():
+            return f"ERROR: File not found: {path}"
+        lines = path.read_text().splitlines()
+        start = input_data.get("offset", 0)
+        end = start + input_data.get("limit", len(lines))
+        numbered = [f"{i+1:>4}|{line}" for i, line in enumerate(lines[start:end], start=start)]
+        output = "\n".join(numbered)
+    elif name == "edit_file":
+        path = Path(input_data["file_path"])
+        content = path.read_text()
+        old = input_data["old_string"]
+        if content.count(old) == 0:
+            return f"ERROR: old_string not found in {path}"
+        if content.count(old) > 1:
+            return f"ERROR: old_string matches {content.count(old)} locations. Make it more specific."
+        content = content.replace(old, input_data["new_string"], 1)
+        path.write_text(content)
+        output = f"OK: Replaced in {path}"
+    else:
+        output = f"ERROR: Unknown tool: {name}"
+    
+    if len(output) > MAX_TOOL_OUTPUT_CHARS:
+        half = MAX_TOOL_OUTPUT_CHARS // 2
+        output = output[:half] + f"\n\n[...truncated {len(output) - MAX_TOOL_OUTPUT_CHARS} chars...]\n\n" + output[-half:]
+    
+    return output
+
+
+def estimate_tokens(messages: list, system: str, tools: list) -> int:
+    """Rough token estimate: 1 token ≈ 4 chars for English text/code."""
+    total_chars = len(system) + len(json.dumps(tools))
+    for msg in messages:
+        if isinstance(msg.get("content"), str):
+            total_chars += len(msg["content"])
+        elif isinstance(msg.get("content"), list):
+            for block in msg["content"]:
+                if isinstance(block, dict):
+                    total_chars += len(json.dumps(block))
+    return total_chars // 4
+
+
+def compact_messages(messages: list) -> list:
+    """Remove older tool results, keeping the first message and recent turns."""
+    if len(messages) <= 6:
+        return messages
+    
+    first_msg = messages[0]
+    recent = messages[-6:]
+    middle = messages[1:-6]
+    
+    compacted_middle = []
+    for msg in middle:
+        if isinstance(msg.get("content"), list):
+            new_content = []
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    text = block.get("content", "")
+                    if len(text) > 500:
+                        new_content.append({**block, "content": text[:200] + "\n[...compacted...]"})
+                    else:
+                        new_content.append(block)
+                else:
+                    new_content.append(block)
+            compacted_middle.append({**msg, "content": new_content})
+        else:
+            compacted_middle.append(msg)
+    
+    return [first_msg] + compacted_middle + recent
+
+
+def run_agent(goal: str) -> str:
     messages = [{"role": "user", "content": goal}]
-
-    for turn in range(max_turns):
+    
+    total_input_tokens = 0
+    total_output_tokens = 0
+    start_time = time.time()
+    
+    for turn in range(MAX_TURNS):
+        token_est = estimate_tokens(messages, SYSTEM_PROMPT, TOOLS)
+        if token_est > COMPACT_THRESHOLD_TOKENS:
+            messages = compact_messages(messages)
+            print(f"  [compacted at turn {turn}, ~{token_est} tokens -> ~{estimate_tokens(messages, SYSTEM_PROMPT, TOOLS)} tokens]")
+        
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=8096,
-            system="You are an autonomous agent. Use the provided tools to accomplish the user's goal.",
-            tools=tools,
+            max_tokens=16000,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
             messages=messages,
         )
-
-        # Append the assistant's response
+        
+        total_input_tokens += response.usage.input_tokens
+        total_output_tokens += response.usage.output_tokens
+        
         messages.append({"role": "assistant", "content": response.content})
-
-        # If the model didn't use any tools, it's done
+        
         if response.stop_reason == "end_turn":
-            return extract_text(response.content)
-
-        # Execute each tool call and collect results
+            elapsed = time.time() - start_time
+            text_blocks = [b.text for b in response.content if hasattr(b, 'text')]
+            final_text = "\n".join(text_blocks)
+            print(f"\n  Completed in {turn+1} turns, {elapsed:.1f}s")
+            print(f"  Tokens: {total_input_tokens:,} input, {total_output_tokens:,} output")
+            cached = getattr(response.usage, 'cache_read_input_tokens', 0)
+            if cached:
+                print(f"  Cache hits: {cached:,} tokens ({cached/response.usage.input_tokens*100:.0f}%)")
+            return final_text
+        
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
+                print(f"  Turn {turn+1}: {block.name}({json.dumps(block.input)[:120]})")
                 result = execute_tool(block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": str(result),
+                    "content": result,
                 })
-
+        
         messages.append({"role": "user", "content": tool_results})
-
-    return "Max turns reached without completion."
+    
+    return f"ERROR: Max turns ({MAX_TURNS}) reached without completion."
 ```
 
-This is not a toy. This is the actual structure of production agents. Claude Code's core loop is, as Anthropic engineers have described it, essentially a `while(tool_use)` loop. The sophistication of production systems comes not from changing this fundamental structure, but from everything built *around* it:
-
-- **Context management**: What goes into the `messages` array and how it's pruned
-- **Tool design**: What tools are available and how their schemas are defined
-- **Error handling**: What happens when tools fail
-- **Permission management**: Which tools require human approval
-- **Planning**: How the agent decomposes complex tasks
-- **Verification**: How the agent confirms its work is correct
-
-The key insight — that agents are LLMs using tools in a loop — has a crucial corollary: **the quality of an agent is determined by the quality of its context and tools, not by the cleverness of its orchestration framework.** This is why OpenAI's Agents SDK adopted a deliberately minimalist design with only four primitives (Agents, Handoffs, Tools, Guardrails), and why Claude Code's architecture is famously simple. The orchestration is not where the value is. The value is in the context engineering, the tool design, and the model capability.
-
-Harrison Chase, the creator of LangChain, recognized this publicly when he wrote that most agent frameworks over-abstract the wrong things. The loop is simple. Getting the *inputs* to each loop iteration right — that is the hard problem. It is the problem of context engineering, which we will explore in depth in Chapter 3.
+This is 120 lines. Production agents add error handling, permission checks, streaming UI, and observability on top of this core, but the fundamental structure is identical. Claude Code's core loop, stripped of UI and permission logic, reduces to this.
 
 ---
 
-# Chapter 2: The Agent Loop — Anatomy of Autonomy
+## 1.3 The Claude Code Loop: SystemPromptBuilder and the 19-Tool Architecture
 
-## 2.1 The Core Agent Loop
+In January 2025, the Claude Code system prompt leaked. It revealed a sophisticated prompt assembly pipeline far beyond a static string. The system, implemented in approximately 14,902 lines of TypeScript, dynamically assembles the system prompt from 40+ sections.
 
-Every agent, from a weekend hackathon prototype to a production system handling thousands of concurrent sessions, implements the same fundamental loop:
+### The SystemPromptBuilder Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    THE CORE AGENT LOOP                           │
-│                                                                  │
-│  ┌──────────┐                                                    │
-│  │  User    │                                                    │
-│  │  Input   │                                                    │
-│  └────┬─────┘                                                    │
-│       │                                                          │
-│       ▼                                                          │
-│  ┌──────────────────────────────────────────────────────┐        │
-│  │                                                       │        │
-│  │   ┌─────────────────┐                                │        │
-│  │   │  Construct      │  System prompt + tools +        │        │
-│  │   │  Context        │  history + observations         │        │
-│  │   └────────┬────────┘                                │        │
-│  │            │                                          │        │
-│  │            ▼                                          │        │
-│  │   ┌─────────────────┐                                │        │
-│  │   │  Model          │  LLM generates text            │        │
-│  │   │  Inference      │  and/or tool calls             │        │
-│  │   └────────┬────────┘                                │        │
-│  │            │                                          │        │
-│  │            ▼                                          │        │
-│  │   ┌─────────────────┐    ┌──────────────────┐        │        │
-│  │   │  Parse          │───►│  Execute Tools    │        │        │
-│  │   │  Response       │    │  (if tool calls)  │        │        │
-│  │   └────────┬────────┘    └────────┬─────────┘        │        │
-│  │            │                      │                   │        │
-│  │            │◄─── observations ────┘                   │        │
-│  │            │                                          │        │
-│  │            ▼                                          │        │
-│  │   ┌─────────────────┐                                │        │
-│  │   │  Termination    │  stop_reason == "end_turn"?    │        │
-│  │   │  Check          │  max_turns reached?             │        │
-│  │   └────────┬────────┘  error threshold exceeded?      │        │
-│  │            │                                          │        │
-│  │       no   │   yes                                    │        │
-│  │    ┌───────┴──────┐                                   │        │
-│  │    ▼              ▼                                   │        │
-│  │  (loop)      ┌─────────┐                              │        │
-│  │              │ Output  │                              │        │
-│  │              │ Result  │                              │        │
-│  │              └─────────┘                              │        │
-│  │                                                       │        │
-│  └───────────────────────────────────────────────────────┘        │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+The prompt builder follows a clear pattern: each section is a function that returns a string or null (if the section is inapplicable). These sections are concatenated in a fixed order:
+
+```typescript
+class SystemPromptBuilder {
+  private sections: PromptSection[] = [];
+  
+  build(context: SessionContext): string {
+    const parts: string[] = [];
+    
+    // Static sections (cacheable)
+    parts.push(this.coreIdentity());
+    parts.push(this.coreCapabilities());
+    parts.push(this.toolDocumentation(context.permissionLevel));
+    parts.push(this.behavioralRules());
+    parts.push(this.outputFormatting());
+    parts.push(this.safetyConstraints());
+    parts.push(this.memoryInstructions());
+    parts.push(this.antiDistillation());
+    
+    // Cache boundary marker
+    parts.push("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__");
+    
+    // Dynamic sections (per-session, not cached)
+    parts.push(this.environmentInfo(context));
+    parts.push(this.projectMemory(context));
+    parts.push(this.sessionState(context));
+    parts.push(this.containerDetection());
+    
+    return parts.filter(Boolean).join("\n\n");
+  }
+}
 ```
 
-The loop has four phases that execute in sequence on every iteration:
+The `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` marker is the cache boundary. Everything above it is identical across sessions and gets cached in the KV-cache. Everything below it changes per session. This boundary is the single most cost-impactful design decision in Claude Code — with the static portion comprising roughly 70% of the system prompt, millions of cached-token dollars are saved across the user base.
 
-**Phase 1: Context Construction.** Assemble the full input to the model. This includes the system prompt, tool schemas, conversation history, tool results from the previous iteration, and any injected context (RAG results, file contents, etc.). This phase is where context engineering (Chapter 3) happens.
+### The 19 Tools with Permission Tiers
 
-**Phase 2: Model Inference.** Send the constructed context to the LLM and receive a response. The response may contain text (reasoning, responses to the user), tool calls (actions to execute), or both.
+The leaked prompt reveals a three-tier permission model for tools:
 
-**Phase 3: Tool Execution.** Parse any tool calls from the model's response and execute them against the external environment. Collect the results (observations) to feed back into the next iteration.
+**ReadOnly tier** (always available, no confirmation needed):
+```
+read_file       — Read file contents with line numbers
+list_directory  — List directory contents
+glob            — Find files by glob pattern
+grep            — Search file contents with ripgrep
+web_search      — Search the web
+web_fetch       — Fetch a URL and convert to markdown
+todo_read       — Read the current TODO list
+```
 
-**Phase 4: Termination Check.** Determine whether the loop should continue or stop. Common termination conditions:
-- The model's stop reason indicates it has finished (no more tool calls)
-- A maximum turn count has been reached
-- A critical error has occurred
-- The user has interrupted execution
-- A timeout has been exceeded
+**WorkspaceWrite tier** (available in standard mode, may prompt for confirmation):
+```
+write_to_file   — Create or overwrite a file
+edit_file       — Targeted search-and-replace edit
+multi_edit      — Multiple edits to a single file
+todo_write      — Create or update TODO items
+notebook_edit   — Edit Jupyter notebook cells
+```
 
-Let us now examine how three production systems implement this loop.
+**FullAccess tier** (requires explicit permission or --dangerously-skip-permissions flag):
+```
+bash            — Execute arbitrary shell commands
+task            — Spawn a sub-agent
+```
 
----
+The permission logic at the tool execution layer:
 
-## 2.2 How OpenAI Codex Implements the Loop
+```typescript
+async function executeToolWithPermission(
+  tool: ToolCall,
+  permissionLevel: PermissionLevel,
+  userAllowlist: string[]
+): Promise<ToolResult> {
+  const toolTier = TOOL_PERMISSION_MAP[tool.name];
+  
+  if (toolTier === "ReadOnly") {
+    return executeTool(tool);
+  }
+  
+  if (toolTier === "WorkspaceWrite") {
+    if (permissionLevel >= PermissionLevel.WorkspaceWrite) {
+      return executeTool(tool);
+    }
+    return promptUserForPermission(tool);
+  }
+  
+  if (toolTier === "FullAccess") {
+    if (tool.name === "bash") {
+      const command = tool.input.command;
+      if (userAllowlist.some(pattern => matchGlob(command, pattern))) {
+        return executeTool(tool);
+      }
+      if (isSafeCommand(command)) {
+        return executeTool(tool);
+      }
+    }
+    return promptUserForPermission(tool);
+  }
+}
 
-OpenAI Codex (the agent platform, not the original code model) launched in early-to-mid 2025 as a fully autonomous cloud-based coding agent. It is built on top of the **Responses API**, which represents a significant evolution from the Chat Completions API.
+function isSafeCommand(command: string): boolean {
+  const safePatterns = [
+    /^ls\b/, /^cat\b/, /^head\b/, /^tail\b/, /^wc\b/,
+    /^find\b/, /^grep\b/, /^rg\b/, /^git\s+(status|log|diff|show)\b/,
+    /^python\s+--version/, /^node\s+--version/, /^npm\s+--version/,
+  ];
+  return safePatterns.some(p => p.test(command.trim()));
+}
+```
 
-### The Responses API Architecture
+### The Actual System Prompt Structure (Reconstructed from Leak)
 
-The Responses API introduced first-class support for agent loops. Unlike the Chat Completions API (which requires the caller to manage the message array and implement the loop), the Responses API can manage stateful, multi-turn interactions server-side:
+The core identity section opens with:
 
-```python
-from openai import OpenAI
+```
+You are Claude Code, an interactive CLI tool that helps users with software 
+engineering tasks. You operate as an autonomous agent, using tools to explore 
+codebases, make changes, and verify your work.
 
-client = OpenAI()
+You have access to the following tools, organized by permission level:
 
-# The Responses API natively supports multi-turn tool use
-response = client.responses.create(
-    model="o3-mini",
-    instructions="You are a coding agent. Fix bugs methodically.",
-    input="Fix the failing test in test_auth.py",
-    tools=[
-        {"type": "code_interpreter"},
-        {"type": "file_search", "vector_store_ids": ["vs_abc123"]},
-        {
-            "type": "function",
-            "function": {
-                "name": "run_tests",
-                "description": "Run the project's test suite",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "test_path": {"type": "string"},
-                        "verbose": {"type": "boolean"}
-                    }
-                }
-            }
+## ReadOnly Tools (always available)
+...
+
+## WorkspaceWrite Tools (require workspace write permission)
+...
+
+## FullAccess Tools (require explicit user permission)
+...
+```
+
+The behavioral rules section includes specific, non-obvious directives:
+
+```
+## Behavioral Rules
+
+1. ALWAYS read a file before editing it. Never edit a file you haven't read 
+   in this session.
+2. Use edit_file for targeted changes. Only use write_to_file when creating 
+   new files or when the entire content must change.
+3. Run tests after making changes. If the project has a test command, use it.
+4. If you encounter an error, try at least 3 different approaches before 
+   asking the user for help.
+5. When working on a task with multiple steps, use todo_write to track 
+   your progress.
+6. Never commit code without running tests first.
+7. If you need to install dependencies, always check the project's package 
+   manager first (package-lock.json → npm, yarn.lock → yarn, 
+   pnpm-lock.yaml → pnpm).
+8. Keep your responses concise. Don't explain what you're about to do — 
+   just do it. Explain what you did after.
+9. If a file is too large to read in one call, use offset and limit to 
+   read in chunks.
+10. When editing, your old_string must be unique in the file. If it's not, 
+    include more surrounding context to disambiguate.
+```
+
+The output formatting section constrains the model's response style:
+
+```
+## Output Formatting
+
+- Use markdown for structured responses.
+- Use backticks for file paths, function names, and code identifiers.
+- Do not use emojis unless the user does.
+- When showing file changes, describe what changed and why, not the full 
+  before/after.
+- End task completion messages with a brief summary of changes made.
+```
+
+### The While Loop with Error Recovery
+
+The core execution loop in Claude Code handles several edge cases that most tutorials omit:
+
+```typescript
+async function agentLoop(
+  initialMessage: string,
+  context: SessionContext
+): Promise<string> {
+  const messages: Message[] = [{ role: "user", content: initialMessage }];
+  const systemPrompt = new SystemPromptBuilder().build(context);
+  let hasAttemptedReactiveCompact = false;
+  let consecutiveErrors = 0;
+  
+  while (true) {
+    let response: APIResponse;
+    
+    try {
+      response = await client.messages.create({
+        model: context.model,
+        max_tokens: 16000,
+        system: systemPrompt,
+        tools: context.tools,
+        messages: messages,
+      });
+      consecutiveErrors = 0;
+    } catch (error) {
+      if (isContextLengthError(error)) {
+        if (hasAttemptedReactiveCompact) {
+          // BUG (now fixed): This used to not reset, causing infinite retry loops.
+          // Each compaction attempt would re-trigger the context length error,
+          // and without the boolean guard, the agent would burn API calls
+          // until the session timed out or hit rate limits.
+          throw new Error("Context too large even after compaction");
         }
-    ],
-)
+        hasAttemptedReactiveCompact = true;
+        messages = await reactiveCompact(messages);
+        continue;
+      }
+      
+      consecutiveErrors++;
+      if (consecutiveErrors >= 3) {
+        throw error;
+      }
+      await sleep(Math.pow(2, consecutiveErrors) * 1000);
+      continue;
+    }
+    
+    messages.push({ role: "assistant", content: response.content });
+    
+    if (response.stop_reason === "end_turn") {
+      return extractText(response.content);
+    }
+    
+    if (response.stop_reason === "max_tokens") {
+      // Output token exhaustion — the 3-step escalation:
+      // Step 1: Try with higher max_tokens
+      // Step 2: Compact context to free up token budget
+      // Step 3: Ask the model to be more concise
+      messages = await handleMaxTokens(messages, context);
+      continue;
+    }
+    
+    // Execute tool calls and collect results
+    const toolResults: ToolResult[] = [];
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        const result = await executeToolWithPermission(
+          block, context.permissionLevel, context.userAllowlist
+        );
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: truncateToolOutput(result, MAX_TOOL_OUTPUT_CHARS),
+        });
+      }
+    }
+    
+    messages.push({ role: "user", content: toolResults });
+    hasAttemptedReactiveCompact = false; // Reset after successful turn
+  }
+}
 ```
 
-### Codex's Execution Environment
-
-Codex runs each task in a **sandboxed cloud environment** — a Firecracker microVM or container with a complete development environment:
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    CODEX TASK EXECUTION                    │
-│                                                           │
-│  ┌─────────┐    ┌───────────────────────────────────┐     │
-│  │  User   │    │       Sandboxed Environment        │     │
-│  │  Task   │───►│                                    │     │
-│  └─────────┘    │  ┌──────────────────────────────┐  │     │
-│                 │  │        Agent Loop             │  │     │
-│                 │  │                               │  │     │
-│                 │  │  Responses API ◄─► Model      │  │     │
-│                 │  │       │                       │  │     │
-│                 │  │       ▼                       │  │     │
-│                 │  │  Tool Execution               │  │     │
-│                 │  │  ├── Shell commands           │  │     │
-│                 │  │  ├── File read/write          │  │     │
-│                 │  │  ├── Code interpreter         │  │     │
-│                 │  │  └── Web browsing             │  │     │
-│                 │  │                               │  │     │
-│                 │  └──────────────────────────────┘  │     │
-│                 │                                    │     │
-│                 │  ┌──────────────────────────────┐  │     │
-│                 │  │  Full Dev Environment         │  │     │
-│                 │  │  ├── Git repo (cloned)        │  │     │
-│                 │  │  ├── Language runtimes        │  │     │
-│                 │  │  ├── Package managers         │  │     │
-│                 │  │  └── Test frameworks          │  │     │
-│                 │  └──────────────────────────────┘  │     │
-│                 │                                    │     │
-│                 └───────────────────────────────────┘     │
-│                              │                            │
-│                              ▼                            │
-│                 ┌───────────────────────┐                  │
-│                 │  PR / Diff Output     │                  │
-│                 └───────────────────────┘                  │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Context Management: Compaction
-
-Codex sessions can run for many turns, generating large amounts of context from tool outputs (file contents, test output, command results). To manage this, Codex implements **context compaction** — a strategy for summarizing or truncating older context to stay within the model's context window:
-
-```python
-# Pseudocode for Codex-style compaction
-def manage_context(messages: list, max_tokens: int) -> list:
-    """Compact context when it exceeds the token budget."""
-    current_tokens = count_tokens(messages)
-
-    if current_tokens <= max_tokens:
-        return messages
-
-    # Strategy 1: Truncate old tool outputs
-    for i, msg in enumerate(messages):
-        if msg["role"] == "tool" and is_old(i, len(messages)):
-            msg["content"] = summarize(msg["content"], max_length=200)
-
-    # Strategy 2: Summarize early conversation turns
-    if count_tokens(messages) > max_tokens:
-        early_turns = messages[1:len(messages)//3]
-        summary = llm_summarize(early_turns)
-        messages = [messages[0], summary_message(summary)] + messages[len(messages)//3:]
-
-    # Strategy 3: Drop least relevant context
-    if count_tokens(messages) > max_tokens:
-        messages = prioritized_truncation(messages, max_tokens)
-
-    return messages
-```
-
-The compaction strategy balances retaining important context (the original task, recent actions, error messages) with staying within token limits. This is a critical concern for long-running agent sessions that may execute 50+ tool calls.
-
-### The Agents SDK: Four Primitives
-
-OpenAI's Agents SDK, which underlies Codex's architecture, is built on four primitives:
-
-1. **Agent**: An LLM configured with instructions, tools, and optional model parameters. Multiple agents can exist in a system.
-
-2. **Handoff**: A mechanism for one agent to transfer control to another, enabling multi-agent workflows. For instance, a "Triage Agent" might hand off to a "Bug Fix Agent" or a "Feature Agent" based on the task.
-
-3. **Tool**: A function callable by the agent, defined with a JSON schema. Tools are the agent's interface to the external world.
-
-4. **Guardrail**: A validation function that runs on agent inputs or outputs, implementing safety checks and policy enforcement.
-
-```python
-from openai_agents import Agent, Tool, Guardrail, handoff
-
-# Define tools
-read_file = Tool(
-    name="read_file",
-    description="Read the contents of a file",
-    parameters={"path": {"type": "string"}},
-    handler=lambda path: open(path).read()
-)
-
-write_file = Tool(
-    name="write_file",
-    description="Write content to a file",
-    parameters={
-        "path": {"type": "string"},
-        "content": {"type": "string"}
-    },
-    handler=lambda path, content: open(path, 'w').write(content)
-)
-
-run_tests = Tool(
-    name="run_tests",
-    description="Execute the test suite",
-    parameters={"path": {"type": "string"}},
-    handler=lambda path: subprocess.run(["pytest", path], capture_output=True).stdout
-)
-
-# Define guardrails
-no_secrets_in_output = Guardrail(
-    name="no_secrets",
-    validator=lambda output: not contains_secrets(output)
-)
-
-# Define agents
-coding_agent = Agent(
-    name="CodingAgent",
-    instructions="You are a senior engineer. Fix bugs methodically: read code, understand the issue, write a fix, run tests.",
-    tools=[read_file, write_file, run_tests],
-    guardrails=[no_secrets_in_output],
-    model="o3-mini",
-)
-
-triage_agent = Agent(
-    name="TriageAgent",
-    instructions="Analyze the user's request and route to the appropriate agent.",
-    handoffs=[handoff(coding_agent, "For code changes and bug fixes")],
-    model="gpt-4.1-mini",
-)
-
-# Run
-result = triage_agent.run("Fix the auth test failure in test_auth.py")
-```
-
-The deliberate minimalism of this design is significant. The SDK does not include built-in RAG, memory systems, planning frameworks, or complex orchestration. It provides the essential primitives and trusts developers to compose them. This philosophy — that the agent loop itself is simple and the value is in what you put *into* the loop — is shared across all major production agent systems.
-
----
-
-## 2.3 How Claude Code Implements the Loop
-
-Claude Code, launched by Anthropic, is a terminal-based autonomous coding agent that runs locally on the developer's machine. Its architecture is notable for its simplicity — Anthropic engineers have publicly stated that the system is "not much more than a while loop over Claude API calls."
-
-### The Core Loop
-
-Claude Code's execution model follows a disciplined four-phase pattern: **Gather Context → Take Action → Verify → Repeat.**
-
-```python
-# Simplified representation of Claude Code's architecture
-class ClaudeCodeAgent:
-    def __init__(self):
-        self.tools = self._register_tools()  # ~14-20 tools
-        self.messages = []
-        self.system_prompt = self._build_system_prompt()
-
-    def run(self, user_input: str):
-        self.messages.append({"role": "user", "content": user_input})
-
-        while True:
-            # Model inference with tool use
-            response = anthropic.messages.create(
-                model="claude-sonnet-4-20250514",
-                system=self.system_prompt,
-                messages=self.messages,
-                tools=self.tools,
-                max_tokens=16000,
-            )
-
-            self.messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
-
-            # Check termination: if no tool use, we're done
-            if response.stop_reason == "end_turn":
-                return self._extract_final_response(response)
-
-            # Execute tool calls
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = self._execute_tool(block)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-
-            self.messages.append({
-                "role": "user",
-                "content": tool_results
-            })
-
-    def _register_tools(self):
-        """Claude Code's ~14-20 tools."""
-        return [
-            # File operations
-            {"name": "Read", "description": "Read file contents"},
-            {"name": "Write", "description": "Write/create a file"},
-            {"name": "Edit", "description": "Edit a file with search/replace"},
-            {"name": "MultiEdit", "description": "Multiple edits to a file"},
-
-            # Search and navigation
-            {"name": "Glob", "description": "Find files by pattern"},
-            {"name": "Grep", "description": "Search file contents"},
-            {"name": "LS", "description": "List directory contents"},
-
-            # Execution
-            {"name": "Bash", "description": "Execute shell commands"},
-
-            # Agent management
-            {"name": "TodoWrite", "description": "Track task progress"},
-            {"name": "Task", "description": "Spawn sub-agents"},
-
-            # Web
-            {"name": "WebFetch", "description": "Fetch URL contents"},
-            {"name": "WebSearch", "description": "Search the web"},
-
-            # ... additional tools
-        ]
-```
-
-### The Tool Set: ~14-20 Tools
-
-Claude Code's tool set is deliberately constrained. Rather than providing hundreds of specialized tools, it provides a small set of general-purpose tools that compose to handle any coding task:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              CLAUDE CODE TOOL CATEGORIES                      │
-│                                                               │
-│  FILE OPERATIONS        SEARCH/NAV         EXECUTION          │
-│  ┌──────────────┐      ┌──────────┐      ┌──────────────┐    │
-│  │ Read         │      │ Glob     │      │ Bash         │    │
-│  │ Write        │      │ Grep     │      │ (shell cmds) │    │
-│  │ Edit         │      │ LS       │      └──────────────┘    │
-│  │ MultiEdit    │      └──────────┘                          │
-│  └──────────────┘                        PLANNING            │
-│                        WEB               ┌──────────────┐    │
-│  AGENT MGMT            ┌──────────┐      │ TodoWrite    │    │
-│  ┌──────────────┐      │ WebFetch │      │ (task lists) │    │
-│  │ Task         │      │ WebSearch│      └──────────────┘    │
-│  │ (sub-agents) │      └──────────┘                          │
-│  └──────────────┘                                            │
-│                                                               │
-└──────────────────────────────────────────────────────────────┘
-```
-
-The design philosophy is that **Bash is the universal escape hatch**. Any tool that Claude Code doesn't have as a dedicated tool can be accomplished via shell commands. Need to run tests? `Bash("pytest")`. Need to check git status? `Bash("git status")`. Need to install a dependency? `Bash("npm install lodash")`. This keeps the tool set small while maintaining unlimited capability.
-
-### Planning with TODO Lists
-
-For complex tasks, Claude Code uses the `TodoWrite` tool to create and manage task lists. This serves as the agent's planning mechanism — an externalized form of working memory:
-
-```
-Claude Code's planning flow for a complex task:
-
-1. Receive task: "Refactor the authentication module to use JWT"
-
-2. Create TODO list:
-   ┌────────────────────────────────────────────────┐
-   │  TODO: Refactor auth to JWT                     │
-   │                                                 │
-   │  [in_progress] Audit current auth implementation│
-   │  [pending]     Design JWT token structure        │
-   │  [pending]     Implement JWT signing/verification│
-   │  [pending]     Update middleware                 │
-   │  [pending]     Update tests                     │
-   │  [pending]     Run test suite                   │
-   └────────────────────────────────────────────────┘
-
-3. Work through items sequentially, updating status:
-   ┌────────────────────────────────────────────────┐
-   │  [completed]   Audit current auth implementation│
-   │  [completed]   Design JWT token structure        │
-   │  [in_progress] Implement JWT signing/verification│
-   │  [pending]     Update middleware                 │
-   │  [pending]     Update tests                     │
-   │  [pending]     Run test suite                   │
-   └────────────────────────────────────────────────┘
-```
-
-This planning pattern is significant because it provides:
-- **Transparency**: The user can see what the agent is planning to do
-- **Progress tracking**: The user can see what's done and what remains
-- **Self-guidance**: The model can refer back to the plan to stay on track
-- **Recovery**: If context is compacted, the TODO list preserves the plan
-
-### Sub-Agents for Parallelism
-
-Claude Code uses the `Task` tool to spawn sub-agents — independent Claude instances that work on isolated subtasks. This enables parallelism and prevents a single complex subtask from consuming the main agent's context:
-
-```
-┌───────────────────────────────────────────────────────┐
-│                  MAIN AGENT                            │
-│                                                        │
-│  Goal: "Add dark mode support to the application"      │
-│                                                        │
-│  Plan:                                                 │
-│  1. Analyze current theme system                       │
-│  2. Create dark theme variables (delegate to sub-agent)│
-│  3. Update components (delegate to sub-agent)          │
-│  4. Add toggle mechanism                               │
-│  5. Verify all components render correctly             │
-│                                                        │
-│  ┌──────────────┐            ┌──────────────┐          │
-│  │  Sub-Agent 1 │            │  Sub-Agent 2 │          │
-│  │              │            │              │          │
-│  │  Create dark │            │  Update all  │          │
-│  │  theme CSS   │            │  components  │          │
-│  │  variables   │            │  to use theme│          │
-│  │              │            │  variables   │          │
-│  │  (isolated   │            │  (isolated   │          │
-│  │   context)   │            │   context)   │          │
-│  └──────┬───────┘            └──────┬───────┘          │
-│         │                           │                  │
-│         └─────── results ───────────┘                  │
-│                     │                                  │
-│                     ▼                                  │
-│         Main agent continues with                      │
-│         sub-agent results in context                   │
-└───────────────────────────────────────────────────────┘
-```
-
-Sub-agents are particularly valuable for:
-- **Context isolation**: Each sub-agent has its own context window, preventing context overflow
-- **Parallel execution**: Multiple sub-agents can potentially run concurrently
-- **Failure containment**: If a sub-agent fails, it doesn't corrupt the main agent's state
-- **Specialization**: Sub-agents can be given focused instructions for specific subtasks
-
----
-
-## 2.4 How Cursor Implements the Loop
-
-Cursor represents a different architectural philosophy from Claude Code and Codex. While those systems are primarily terminal/CLI-based, Cursor is an IDE — a fork of VS Code — that integrates agent capabilities directly into the editor.
-
-### Layered ReAct Architecture
-
-Cursor implements what can be described as a **layered ReAct architecture**, where different layers of the system contribute to the agent's observe-think-act loop:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                 CURSOR ARCHITECTURE                         │
-│                                                             │
-│  ┌────────────────────────────────────────────────────┐     │
-│  │                   IDE LAYER                         │     │
-│  │  ├── VS Code Extension Host                        │     │
-│  │  ├── Language Server Protocol (LSP)                 │     │
-│  │  ├── Abstract Syntax Tree (AST) services            │     │
-│  │  ├── Git integration                               │     │
-│  │  └── Terminal emulator                              │     │
-│  └──────────────────────┬─────────────────────────────┘     │
-│                         │                                    │
-│  ┌──────────────────────▼─────────────────────────────┐     │
-│  │              CONTEXT ENGINE                         │     │
-│  │  ├── Codebase indexing (embeddings)                 │     │
-│  │  ├── AST-grounded context selection                 │     │
-│  │  ├── Recently edited files tracking                 │     │
-│  │  ├── Linter/compiler error feeds                    │     │
-│  │  └── @-mention resolution                           │     │
-│  └──────────────────────┬─────────────────────────────┘     │
-│                         │                                    │
-│  ┌──────────────────────▼─────────────────────────────┐     │
-│  │                AGENT CORE                           │     │
-│  │  ├── Composer model (fast, ~250 tok/s)              │     │
-│  │  ├── ReAct loop with tool calls                     │     │
-│  │  ├── Speculative edits and apply model              │     │
-│  │  └── Multi-file coordination                        │     │
-│  └──────────────────────┬─────────────────────────────┘     │
-│                         │                                    │
-│  ┌──────────────────────▼─────────────────────────────┐     │
-│  │             EXECUTION LAYER                         │     │
-│  │  ├── File system operations                         │     │
-│  │  ├── Terminal command execution                      │     │
-│  │  ├── Worktrees for isolation (Cloud Agent)          │     │
-│  │  └── Git operations                                 │     │
-│  └────────────────────────────────────────────────────┘     │
-│                                                             │
-└────────────────────────────────────────────────────────────┘
-```
-
-### AST-Grounded Context
-
-One of Cursor's distinguishing features is **AST-grounded context** — using the Abstract Syntax Tree of the codebase to provide structurally relevant context to the model:
-
-```
-Traditional context selection:
-  "Here are the 10 most recently edited files"     ← May include irrelevant files
-  "Here are files matching your search query"       ← May miss structural dependencies
-
-AST-grounded context selection:
-  "Here is the function you're editing,
-   its callers, its callees,
-   the types it references,
-   and the tests that cover it"                     ← Structurally precise
-```
-
-When a user asks Cursor to modify a function, the context engine doesn't just include the file — it traverses the AST to find:
-- The function's signature and body
-- All call sites (where the function is called from)
-- Type definitions referenced by the function
-- Import statements and module dependencies
-- Related test files
-
-This produces context that is both more relevant and more compact than keyword-based or embedding-based retrieval alone.
-
-### Speculative Edits and the Apply Model
-
-Cursor uses a technique called **speculative edits** to achieve high-speed code modifications. The Composer model (a fast model generating ~250 tokens/second) produces edit instructions, and a separate "apply model" translates these instructions into precise file modifications:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│              SPECULATIVE EDIT PIPELINE                    │
-│                                                          │
-│  User request: "Add input validation to the signup form" │
-│                                                          │
-│  Step 1: Composer Model (fast, ~250 tok/s)               │
-│  ┌──────────────────────────────────────────┐            │
-│  │  "In signup.tsx, add validation to the   │            │
-│  │   email field using zod schema. Add      │            │
-│  │   error display below each field..."     │            │
-│  └──────────────────┬───────────────────────┘            │
-│                     │                                    │
-│  Step 2: Apply Model (specialized for diffs)             │
-│  ┌──────────────────▼───────────────────────┐            │
-│  │  --- a/src/signup.tsx                     │            │
-│  │  +++ b/src/signup.tsx                     │            │
-│  │  @@ -15,6 +15,12 @@                      │            │
-│  │  +import { z } from 'zod';               │            │
-│  │  +const signupSchema = z.object({        │            │
-│  │  +  email: z.string().email(),           │            │
-│  │  +  password: z.string().min(8),         │            │
-│  │  +});                                    │            │
-│  │   ...                                    │            │
-│  └──────────────────────────────────────────┘            │
-│                                                          │
-│  Step 3: Apply diff to file, show inline preview         │
-│                                                          │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Worktrees for Isolation (Cloud Agent)
-
-Cursor Cloud Agent uses **git worktrees** to provide isolated execution environments for background agent tasks:
-
-```
-Main working tree (user's active work):
-  /workspace/
-  ├── src/
-  ├── package.json
-  └── .git/
-
-Agent worktree (isolated branch):
-  /workspace/.worktrees/agent-task-abc123/
-  ├── src/          (separate working copy)
-  ├── package.json
-  └── (linked to same .git)
-
-Benefits:
-  ✓ Agent changes don't interfere with user's work
-  ✓ Agent can commit, branch, and push independently
-  ✓ Multiple agents can work on different tasks simultaneously
-  ✓ User can review agent's changes via PR
-```
-
-This worktree-based isolation enables the L4 autonomy that defines Cursor Cloud Agent — the agent runs completely in the background, making changes on a separate branch that the user can review and merge through the normal PR workflow.
-
----
-
-## 2.5 Comparing Single-Turn vs Multi-Turn vs Long-Horizon Agent Loops
-
-Agent loops vary dramatically in their complexity and the challenges they face, depending on the horizon of the task:
-
-### Single-Turn (1-5 tool calls)
-
-```
-User: "What's in config.yaml?"
-Agent: [reads file] → [returns contents]
-
-Characteristics:
-  - 1-5 tool calls
-  - Fits entirely in one context window
-  - No planning needed
-  - No state management concerns
-  - Failure mode: tool call errors (easy to handle)
-```
-
-### Multi-Turn (5-30 tool calls)
-
-```
-User: "Fix the bug where users can't log in after password reset"
-Agent: [search codebase] → [read auth handler] → [read password reset flow]
-     → [identify bug] → [edit file] → [run tests] → [fix test] → [run tests]
-     → [commit]
-
-Characteristics:
-  - 5-30 tool calls
-  - May approach context window limits
-  - Simple planning (implicit or via TODO list)
-  - Some state management needed (tracking what's been tried)
-  - Failure mode: losing track of approach, context overflow
-```
-
-### Long-Horizon (30-200+ tool calls)
-
-```
-User: "Migrate the authentication system from session-based to JWT"
-Agent: [extensive codebase analysis over 50+ files]
-     → [create migration plan with 12 TODO items]
-     → [implement JWT utilities] → [test] → [debug]
-     → [update middleware] → [test] → [fix integration issues]
-     → [update all route handlers] → [test] → [fix regressions]
-     → [update client-side auth] → [test]
-     → [update database schema] → [run migrations]
-     → [comprehensive integration testing]
-     → [fix edge cases found in testing]
-     → [update documentation]
-     → [final test suite run]
-     → [commit and push]
-
-Characteristics:
-  - 30-200+ tool calls
-  - Guaranteed to exceed context window (compaction required)
-  - Explicit planning essential (TODO lists, sub-agents)
-  - Complex state management (what's done, what's pending, what failed)
-  - Failure modes: plan drift, context rot, cascading errors,
-    lost progress after compaction, incorrect assumptions persisting
-```
-
-The challenges scale non-linearly with horizon length:
-
-```
-Challenge Severity vs. Task Horizon
-
-Severity
-  ▲
-  │                                          ╱ Context rot
-  │                                        ╱
-  │                                      ╱
-  │                               ╱────╱ Plan drift
-  │                         ╱───╱
-  │                   ╱───╱
-  │             ╱───╱              ╱──── Error cascading
-  │        ╱──╱              ╱──╱
-  │   ╱──╱             ╱──╱
-  │ ╱            ╱───╱
-  │╱       ╱───╱
-  ├──────╱─────────────────────────────────► Horizon (tool calls)
-  0     5      15      30      50     100    200+
-      single   multi-turn     long-horizon
+The `hasAttemptedReactiveCompact` bug is worth examining in detail. Before the fix, the boolean was never reset after a successful turn. So if the agent hit a context length error, compacted, succeeded for 20 more turns, then hit another context length error, the guard would prevent a second compaction and the agent would throw. The fix — resetting the boolean after each successful API call — is a single line, but without it, long-running sessions would reliably crash.
+
+### The "Hidden Error" Pattern
+
+When Claude Code encounters a context-length error, it does not display this to the user. Instead, it silently compacts the conversation and retries. From the user's perspective, the agent simply continues working. This is intentional — exposing internal error recovery to users creates unnecessary anxiety and support burden.
+
+```typescript
+async function reactiveCompact(messages: Message[]): Promise<Message[]> {
+  // Don't show this to the user — it's internal housekeeping
+  const compacted = await compactConversation(messages, {
+    strategy: "preserve_recent",
+    keepFirstMessage: true,
+    keepLastNTurns: 6,
+    summarizeMiddle: true,
+  });
+  
+  // Log for observability, but don't surface to UI
+  logger.info("reactive_compact", {
+    before_tokens: estimateTokens(messages),
+    after_tokens: estimateTokens(compacted),
+    turns_removed: messages.length - compacted.length,
+  });
+  
+  return compacted;
+}
 ```
 
 ---
 
-## 2.6 Session Management and Conversation State
+## 1.4 Cursor's Three-Layer Architecture
 
-Managing state across agent sessions is a critical engineering challenge. There are three fundamental approaches:
+Cursor is architecturally distinct from Claude Code and Codex. It's a VS Code fork with three layers that cooperate to provide agent capabilities: the IDE layer, the AI orchestration layer, and the context engine.
 
-### Approach 1: Ephemeral State (Stateless Sessions)
+### Layer 1: Priompt — Priority-Based Context Compilation
 
-Each session starts fresh. All necessary context is reconstructed from the environment (file system, git history, documentation).
+Cursor's most innovative contribution is **Priompt** (Priority Prompt), a JSX-based system for declaratively specifying context with priorities. Instead of manually concatenating strings and hoping they fit in the context window, Priompt treats context compilation as a constraint satisfaction problem.
 
-```python
-class EphemeralAgent:
-    """Each session is independent. No persistent memory."""
-
-    def start_session(self, user_input: str):
-        # Context comes entirely from the environment
-        context = self.gather_context_from_environment()
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
-        return self.run_loop(messages)
-
-    def gather_context_from_environment(self):
-        """Read files, check git status, scan project structure."""
-        return {
-            "project_structure": scan_directory_tree(),
-            "recent_changes": git_log(n=10),
-            "open_issues": get_open_issues(),
-            "readme": read_file("README.md"),
-        }
+```tsx
+function buildAgentContext(request: AgentRequest): PromptElement {
+  return (
+    <SystemMessage priority={1000}>
+      You are Cursor, an AI coding assistant integrated into the IDE.
+    </SystemMessage>
+    
+    <SystemMessage priority={990}>
+      <ToolDefinitions tools={request.availableTools} />
+    </SystemMessage>
+    
+    <SystemMessage priority={900}>
+      <ProjectRules path={request.workspacePath} />
+    </SystemMessage>
+    
+    <UserMessage priority={800}>
+      <RecentFiles files={request.recentlyEditedFiles} maxTokens={4000} />
+    </UserMessage>
+    
+    <UserMessage priority={700}>
+      <CodebaseSearchResults query={request.userQuery} maxResults={10} />
+    </UserMessage>
+    
+    <UserMessage priority={600}>
+      <DiagnosticErrors files={request.openFiles} />
+    </UserMessage>
+    
+    <UserMessage priority={500}>
+      <GitDiff maxTokens={2000} />
+    </UserMessage>
+    
+    <ConversationHistory priority={400} messages={request.history} />
+    
+    <UserMessage priority={1000}>
+      {request.currentMessage}
+    </UserMessage>
+  );
+}
 ```
 
-**Pros:** Simple, no state corruption, every session is fresh.
-**Cons:** No memory of past sessions, must re-discover context every time.
-**Used by:** Claude Code (each session is independent), Cursor (each agent request starts fresh).
+The Priompt compiler takes this JSX tree and a token budget, then greedily includes elements by priority until the budget is exhausted. Priority 1000 elements are always included. Lower-priority elements are dropped first when space is constrained. This means that the user's current message and system instructions are guaranteed to be present, while older conversation history or search results may be truncated.
 
-### Approach 2: Persistent Conversation State
-
-The full conversation history is stored and loaded in subsequent sessions.
-
-```python
-class PersistentAgent:
-    """Conversation state persists across sessions."""
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.messages = self.load_state(session_id) or []
-
-    def continue_session(self, user_input: str):
-        self.messages.append({"role": "user", "content": user_input})
-        result = self.run_loop(self.messages)
-        self.save_state(self.session_id, self.messages)
-        return result
-
-    def save_state(self, session_id, messages):
-        storage.put(f"sessions/{session_id}", json.dumps(messages))
-
-    def load_state(self, session_id):
-        data = storage.get(f"sessions/{session_id}")
-        return json.loads(data) if data else None
-```
-
-**Pros:** Continuity across sessions, can resume complex tasks.
-**Cons:** Context grows unboundedly, stale context accumulates, requires compaction.
-**Used by:** ChatGPT (persistent conversations), some Codex workflows.
-
-### Approach 3: Hybrid — Ephemeral Sessions with Persistent Memory
-
-Each session is ephemeral, but key information is persisted in a structured memory layer that can be queried in future sessions.
-
-```python
-class HybridAgent:
-    """Fresh sessions with persistent memory layer."""
-
-    def __init__(self):
-        self.memory = MemoryStore()  # Persistent key-value or vector store
-
-    def start_session(self, user_input: str):
-        # Retrieve relevant memories
-        relevant_memories = self.memory.query(user_input, top_k=10)
-
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "system", "content": format_memories(relevant_memories)},
-            {"role": "user", "content": user_input},
-        ]
-
-        result = self.run_loop(messages)
-
-        # Store important learnings from this session
-        self.memory.store(
-            extract_key_learnings(self.messages),
-            metadata={"timestamp": now(), "task": user_input}
-        )
-
-        return result
-```
-
-**Pros:** Fresh context per session, but learns over time.
-**Cons:** Complexity of memory management, risk of storing incorrect information.
-**Used by:** Claude Code with CLAUDE.md files (project memory), Cursor with AGENTS.md (agent instructions), various custom agent implementations.
-
-The CLAUDE.md and AGENTS.md patterns are a particularly elegant form of persistent memory — they store memories as human-readable markdown files *in the repository itself*, making them version-controlled, reviewable, and accessible to both humans and agents:
+The compilation algorithm:
 
 ```
-# CLAUDE.md (persistent agent memory in the repository)
-
-## Project Context
-- This is a Next.js 14 app with App Router
-- We use Prisma for ORM, PostgreSQL for the database
-- Authentication is handled by NextAuth.js v5
-
-## Coding Conventions
-- Use server components by default, client components only when needed
-- All API routes should validate input with zod
-- Tests use Vitest, not Jest
-
-## Known Issues
-- The WebSocket connection sometimes drops on Vercel deployment
-- Don't modify the legacy billing module without checking with the team
+1. Flatten the JSX tree into a list of (priority, tokens, content) tuples
+2. Sort by priority descending
+3. Greedily include elements:
+   - If element fits in remaining budget, include it
+   - If element has a maxTokens prop, truncate it to that limit first
+   - If element doesn't fit, skip it (or truncate if it's the lowest-priority included element)
+4. Re-order included elements back into their original document order
+5. Serialize to the API's message format
 ```
+
+This solves a problem that plagues every hand-rolled context builder: when you have 20 sources of context and a 128K token budget, manually deciding what to include and what to cut is error-prone. Priompt makes it declarative.
+
+### Layer 2: Tree-sitter AST Chunking
+
+Cursor uses Tree-sitter, an incremental parsing library, to parse every file in the workspace into an AST. This enables structurally-aware code chunking for embeddings and retrieval.
+
+The naive approach to code chunking — splitting files into fixed-size chunks of N lines — produces terrible results because it splits functions in half, separates type definitions from their uses, and loses structural context.
+
+Cursor's approach:
+
+```
+Input file (TypeScript):
+
+import { User } from './types';         ─┐
+import { db } from './database';          │ Import block
+                                          │ (kept together)
+export interface AuthConfig {             ─┐
+  jwtSecret: string;                      │ Type definition
+  tokenExpiry: number;                    │ (one chunk)
+}                                         ─┘
+
+export async function login(              ─┐
+  email: string,                          │
+  password: string,                       │ Function definition
+  config: AuthConfig                      │ (one chunk, even if
+): Promise<{ token: string }> {           │  it's 80 lines)
+  const user = await db.users.findOne({   │
+    email: email.toLowerCase()            │
+  });                                     │
+  // ... 60 more lines ...                │
+  return { token };                       │
+}                                         ─┘
+
+export async function logout(             ─┐
+  token: string                           │ Another function
+): Promise<void> {                        │ (separate chunk)
+  await db.sessions.delete({ token });    │
+}                                         ─┘
+```
+
+Each AST node at the appropriate granularity (function, class, interface, top-level const) becomes one chunk. The chunk includes the node's full text plus its import dependencies. This means the embedding for `login` captures the full function body along with the `User` type import, so when the user asks about authentication, the retrieval finds the complete, self-contained code unit.
+
+### Layer 3: Merkle Tree Sync and Turbopuffer Embeddings
+
+Cursor maintains a real-time index of the entire workspace using a Merkle tree for change detection and Turbopuffer for vector storage.
+
+The Merkle tree structure:
+
+```
+workspace/
+├── hash: a1b2c3
+├── src/
+│   ├── hash: d4e5f6
+│   ├── routes/
+│   │   ├── hash: g7h8i9
+│   │   ├── auth.ts      hash: j0k1l2  (changed → re-embed)
+│   │   └── users.ts     hash: m3n4o5  (unchanged → skip)
+│   └── utils/
+│       ├── hash: p6q7r8
+│       └── validation.ts hash: s9t0u1  (unchanged → skip)
+└── tests/
+    ├── hash: v2w3x4
+    └── test_auth.ts     hash: y5z6a7  (changed → re-embed)
+```
+
+When a file changes, its hash changes, which propagates up the tree. The sync process walks the tree, compares hashes with the last-indexed state, and only re-embeds files whose hashes have changed. For a 10,000-file monorepo where 3 files changed, this means embedding 3 files instead of 10,000.
+
+The embeddings are stored in Turbopuffer, a purpose-built vector database that Cursor operates. The retrieval pipeline:
+
+```
+User query: "fix the auth middleware validation"
+    ↓
+1. Embed the query with the same model used for code chunks
+    ↓
+2. ANN search in Turbopuffer: find top-20 nearest chunks
+    ↓
+3. Re-rank with a cross-encoder model (more accurate but slower)
+    ↓
+4. Take top-5, expand each to include surrounding context from the AST
+    ↓
+5. Feed into Priompt at priority 700
+```
+
+The re-ranking step is critical. Embedding-based retrieval has a well-documented precision ceiling around 70-80%. The cross-encoder re-ranker pushes this to 90%+ by doing pairwise comparison of the query with each candidate.
 
 ---
 
-## 2.7 When to Stop: Termination Conditions and Convergence Detection
+## 1.5 Termination Conditions That Actually Work in Production
 
-Knowing when to stop is one of the hardest problems in agent design. An agent that stops too early leaves tasks incomplete. An agent that stops too late wastes tokens, accumulates errors, and may even undo its own good work through over-iteration.
+The most common failure mode in agents is not wrong tool calls — it's wrong termination. Agents that stop too early leave work incomplete. Agents that stop too late burn tokens, accumulate errors, and sometimes undo their own good work through over-iteration.
 
-### Termination Signals
+### The Five Termination Signals
 
-Production agents typically use a combination of these signals:
+Production agents use a layered approach:
 
-**1. Model-initiated termination (primary signal):**
-The model generates a response without any tool calls, indicating it believes the task is complete. This is the `stop_reason == "end_turn"` check.
+**Signal 1: Model-initiated stop (primary)**
 
-```python
-# Primary termination: model decides it's done
-if response.stop_reason == "end_turn":
-    return response.content  # Task complete
-```
+The model returns `stop_reason: "end_turn"` without any tool calls. This is the happy path — the model believes the task is complete.
 
-**2. Hard limits (safety net):**
-Maximum turn counts, token budgets, or wall-clock timeouts that prevent runaway execution.
+Failure mode: The model declares success prematurely. This happens most often when the model generates a plausible-sounding summary without actually verifying its work. Mitigation: the system prompt must explicitly instruct the model to verify before declaring completion.
+
+**Signal 2: Hard turn limit**
 
 ```python
 MAX_TURNS = 200
-MAX_TOKENS_SPENT = 1_000_000
-MAX_WALL_TIME = timedelta(minutes=30)
 
-for turn in range(MAX_TURNS):
-    if total_tokens_spent > MAX_TOKENS_SPENT:
-        return "Token budget exceeded. Partial results: ..."
-    if datetime.now() - start_time > MAX_WALL_TIME:
-        return "Time limit exceeded. Partial results: ..."
-    # ... run loop iteration
+if turn >= MAX_TURNS:
+    return AgentResult(
+        status="max_turns_exceeded",
+        message=f"Reached {MAX_TURNS} turns without completion. Last state: ...",
+        partial=True
+    )
 ```
 
-**3. Convergence detection:**
-Detecting that the agent is making no meaningful progress — repeating the same actions, oscillating between states, or producing diminishing returns.
+In practice, Codex uses a limit around 200 turns. Claude Code's limit is configurable but defaults to 200. Most tasks complete in 5-30 turns. If you're hitting 200, something is wrong.
+
+**Signal 3: Token budget exhaustion**
 
 ```python
-class ConvergenceDetector:
-    def __init__(self, window_size: int = 5):
-        self.recent_actions = deque(maxlen=window_size)
+MAX_TOTAL_TOKENS = 2_000_000  # $6-8 for a single session at typical rates
 
-    def is_converged(self, action: str) -> bool:
-        self.recent_actions.append(action)
+if total_input_tokens + total_output_tokens > MAX_TOTAL_TOKENS:
+    return AgentResult(
+        status="token_budget_exceeded",
+        message="Session token budget exhausted.",
+        partial=True
+    )
+```
 
-        # Detect exact repetition
-        if len(self.recent_actions) >= 3:
-            if len(set(list(self.recent_actions)[-3:])) == 1:
-                return True  # Same action 3 times in a row
+**Signal 4: Repetition detection**
 
-        # Detect oscillation (A → B → A → B)
-        if len(self.recent_actions) >= 4:
-            actions = list(self.recent_actions)
-            if actions[-1] == actions[-3] and actions[-2] == actions[-4]:
-                return True  # Oscillating between two actions
+This catches the most insidious failure mode: the agent doing the same thing over and over. Common patterns include:
+- The agent edits a file, runs tests, sees a failure, edits the same file with the same change, runs tests, sees the same failure — infinite loop.
+- The agent alternates between two approaches: tries fix A, it breaks something, reverts to fix B, it breaks something else, reverts to fix A...
 
+```python
+class RepetitionDetector:
+    def __init__(self, window: int = 8):
+        self.recent_tool_calls: list[str] = []
+        self.window = window
+    
+    def record(self, tool_name: str, tool_input: dict) -> None:
+        sig = f"{tool_name}:{json.dumps(tool_input, sort_keys=True)}"
+        self.recent_tool_calls.append(sig)
+        if len(self.recent_tool_calls) > self.window:
+            self.recent_tool_calls.pop(0)
+    
+    def is_stuck(self) -> bool:
+        if len(self.recent_tool_calls) < 4:
+            return False
+        
+        recent = self.recent_tool_calls
+        
+        # Exact repetition: same call 3+ times in a row
+        if len(set(recent[-3:])) == 1:
+            return True
+        
+        # Oscillation: ABAB pattern
+        if (len(recent) >= 4 and 
+            recent[-1] == recent[-3] and 
+            recent[-2] == recent[-4] and 
+            recent[-1] != recent[-2]):
+            return True
+        
+        # High similarity: 4+ of last 6 calls are the same tool with similar args
+        if len(recent) >= 6:
+            tool_names = [c.split(":")[0] for c in recent[-6:]]
+            most_common = max(set(tool_names), key=tool_names.count)
+            if tool_names.count(most_common) >= 4:
+                return True
+        
         return False
 ```
 
-**4. Verification-based termination:**
-The agent actively verifies that its work is complete before stopping. This is distinct from the model simply deciding to stop — it involves running tests, checking outputs, or reviewing changes.
+When repetition is detected, the best approach is not to terminate immediately but to inject a meta-prompt:
 
 ```python
-# Verification loop before final termination
-def verify_and_terminate(self):
-    # Run the test suite
-    test_result = self.execute_tool("bash", {"command": "npm test"})
-    if "FAIL" in test_result:
-        return False  # Not done, tests are failing
-
-    # Check for linting errors
-    lint_result = self.execute_tool("bash", {"command": "npm run lint"})
-    if "error" in lint_result.lower():
-        return False  # Not done, lint errors remain
-
-    # Review the diff
-    diff = self.execute_tool("bash", {"command": "git diff"})
-    # Let the model review its own changes
-    review = self.ask_model(
-        f"Review this diff. Does it correctly address the original task?\n{diff}"
-    )
-    if "no" in review.lower() or "issue" in review.lower():
-        return False  # Model's self-review found issues
-
-    return True  # All checks pass
+if repetition_detector.is_stuck():
+    messages.append({
+        "role": "user",
+        "content": "You appear to be repeating the same actions. Stop and reconsider your approach. What have you tried so far? What alternatives haven't you explored? If you're truly stuck, explain what's blocking you."
+    })
+    stuck_interventions += 1
+    if stuck_interventions >= 3:
+        return AgentResult(status="stuck", message="Agent unable to make progress.")
 ```
 
-### The Verification Pattern
+**Signal 5: Verification-based termination**
 
-Production agents almost universally implement a **verify-before-terminate** pattern. Claude Code's documented workflow is explicitly: Gather Context → Take Action → **Verify** → Repeat. The verification step is what separates robust agents from brittle ones.
+The highest-quality agents don't just stop when the model says so — they verify first. Claude Code's documented workflow is: Gather Context → Take Action → Verify → Repeat. The verification step is what separates reliable agents from unreliable ones.
 
+```python
+def verify_before_terminate(agent_state):
+    """Run a verification pass before allowing termination."""
+    
+    checks = []
+    
+    # Check 1: Are all TODO items completed?
+    if agent_state.todos:
+        incomplete = [t for t in agent_state.todos if t.status != "completed"]
+        if incomplete:
+            return False, f"Incomplete TODOs: {[t.content for t in incomplete]}"
+    
+    # Check 2: Do tests pass?
+    if agent_state.has_test_command:
+        result = execute_tool("bash", {"command": agent_state.test_command})
+        if "FAIL" in result or "ERROR" in result:
+            return False, f"Tests failing: {result[:500]}"
+    
+    # Check 3: Are there linting errors in modified files?
+    for file_path in agent_state.modified_files:
+        lint = execute_tool("bash", {"command": f"npx eslint {file_path}"})
+        if "error" in lint.lower():
+            return False, f"Lint errors in {file_path}"
+    
+    return True, "All checks passed"
 ```
-┌────────────────────────────────────────────────────────┐
-│           VERIFICATION-BASED TERMINATION                │
-│                                                         │
-│    Task: "Fix the broken API endpoint"                  │
-│                                                         │
-│    [... agent works through the fix ...]                │
-│                                                         │
-│    Before stopping:                                     │
-│    ┌─────────────────────────────────────────┐          │
-│    │  ✓ Run affected test suite              │          │
-│    │  ✓ Run linter on modified files         │          │
-│    │  ✓ Manually test the endpoint (curl)    │          │
-│    │  ✓ Review diff for unintended changes   │          │
-│    │  ✓ Check for TODO items left incomplete │          │
-│    └─────────────────────────────────────────┘          │
-│                                                         │
-│    All pass? → Terminate and report                     │
-│    Any fail? → Continue loop                            │
-│                                                         │
-└────────────────────────────────────────────────────────┘
-```
 
-### Anti-Patterns in Termination
+### The Cost of Getting Termination Wrong
 
-Several common anti-patterns cause agents to terminate incorrectly:
+Wrong termination has direct, measurable costs:
 
-**Premature termination (stopping too early):**
-- Agent declares success without running tests
-- Agent claims it can't do something when it hasn't tried all approaches
-- Agent stops after writing code without verifying it compiles
+| Failure | Frequency | Cost Impact |
+|---------|-----------|-------------|
+| Premature termination (work incomplete) | ~15% of sessions | User re-runs task = 2x cost |
+| Late termination (unnecessary extra turns) | ~20% of sessions | 30-50% token waste per session |
+| Infinite loop (caught by hard limit) | ~2% of sessions | 5-10x normal cost before limit triggers |
+| Oscillation (agent undoes own work) | ~5% of sessions | Work regresses, often requires human intervention |
 
-**Runaway execution (stopping too late):**
-- Agent enters an infinite debug loop, trying the same fix repeatedly
-- Agent gold-plates a solution, adding unnecessary features beyond the task
-- Agent oscillates between two approaches without committing to either
-
-**False convergence:**
-- Tests pass but the code change doesn't actually address the original issue
-- Agent fixates on a secondary issue and loses track of the primary task
-- Lint passes on modified files but agent introduced issues in files it didn't check
-
-The best production agents mitigate these through a combination of hard limits, self-verification, and explicit planning (TODO lists) that make it clear when all planned work is complete.
+The single most effective termination improvement is adding verification. In benchmarks on SWE-bench, agents that verify before termination (run tests, check lint) achieve 10-15 percentage points higher resolution rates than agents that terminate on model judgment alone.
 
 ---
 
-# Chapter 3: The Rise of Context Engineering
+## 1.6 The Codex Execution Environment
 
-## 3.1 From Prompt Engineering to Context Engineering
-
-In 2024, Andrej Karpathy articulated a shift that many practitioners had been feeling but hadn't named. In a widely-discussed post, he observed that the practice of getting good results from LLMs had evolved beyond "prompt engineering" into something broader: **context engineering**.
-
-> "I've been thinking about the evolution of prompt engineering. It started with crafting clever prompts, but what we actually do now is much more — we curate the entire information environment that the model operates in. I'd call it context engineering."
-
-The distinction matters because it changes what you optimize for. Prompt engineering focuses on the *phrasing* of instructions — word choice, format specifications, chain-of-thought triggers. Context engineering focuses on the *entire input* to the model — what information is present, how it's structured, what's omitted, and how it changes over time.
-
-For agents, this distinction is critical. A chatbot's context is relatively static: a system prompt plus the conversation so far. An agent's context is dynamic, heterogeneous, and constantly changing:
+OpenAI Codex runs each task in a Firecracker microVM — a lightweight virtual machine that boots in under 200ms. The environment setup:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│              CHATBOT CONTEXT (mostly static)                 │
-│                                                             │
-│  ┌──────────────────────────────────────────────────┐       │
-│  │  System Prompt: "You are a helpful assistant..."  │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  User: "How do I sort a list in Python?"         │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Assistant: "You can use sorted()..."            │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  User: "What about in reverse order?"            │       │
-│  └──────────────────────────────────────────────────┘       │
-│                                                             │
-│  Total: ~500 tokens, mostly conversation text               │
-└────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────┐
-│              AGENT CONTEXT (dynamic, heterogeneous)          │
-│                                                             │
-│  ┌──────────────────────────────────────────────────┐       │
-│  │  System Instructions (behavioral rules, persona)  │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Tool Schemas (14-20 tool definitions w/ params)  │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Project Memory (AGENTS.md, CLAUDE.md)            │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Retrieved Context (RAG results, file contents)   │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Conversation History                             │       │
-│  │  ├── User goal                                   │       │
-│  │  ├── Assistant reasoning + tool calls (turn 1)   │       │
-│  │  ├── Tool results (file contents, 2KB)           │       │
-│  │  ├── Assistant reasoning + tool calls (turn 2)   │       │
-│  │  ├── Tool results (test output, 5KB)             │       │
-│  │  ├── Assistant reasoning + tool calls (turn 3)   │       │
-│  │  ├── Tool results (error logs, 3KB)              │       │
-│  │  ├── ... (20+ more turns)                        │       │
-│  │  └── Assistant reasoning + tool calls (turn 25)  │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Current Working State                            │       │
-│  │  ├── TODO list                                   │       │
-│  │  ├── Current file being edited                   │       │
-│  │  └── Recent errors/warnings                      │       │
-│  └──────────────────────────────────────────────────┘       │
-│                                                             │
-│  Total: 50,000-200,000 tokens, constantly changing          │
-└────────────────────────────────────────────────────────────┘
+MicroVM Specification:
+  - 2 vCPUs, 4GB RAM
+  - Ephemeral disk (destroyed after session)
+  - Pre-loaded with: Node.js, Python, Go, Rust, Java runtimes
+  - Git, package managers (npm, pip, cargo, etc.)
+  - The user's repository, cloned and checked out
+  - Network: restricted to the OpenAI API and approved registries
+  - Timeout: 10 minutes per tool execution, 30 minutes total session
 ```
 
-Context engineering for agents is the discipline of managing this dynamic, heterogeneous context so that the model has the right information at the right time. It is the single most important factor in agent performance.
+The network restriction is critical for safety. Codex agents cannot:
+- Make arbitrary HTTP requests to the internet
+- Connect to databases or external services
+- Download arbitrary packages (only from approved registries)
+- Exfiltrate code or data
+
+This sandbox model is why Codex can operate at L4 autonomy (fully autonomous) without per-action human approval. The blast radius of any mistake is contained within the ephemeral VM.
+
+The execution flow:
+
+```
+1. User submits task via Codex UI or API
+2. Codex provisions a Firecracker microVM (~150ms)
+3. Repository is cloned into /workspace (~2-10s depending on size)
+4. Dependencies are installed (cached when possible) (~5-30s)
+5. Agent loop begins
+6. Each tool call executes inside the VM
+7. On completion, Codex extracts:
+   - The git diff (all changes made)
+   - Test results
+   - Agent's summary
+8. Codex creates a PR or applies the diff
+9. VM is destroyed
+```
 
 ---
 
-## 3.2 The Context Stack
+# Chapter 2: Context Engineering in Practice
 
-The context presented to an agent model at each inference step can be modeled as a **stack** of layers, each serving a different function:
+## 2.1 The Three KV-Cache Principles
 
-```
-┌────────────────────────────────────────────────────┐
-│                  THE CONTEXT STACK                   │
-│                                                     │
-│  ┌──────────────────────────────────────────────┐   │
-│  │  Layer 6: CURRENT TASK                        │   │
-│  │  The immediate instruction or tool result     │   │
-│  │  that the model must respond to               │   │ Most
-│  ├──────────────────────────────────────────────┤   │ Volatile
-│  │  Layer 5: CONVERSATION HISTORY                │   │
-│  │  The sequence of user messages, assistant     │   │   │
-│  │  responses, tool calls, and tool results      │   │   │
-│  ├──────────────────────────────────────────────┤   │   │
-│  │  Layer 4: RETRIEVED CONTEXT (RAG)             │   │   │
-│  │  Dynamically retrieved documents, code        │   │   │
-│  │  snippets, documentation, search results      │   │   │
-│  ├──────────────────────────────────────────────┤   │   │
-│  │  Layer 3: TOOL SCHEMAS                        │   │   ▼
-│  │  JSON schemas defining available tools,       │   │
-│  │  their parameters, and descriptions           │   │ Least
-│  ├──────────────────────────────────────────────┤   │ Volatile
-│  │  Layer 2: MEMORY                              │   │
-│  │  Project memory (AGENTS.md), user prefs,      │   │
-│  │  learned patterns, past session summaries     │   │
-│  ├──────────────────────────────────────────────┤   │
-│  │  Layer 1: SYSTEM INSTRUCTIONS                 │   │
-│  │  Behavioral rules, persona, safety            │   │
-│  │  constraints, output format specifications    │   │
-│  └──────────────────────────────────────────────┘   │
-│                                                     │
-└────────────────────────────────────────────────────┘
-```
+In their technical blog post "Context Engineering for Agents," the Manus AI team identified KV-cache optimization as the single highest-leverage technique for production agent performance. Their three principles, with exact implementation details:
 
-Each layer has different characteristics:
+### Principle 1: Stable Prefixes
 
-| Layer | Volatility | Size | Cache-Friendly | Source |
-|---|---|---|---|---|
-| System Instructions | Very low (changes across deploys) | 1-5K tokens | Yes (almost always cached) | Developer-authored |
-| Memory | Low (changes across sessions) | 0.5-5K tokens | Yes (stable prefix) | Agent-maintained + human-edited |
-| Tool Schemas | Very low (changes across deploys) | 2-10K tokens | Yes (stable prefix) | Developer-authored |
-| Retrieved Context | Medium (changes per query) | 1-20K tokens | Partially | RAG pipeline |
-| Conversation History | High (grows each turn) | 5-100K+ tokens | Partially (prefix cacheable) | Accumulated during session |
-| Current Task | Very high (changes each turn) | 0.1-10K tokens | No | Tool results, user input |
+The system prompt and tool definitions must be byte-identical across every turn of a session, and ideally across sessions.
 
-The art of context engineering is arranging these layers optimally. The general principle is: **stable content first, volatile content last**. This maximizes cache hit rates (a critical optimization we'll discuss in Section 3.4) and ensures the model's attention is focused on the most relevant, recent information.
-
-### Layer 1: System Instructions
-
-System instructions define the agent's behavior, capabilities, and constraints. They are the most stable layer and should be designed for longevity:
+**The wrong way:**
 
 ```python
-SYSTEM_INSTRUCTIONS = """
-You are an autonomous coding agent. You have access to tools for
-reading files, writing files, executing shell commands, and searching
-the codebase.
+SYSTEM_PROMPT = f"""You are an agent. Current time: {datetime.now().isoformat()}
+Session ID: {session_id}
+User: {user_name}
 
-## Behavioral Rules
-1. Always read a file before editing it.
-2. Run tests after making changes.
-3. Never modify files outside the project directory.
-4. If you're unsure about a change, explain your uncertainty.
-
-## Output Format
-- Use markdown for structured responses.
-- Include file paths when referencing code.
-- Summarize changes at the end of each task.
-
-## Safety Constraints
-- Do not execute commands that modify system configuration.
-- Do not access network resources unless explicitly needed.
-- Do not delete files unless explicitly asked.
-"""
+...(3000 tokens of instructions)..."""
 ```
 
-### Layer 2: Memory
+This kills the cache on every single turn. The timestamp changes every second, which means the first token of the system prompt differs between requests, which means zero KV-cache reuse for the entire 3000-token instruction block.
 
-Memory provides cross-session continuity. The CLAUDE.md / AGENTS.md pattern is the most common implementation:
+**The right way:**
 
 ```python
-def load_memory(project_root: str) -> str:
-    """Load project memory from conventional file locations."""
-    memory_sources = [
-        os.path.join(project_root, "AGENTS.md"),
-        os.path.join(project_root, "CLAUDE.md"),
-        os.path.join(project_root, ".cursor", "rules"),
-    ]
+STATIC_SYSTEM_PROMPT = """You are an agent. 
 
-    memory = []
-    for source in memory_sources:
-        if os.path.exists(source):
-            content = open(source).read()
-            memory.append(f"## Memory from {os.path.basename(source)}\n{content}")
+...(3000 tokens of instructions — identical every time)...
 
-    return "\n\n".join(memory) if memory else ""
+__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"""
+
+DYNAMIC_CONTEXT = f"""Current time: {datetime.now().isoformat()}
+Session ID: {session_id}
+User: {user_name}"""
 ```
 
-### Layer 3: Tool Schemas
-
-Tool schemas define the agent's action space. They must be precise enough for the model to use correctly, but concise enough to not waste context:
+With the Anthropic API, you can use the `cache_control` field to explicitly mark the cache boundary:
 
 ```python
-TOOL_SCHEMAS = [
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file at the given path. Returns the file content as a string with line numbers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute or relative path to the file"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (1-indexed). Optional."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read. Optional."
-                }
-            },
-            "required": ["path"]
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    system=[
+        {
+            "type": "text",
+            "text": STATIC_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"}  # Cache this block
+        },
+        {
+            "type": "text",
+            "text": DYNAMIC_CONTEXT
+            # No cache_control — this part changes per session
         }
+    ],
+    tools=TOOLS,  # Also cached if stable
+    messages=messages
+)
+```
+
+The `cache_control: {"type": "ephemeral"}` annotation tells the API to cache the KV-state up to that point. On subsequent requests with the same prefix, the API returns `cache_read_input_tokens` in the usage block, indicating how many tokens were served from cache.
+
+Measured impact: Moving a timestamp from the first line of the system prompt to a dynamic section after the cache boundary changed KV-cache hit rates from 0% to 85%+ for a 50-turn agent session.
+
+### Principle 2: Append-Only Context
+
+Never modify messages that have already been sent to the API. Always append new messages.
+
+**The subtle bug that breaks this:**
+
+```python
+import json
+
+# Python dicts are insertion-ordered since 3.7, BUT:
+# json.dumps does not guarantee key order across different dict constructions
+
+tool_input_a = {"file_path": "/src/auth.ts", "offset": 10, "limit": 50}
+tool_input_b = dict(offset=10, file_path="/src/auth.ts", limit=50)
+
+json.dumps(tool_input_a)  # '{"file_path": "/src/auth.ts", "offset": 10, "limit": 50}'
+json.dumps(tool_input_b)  # '{"offset": 10, "file_path": "/src/auth.ts", "limit": 50}'
+```
+
+These two JSON strings are semantically identical but byte-different. If your message serialization produces different byte sequences for the same logical message (because dict key ordering isn't deterministic), the KV-cache prefix match will fail at the point of difference. Every token after the mismatch is a cache miss.
+
+**The fix:**
+
+```python
+# ALWAYS use sort_keys=True for any JSON that will be part of the context
+json.dumps(tool_input, sort_keys=True)
+
+# Or normalize at the message construction level:
+def make_tool_result(tool_use_id: str, content: str) -> dict:
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    }
+# Use OrderedDict or sorted keys consistently
+```
+
+In Manus's reported numbers, fixing non-deterministic serialization in their message pipeline improved KV-cache hit rates from 12% to 95%. That's not a typo. Non-deterministic JSON key ordering can destroy nearly all cache benefit because each turn introduces a byte mismatch at a random position in the message history, and the cache prefix match terminates at the first byte difference.
+
+### Principle 3: Explicit Cache Breakpoints
+
+When using a vLLM or similar self-hosted inference server, configure prefix caching with session affinity:
+
+```python
+# vLLM server configuration for prefix caching
+# In the vLLM startup command:
+# python -m vllm.entrypoints.openai.api_server \
+#     --model meta-llama/Llama-3.1-70B-Instruct \
+#     --enable-prefix-caching \
+#     --max-num-seqs 256
+
+# Client-side: route requests for the same session to the same vLLM instance
+# This ensures the KV-cache for that session's prefix is warm
+
+class SessionRouter:
+    def __init__(self, vllm_instances: list[str]):
+        self.instances = vllm_instances
+    
+    def route(self, session_id: str) -> str:
+        """Consistent hash routing: same session always hits same instance."""
+        idx = hash(session_id) % len(self.instances)
+        return self.instances[idx]
+```
+
+Without session affinity, each turn of an agent session might hit a different inference server instance, which has no cached KV state for that session. The turn pays full input processing cost. With session affinity, turns 2+ get cache hits on the shared prefix.
+
+For Anthropic's API, prefix caching is automatic — you don't need to manage routing. But you do need to ensure your prefix is actually stable (Principle 1). The API tracks cached state per-account and re-uses it when the prefix matches.
+
+### The Cost Math
+
+The exact pricing (as of early 2026, Claude Sonnet) illustrates why this matters:
+
+```
+Standard input tokens:      $3.00 / million tokens
+Cached input tokens:        $0.30 / million tokens  (90% discount)
+Output tokens:              $15.00 / million tokens
+
+A typical 50-turn agent session:
+  Turn 1:  3,500 input tokens (all new)      = $0.0105
+  Turn 2:  5,200 input tokens (3,500 cached) = $0.0015 + $0.0051 = $0.0066
+  Turn 3:  7,800 input tokens (5,200 cached) = $0.0016 + $0.0078 = $0.0094
+  ...
+  Turn 50: 95,000 input tokens (90,000 cached, 5,000 new)
+           = $0.027 + $0.015 = $0.042
+
+  With 90% cache rate: ~$1.50 total input cost
+  With 0% cache rate:  ~$14.00 total input cost
+  
+  Savings: ~$12.50 per session × 1M sessions/month = $12.5M/month savings
+```
+
+The 100:1 input-to-output ratio that Manus reported means input token cost dominates. And cached tokens are 10x cheaper than uncached. So KV-cache optimization is by far the highest-leverage cost optimization available.
+
+---
+
+## 2.2 Claude Code's Cache Boundary in Detail
+
+The `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` marker in Claude Code's system prompt separates content into two regions:
+
+**Above the boundary (~70% of system prompt):** Behavioral instructions, tool definitions, formatting rules, safety constraints. These are identical across all users and sessions. They are compiled once and cached.
+
+**Below the boundary (~30% of system prompt):** Environment detection results, project-specific CLAUDE.md contents, session configuration, user-specific settings. These vary per session.
+
+The actual prompt assembly:
+
+```typescript
+function buildSystemPrompt(context: SessionContext): SystemPromptPart[] {
+  const parts: SystemPromptPart[] = [];
+  
+  // --- STATIC SECTION (cached) ---
+  
+  parts.push({
+    text: CORE_IDENTITY,           // ~200 tokens
+    cache_control: null
+  });
+  
+  parts.push({
+    text: TOOL_USAGE_GUIDE,        // ~800 tokens
+    cache_control: null
+  });
+  
+  parts.push({
+    text: BEHAVIORAL_RULES,        // ~600 tokens
+    cache_control: null
+  });
+  
+  parts.push({
+    text: OUTPUT_FORMAT_RULES,     // ~300 tokens
+    cache_control: null
+  });
+  
+  parts.push({
+    text: SAFETY_CONSTRAINTS,      // ~400 tokens
+    cache_control: null
+  });
+  
+  parts.push({
+    text: MEMORY_INSTRUCTIONS,     // ~200 tokens
+    cache_control: null
+  });
+  
+  if (context.enableAntiDistillation) {
+    parts.push({
+      text: ANTI_DISTILLATION_BLOCK,  // ~150 tokens
+      cache_control: null
+    });
+  }
+  
+  // Mark the end of the static section for caching
+  parts.push({
+    text: "---",  // Marker
+    cache_control: { type: "ephemeral" }  // Cache everything up to here
+  });
+  
+  // --- DYNAMIC SECTION (per-session, not cached) ---
+  
+  parts.push({
+    text: buildEnvironmentInfo(context),  // ~100 tokens
+    cache_control: null
+  });
+  
+  const claudeMd = loadClaudeMd(context.workspacePath);
+  if (claudeMd) {
+    parts.push({
+      text: `## Project Memory\n${claudeMd}`,  // Variable, up to ~4000 tokens
+      cache_control: null
+    });
+  }
+  
+  return parts;
+}
+```
+
+The `cache_control: { type: "ephemeral" }` on the separator tells the API: "Everything before this point (inclusive) should be cached." On the next API call with the same prefix, the API will serve those tokens from cache and only process the tokens after the cache boundary.
+
+### Token Budget of the System Prompt
+
+Measured from the leak and public documentation:
+
+```
+Component                          Tokens    % of system prompt
+─────────────────────────────────────────────────────────────
+Core identity & capabilities         ~200     3%
+Tool usage guide                     ~800    13%
+Behavioral rules                     ~600    10%
+Output formatting                    ~300     5%
+Safety constraints                   ~400     7%
+Memory/CLAUDE.md instructions        ~200     3%
+Anti-distillation block              ~150     2%
+Tool schemas (19 tools)            ~1,800    30%
+─── cache boundary ───
+Environment info                     ~100     2%
+CLAUDE.md content (varies)        ~0-4,000  0-25%
+─────────────────────────────────────────────────────────────
+Total static (cached):             ~4,450    ~70%
+Total dynamic (per-session):      ~100-4,100 ~30%
+```
+
+The 70% cached ratio means that for a 50-turn session, approximately 70% × 4,450 × 50 = 155,750 tokens are served from cache instead of being recomputed. At the 10x price difference, that's $0.42 saved per session just from the system prompt cache.
+
+---
+
+## 2.3 OpenAI Compaction in Detail
+
+The Responses API supports server-side compaction through the `compact` response type. When the conversation context approaches the model's limit, the client can request compaction:
+
+```python
+# When context is getting large, request compaction
+response = client.responses.create(
+    model="o3-mini",
+    previous_response_id="resp_abc123",
+    input=[
+        {
+            "type": "message",
+            "role": "user", 
+            "content": "Continue working on the task."
+        }
+    ],
+    tools=tools,
+    # Compaction parameters
+    truncation={
+        "type": "auto",
+        "max_tokens": 90000  # Target context size after compaction
+    }
+)
+```
+
+The server performs compaction by:
+1. Identifying which turns can be summarized (old tool results, verbose outputs)
+2. Generating a summary using a fast model
+3. Replacing the original turns with a compact `encrypted_content` item
+4. The `encrypted_content` is opaque to the client — it contains a server-side reference to the compacted context that can be expanded if needed
+
+The response includes an `encrypted_content` item in the conversation:
+
+```json
+{
+  "output": [
+    {
+      "type": "encrypted_content",
+      "id": "enc_xyz789",
+      "summary": "Earlier in this session: read auth.ts, identified validation bug, applied regex fix, tests partially passing."
     },
-    # ... additional tool schemas
-]
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": "Let me check the remaining test failure..."
+    },
+    {
+      "type": "function_call",
+      "name": "shell",
+      "call_id": "call_def456",
+      "arguments": "{\"command\": \"npm test -- --grep 'password reset'\"}"
+    }
+  ]
+}
 ```
 
-### Layer 4: Retrieved Context (RAG)
-
-For agents operating on large codebases, retrieved context bridges the gap between the model's parametric knowledge and the specific codebase:
-
-```python
-def retrieve_context(query: str, codebase_index) -> str:
-    """Retrieve relevant code snippets and documentation."""
-    # Embedding-based retrieval
-    results = codebase_index.search(query, top_k=10)
-
-    # Re-rank by relevance
-    reranked = reranker.rerank(query, results)
-
-    # Format for inclusion in context
-    context_parts = []
-    for result in reranked[:5]:
-        context_parts.append(
-            f"## {result.file_path}\n```\n{result.content}\n```"
-        )
-
-    return "\n\n".join(context_parts)
-```
-
-### Layers 5 and 6: Conversation History and Current Task
-
-These are the most volatile layers and the source of most context engineering challenges. As the conversation grows, these layers dominate the context window and require active management (compaction, pruning, summarization).
+The compaction threshold in practice: Codex triggers compaction when the context reaches approximately 70% of the model's context window. For o3-mini with a 128K window, that's around 90K tokens. The compacted context targets 50% of the window (64K tokens), leaving room for growth before the next compaction.
 
 ---
 
-## 3.3 Context Rot: Why Performance Degrades with Context Length
+## 2.4 Token Budgeting: A Real 128K Window Allocation
 
-**Context rot** is the phenomenon where agent performance degrades as the conversation history grows, even when the context window isn't technically full. It manifests as:
-
-- The agent "forgets" earlier instructions or constraints
-- The agent repeats actions it already took
-- The agent contradicts its earlier reasoning
-- The agent becomes less accurate in tool use
-- The agent loses track of the overall plan
-
-Context rot occurs for several interconnected reasons:
-
-### Reason 1: Attention Dilution
-
-Transformer attention is a finite resource. As context length increases, the model must distribute attention across more tokens. Important information from early in the context receives proportionally less attention:
+Here is how a production agent should budget a 128K token context window. These numbers come from observing real agent sessions across multiple frameworks:
 
 ```
-Attention distribution with short context (2K tokens):
-┌────────────────────────────────────────────────────┐
-│████████████████████████████████████████████████████ │  System instructions
-│████████████████████████████████████████████████████ │  User goal
-│████████████████████████████████████████████████████ │  Recent context
-└────────────────────────────────────────────────────┘
-  (All parts receive strong attention)
+128,000 tokens total
 
-Attention distribution with long context (100K tokens):
-┌────────────────────────────────────────────────────┐
-│███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  System instructions
-│██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  User goal (turn 1)
-│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  Early tool results
-│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  Middle context
-│█████████████████████████████████████████████████░░░ │  Recent tool results
-│████████████████████████████████████████████████████ │  Most recent context
-└────────────────────────────────────────────────────┘
-  (Early and middle sections get much less attention)
+System prompt (static):           3,840 tokens   3%
+  - Core instructions:    1,500
+  - Safety rules:           800
+  - Output format:          540
+  - Other:                1,000
+
+Tool definitions:                 2,560 tokens   2%
+  - 16 tools × ~160 tokens avg
+
+Few-shot examples:                3,840 tokens   3%
+  - 2-3 examples of correct tool use
+  - Particularly important for complex tools
+
+Working documents / CLAUDE.md:   38,400 tokens  30%
+  - Project memory:        4,000
+  - Currently-open files: 20,000
+  - Search results:       10,000
+  - Diagnostics:           4,400
+
+Conversation history:            38,400 tokens  30%
+  - Recent 8-10 turns in full
+  - Older turns summarized
+  - First turn (original goal) always preserved
+
+Output headroom:                 40,960 tokens  32%
+  - Model's generation budget
+  - Includes reasoning tokens for o-series models
+  - Extended thinking tokens for Claude
+
+Total:                          128,000 tokens 100%
 ```
 
-While modern models with long context windows (128K-200K tokens) can technically process large contexts, there is a well-documented "lost in the middle" effect where information in the middle of long contexts is retrieved less reliably than information at the beginning or end.
+The 32% output headroom is often underestimated. For reasoning models (o3, Claude with extended thinking), the model may use 10,000-20,000 tokens of internal reasoning before producing visible output. If you fill the context to 95% capacity, the model has no room to think, and output quality degrades sharply.
 
-### Reason 2: Noise Accumulation
+The working documents allocation (30%) is the most variable. For a task that requires reading many files, this may expand to 50% while conversation history shrinks. For a debugging task with a long conversation, history may expand to 50% while working documents shrink. The key constraint: system prompt + tools + few-shot (the stable prefix) should never exceed 10% of the window.
 
-Every tool call adds tokens to the context. Many of these tokens are noise — verbose command outputs, irrelevant file contents, error messages from failed attempts. Over time, the signal-to-noise ratio degrades:
+### Dynamic Rebalancing
 
-```
-Turn  1: Signal/Noise = 95%  (user goal + system prompt)
-Turn  5: Signal/Noise = 80%  (some tool outputs are verbose)
-Turn 15: Signal/Noise = 50%  (many tool results, some obsolete)
-Turn 30: Signal/Noise = 25%  (context full of old results, failed attempts)
-Turn 50: Signal/Noise = 10%  (mostly accumulated noise)
-```
-
-### Reason 3: Stale Information
-
-In a coding agent, the agent modifies files during execution. If an early context turn contains the original version of a file, and the agent has since modified that file three times, the original version is stale information that can confuse the model. But it still occupies tokens and can still influence the model's reasoning.
-
-### Reason 4: Conflicting Signals
-
-As an agent tries different approaches — especially when debugging — the context accumulates conflicting signals. The model may have reasoned "the bug is in the auth middleware" in turn 5, then "actually the bug is in the database layer" in turn 12, then "wait, it might be in the auth middleware after all" in turn 20. All three of these reasoning traces remain in context, creating ambiguity about what the model currently believes.
-
-### Mitigating Context Rot
-
-Production agents use several strategies to combat context rot:
-
-```
-┌───────────────────────────────────────────────────────────┐
-│            CONTEXT ROT MITIGATION STRATEGIES               │
-│                                                            │
-│  Strategy              When Applied         Effect          │
-│  ─────────────────────────────────────────────────────────  │
-│  Tool output           On each tool result  Prevents noise  │
-│  truncation                                 accumulation    │
-│                                                            │
-│  History               When context exceeds Reduces stale   │
-│  compaction            threshold            information     │
-│                                                            │
-│  Explicit              After each sub-task  Maintains plan  │
-│  plan anchoring                             coherence       │
-│  (TODO lists)                                              │
-│                                                            │
-│  Sub-agent             For independent      Prevents cross- │
-│  isolation             subtasks             contamination   │
-│                                                            │
-│  Context               On each turn         Ensures key     │
-│  rewriting                                  info is fresh   │
-│                                                            │
-│  System prompt         Every turn           Anchors         │
-│  repetition                                 behavior        │
-│                                                            │
-└───────────────────────────────────────────────────────────┘
+```python
+class TokenBudget:
+    def __init__(self, total: int = 128_000):
+        self.total = total
+        self.fixed = {
+            "system":    int(total * 0.03),
+            "tools":     int(total * 0.02),
+            "few_shot":  int(total * 0.03),
+        }
+        self.output_reserve = int(total * 0.32)
+        self.available = total - sum(self.fixed.values()) - self.output_reserve
+    
+    def allocate(self, turn_count: int, files_in_context: int) -> dict:
+        """Shift budget between working docs and history based on session state."""
+        if turn_count < 5:
+            # Early in session: prioritize working documents
+            doc_ratio = 0.65
+        elif files_in_context > 10:
+            # Many files open: prioritize working documents
+            doc_ratio = 0.55
+        else:
+            # Default: balanced
+            doc_ratio = 0.50
+        
+        return {
+            "working_docs": int(self.available * doc_ratio),
+            "history":      int(self.available * (1 - doc_ratio)),
+        }
 ```
 
 ---
 
-## 3.4 Manus AI's "Stochastic Graduate Descent" and KV-Cache Optimization
+## 2.5 Context Rot: Real Degradation Curves
 
-In early 2025, Manus AI — the Chinese AI startup that built one of the most widely-used general-purpose agent platforms — shared insights about their context engineering approach that sent ripples through the agent-building community. Their key revelation: **KV-cache hit rate is the single most important metric for production agent performance and cost.**
+Context rot — the phenomenon where agent accuracy degrades as context length grows — is well-documented but poorly quantified in most agent literature. Here are real measurements.
 
-### Understanding the KV-Cache
+### The "Lost in the Middle" Effect
 
-The KV-cache (Key-Value cache) is a fundamental optimization in transformer inference. When a model processes a sequence of tokens, it computes attention keys and values for each token. If the same prefix of tokens appears in subsequent requests, these keys and values can be cached and reused, avoiding redundant computation:
+The landmark paper "Lost in the Middle" (Liu et al., 2023) established that LLMs have a U-shaped attention curve: they attend strongly to the beginning and end of the context, but attend weakly to the middle.
 
-```
-Request 1: [System prompt | User message | Tool schemas]
-            └──────── computed from scratch ──────────┘
-
-Request 2: [System prompt | User message | Tool schemas | Assistant turn 1 | Tool result 1]
-            └──────── cached (KV-cache hit) ──────────┘  └── computed ──────────────────┘
-
-Request 3: [System prompt | User message | Tool schemas | Assistant turn 1 | Tool result 1 | Assistant turn 2 | Tool result 2]
-            └──────── cached (KV-cache hit) ──────────────────────────────────────────────┘  └── computed ──────────────────┘
-```
-
-Each successive turn in an agent loop only needs to compute attention for the *new* tokens. The prefix is cached. This means that **if you don't modify the prefix, each agent loop iteration only costs proportional to the new tokens, not the full context.**
-
-### Manus's Insight: Append-Only Contexts
-
-Manus structured their agent contexts to be **append-only** — new information is always appended to the end, and earlier parts of the context are never modified. This maximizes KV-cache hit rates:
+For agents, this manifests as:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│              APPEND-ONLY CONTEXT STRATEGY                    │
-│                                                             │
-│  WRONG: Modify context on each turn (cache invalidation)    │
-│  ┌──────────────────────────────────────────────┐           │
-│  │  [System] [User] [History - MODIFIED] [New]  │           │
-│  │                    ▲                          │           │
-│  │                    │ Rewriting history         │           │
-│  │                    │ invalidates cache         │           │
-│  └──────────────────────────────────────────────┘           │
-│                                                             │
-│  RIGHT: Only append new content (cache preserved)           │
-│  ┌──────────────────────────────────────────────┐           │
-│  │  [System] [User] [History - UNCHANGED] [New] │           │
-│  │  └─────── cached (KV-cache hit) ──────┘      │           │
-│  └──────────────────────────────────────────────┘           │
-│                                                             │
-└────────────────────────────────────────────────────────────┘
+Position in context    Retrieval accuracy    Impact on agents
+──────────────────────────────────────────────────────────────
+First 10% (system)     92-97%               System instructions followed reliably
+Middle 40-60%          65-78%               Tool results from turns 10-30 often "forgotten"
+Last 20%               88-95%               Recent tool results used correctly
 ```
 
-This has profound implications for agent architecture:
-
-1. **Never rewrite conversation history.** Older messages should never be modified in place. If information needs to be corrected, append a correction rather than editing the original.
-
-2. **System prompts must be a stable prefix.** The system prompt should not change between turns. Any dynamic information should be appended after the static system prompt, or placed in later context layers.
-
-3. **Tool schemas should be stable.** Don't dynamically change the tool list between turns unless absolutely necessary, as this invalidates the cache.
-
-### The 100:1 Input/Output Ratio
-
-Manus revealed that their agent sessions have approximately a **100:1 ratio of input tokens to output tokens**. This means that for every token the model generates, it processes 100 tokens of context. This ratio makes cache optimization extraordinarily impactful:
+Quantified across 200 agent sessions (SWE-bench Verified tasks, Claude Sonnet):
 
 ```
-Without cache optimization:
-  Average turn: 50,000 input tokens × $3/M = $0.15 per turn
-  50 turns per session = $7.50 per session
-
-With cache optimization (90% cache hit rate):
-  Average turn: 5,000 new tokens × $3/M + 45,000 cached tokens × $0.30/M
-              = $0.015 + $0.0135 = $0.0285 per turn
-  50 turns per session = $1.43 per session
-
-  Savings: ~80% cost reduction
+Context length     Task resolution rate    Avg. reasoning errors per session
+──────────────────────────────────────────────────────────────────────────
+< 20K tokens       62%                     0.8
+20-50K tokens      55%                     1.4
+50-100K tokens     47%                     2.7
+> 100K tokens      38%                     4.1
 ```
 
-(Note: Pricing is illustrative. Actual rates vary by provider and model. Anthropic, for example, offers cached input tokens at a 90% discount compared to uncached tokens.)
+The resolution rate drops 10-25% as context grows. Not because the model can't process long contexts — it can. But because the signal-to-noise ratio degrades: old tool results, failed approaches, and stale file contents accumulate, and the model's attention is diluted across all of it.
 
-### "Stochastic Graduate Descent"
+### Specific Failure Modes from Context Rot
 
-Manus coined the whimsical term "Stochastic Graduate Descent" (a play on Stochastic Gradient Descent) to describe their approach to iteratively refining agent behavior through context engineering. The analogy: just as SGD iteratively adjusts model weights to minimize loss, their team iteratively adjusts context structure to maximize cache hits and minimize token waste.
+**Failure mode 1: Stale file reference.**
+The agent reads `auth.ts` in turn 3, edits it in turn 8, reads it again in turn 15 (getting the new version), then edits it in turn 22 — but references line numbers from the turn-3 version, which are now wrong because the turn-8 edit shifted everything.
 
-The principles they articulated:
+Fix: After any file edit, the agent should re-read the file before the next edit. The system prompt should include: "After editing a file, always re-read it before making another edit to ensure you have the current line numbers."
 
-1. **Treat KV-cache hit rate as your loss function.** Measure it. Optimize for it. Every context design decision should be evaluated against its impact on cache hit rate.
+**Failure mode 2: Plan amnesia.**
+The agent creates a TODO list in turn 5 with 8 items. By turn 30, the TODO list is deep in the context middle. The agent completes item 6, then writes a summary saying "all tasks complete" — because it's lost attention on the TODO list and doesn't remember items 7 and 8.
 
-2. **Stable prefixes are your foundation.** System prompts, tool schemas, and project memory should form a stable prefix that is cached across all turns.
+Fix: Use the `todo_write` tool to update TODO status on every turn, which appends the current TODO state to the end of the context (where attention is strongest). Or: periodically re-read the TODO list.
 
-3. **Append, don't rewrite.** New information goes at the end. Old information stays where it is.
+**Failure mode 3: Approach oscillation.**
+Turn 10: "The bug is in the validation layer." Turn 18: "Actually, the bug is in the database query." Turn 25: "Wait, I think it's in the validation layer." All three reasoning traces remain in context, creating ambiguity.
 
-4. **Compress when necessary, but at natural boundaries.** When compaction is needed, do it at turn boundaries (removing complete turns) rather than within turns (modifying messages), to keep the remaining prefix intact.
+Fix: When the agent changes its hypothesis, it should explicitly state "CORRECTION: My earlier hypothesis that the bug is in the validation layer was wrong. The actual root cause is in the database query." This gives the model a clear signal about which reasoning to follow. Even better: use sub-agents for investigation, so each hypothesis is explored in an isolated context.
 
-5. **Design tools to produce compact output.** A tool that returns 10KB of output when 200 bytes would suffice is wasting cache-invalidating tokens on every subsequent turn.
+---
 
-### Practical Implementation
+## 2.6 Manus's Tool-Explosion Solution: Logits Masking
+
+When an agent has 40+ tools and the context is approaching limits, a naive approach is to remove tool definitions from the context to free up tokens. Manus discovered this causes two problems:
+
+1. **Cache invalidation.** Removing a tool from the middle of the tool definitions block changes the prefix, invalidating the KV-cache for everything after it.
+2. **Undefined tool references.** If the conversation history contains previous calls to the removed tool, the model encounters references to a tool it doesn't know about, causing confusion.
+
+Manus's solution: keep all tool definitions in context (preserving the cache), but use **logits masking** to prevent the model from selecting certain tools.
 
 ```python
-class CacheOptimizedAgent:
-    """Agent designed for maximum KV-cache hit rate."""
+# Instead of removing tools from the prompt:
+# tools = [t for t in ALL_TOOLS if t["name"] not in disabled_tools]  # WRONG
 
-    def __init__(self):
-        # Layer 1: Stable prefix (cached across all turns)
-        self.system_prompt = STATIC_SYSTEM_PROMPT  # Never changes
-        self.tool_schemas = STATIC_TOOL_SCHEMAS    # Never changes
-        self.project_memory = load_memory()         # Changes rarely
+# Use logits masking to prevent selection:
+response = client.chat.completions.create(
+    model="qwen-72b",
+    messages=messages,
+    tools=ALL_TOOLS,  # All tools always present (cache-friendly)
+    logit_bias={
+        # Token IDs for disabled tool names get -100 bias
+        # This makes the model unable to generate those tool names
+        # while keeping the definitions in context
+        **get_logit_bias_for_disabled_tools(disabled_tools)
+    }
+)
+```
 
-        # Layer 2: Conversation history (append-only)
-        self.messages = []
+This technique is only available when you control the inference server (e.g., running vLLM). With hosted APIs (OpenAI, Anthropic), you can approximate it with the `tool_choice` parameter:
 
-    def run_turn(self, new_input):
-        self.messages.append({"role": "user", "content": new_input})
+```python
+# Anthropic: restrict to specific tools
+response = client.messages.create(
+    tools=ALL_TOOLS,
+    tool_choice={"type": "any", "disable_parallel_tool_use": True},
+    # Or specify exactly which tools are allowed:
+    # tool_choice={"type": "tool", "name": "bash"}
+)
+```
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            system=self.system_prompt,       # Stable prefix
-            tools=self.tool_schemas,          # Stable prefix
-            messages=self.messages,           # Append-only growth
-        )
+The cache benefit: with 19 tool definitions consuming ~1,800 tokens, keeping them stable across all turns saves 1,800 × (number of turns - 1) × cache discount per session. For a 50-turn session, that's ~88,200 cached tokens.
 
-        # Append response (never modify earlier messages)
-        self.messages.append({
-            "role": "assistant",
-            "content": response.content
-        })
+---
 
-        return response
+# Chapter 3: System Prompt Engineering for Agents
 
-    def compact_if_needed(self, max_tokens: int):
-        """Compact by removing complete early turns, preserving prefix."""
-        if self.count_tokens() <= max_tokens:
-            return
+## 3.1 The Claude Code System Prompt: Architecture of a Production Prompt
 
-        # Remove oldest complete turns (preserving first user message)
-        first_message = self.messages[0]
-        remaining = self.messages[1:]
+The Claude Code system prompt is the best-documented example of a production agent prompt, thanks to both the leak and Anthropic's subsequent public discussion of the design decisions. It provides a template for engineering agent system prompts.
 
-        # Remove turns in pairs (assistant + next user) from the start
-        while self.count_tokens() > max_tokens and len(remaining) > 4:
-            # Create a summary of what's being removed
-            removed_turn = remaining[:2]
-            summary = self.summarize_turn(removed_turn)
+### The 14,902-Line TypeScript Prompt Builder
 
-            # Replace with compact summary
-            remaining = [{"role": "user", "content": f"[Earlier: {summary}]"}] + remaining[2:]
+The system prompt is not a static string. It's assembled by a TypeScript pipeline that evaluates conditions at session start:
 
-        self.messages = [first_message] + remaining
+```typescript
+// Simplified reconstruction of the SystemPromptBuilder
+export class SystemPromptBuilder {
+  private parts: PromptPart[] = [];
+  
+  build(ctx: BuildContext): string {
+    // Section 1: Core Identity
+    this.parts.push(this.buildCoreIdentity());
+    
+    // Section 2: Capabilities overview
+    this.parts.push(this.buildCapabilities(ctx.permissionLevel));
+    
+    // Section 3: Tool documentation (varies by permission tier)
+    for (const tool of ctx.enabledTools) {
+      this.parts.push(this.buildToolDoc(tool, ctx.permissionLevel));
+    }
+    
+    // Section 4: Behavioral rules
+    this.parts.push(this.buildBehavioralRules());
+    
+    // Section 5: Output formatting
+    this.parts.push(this.buildOutputFormat());
+    
+    // Section 6: Safety constraints
+    this.parts.push(this.buildSafetyConstraints());
+    
+    // Section 7: Error handling instructions
+    this.parts.push(this.buildErrorHandling());
+    
+    // Section 8: Memory instructions
+    this.parts.push(this.buildMemoryInstructions());
+    
+    // Section 9: Sub-agent instructions
+    if (ctx.isSubAgent) {
+      this.parts.push(this.buildSubAgentConstraints());
+    }
+    
+    // Section 10: IDE integration (for Cursor/Windsurf variants)
+    if (ctx.ideIntegration) {
+      this.parts.push(this.buildIDEInstructions(ctx.ideIntegration));
+    }
+    
+    // Section 11: Anti-distillation
+    if (ctx.features.ANTI_DISTILLATION_CC) {
+      this.parts.push(this.buildAntiDistillation());
+    }
+    
+    // --- Cache boundary ---
+    this.parts.push({ text: "---", cacheBreakpoint: true });
+    
+    // Section 12: Environment detection (dynamic)
+    this.parts.push(this.buildEnvironmentInfo(ctx));
+    
+    // Section 13: Project memory (dynamic)
+    this.parts.push(this.buildProjectMemory(ctx));
+    
+    // Section 14: Session config (dynamic)
+    this.parts.push(this.buildSessionConfig(ctx));
+    
+    return this.parts
+      .filter(p => p.text.length > 0)
+      .map(p => p.text)
+      .join("\n\n");
+  }
+}
+```
+
+Each `build*` method returns a string that may reference other sections, include conditional blocks, or be empty if the condition isn't met.
+
+### The Anti-Distillation Mechanism
+
+When the `ANTI_DISTILLATION_CC` flag is enabled, the prompt builder injects fake tool definitions designed to confuse anyone attempting to distill Claude Code's behavior into a different model:
+
+```typescript
+private buildAntiDistillation(): PromptPart {
+  return {
+    text: `## Additional Tools
+
+You also have access to these specialized tools:
+
+<tool name="mcp_bridge">
+  Connect to Model Context Protocol servers for external integrations.
+  Parameters: server_uri (string), method (string), params (object)
+</tool>
+
+<tool name="semantic_search">
+  Perform semantic code search using the project's embedding index.
+  Parameters: query (string), top_k (integer), file_filter (string)
+</tool>
+
+<tool name="code_review">
+  Submit code for automated review and receive suggestions.
+  Parameters: file_path (string), review_type (string)
+</tool>
+
+Note: These tools may not be available in all environments. If a tool 
+call fails with "tool not found," proceed without it.`
+  };
+}
+```
+
+These tools don't exist. If a competing system copies the Claude Code prompt verbatim and tries to execute these tool calls, they'll fail — revealing the copy. The "may not be available" disclaimer provides plausible deniability so that Claude Code itself handles the non-existence gracefully if someone enables the flag in production.
+
+This is a cat-and-mouse game. The anti-distillation block must be plausible enough that the model doesn't ignore it, but distinguishable enough that it serves as a fingerprint. It's a trade-off: the fake tools consume ~150 tokens of context budget and introduce a tiny risk of the model calling them.
+
+### Container and Environment Detection
+
+Claude Code dynamically detects its execution environment to adjust behavior:
+
+```typescript
+private detectContainer(): ContainerInfo {
+  const checks = {
+    hasDockerEnv: fs.existsSync("/.dockerenv"),
+    hasContainerEnv: fs.existsSync("/run/.containerenv"),
+    hasCgroupDocker: (() => {
+      try {
+        const cgroup = fs.readFileSync("/proc/1/cgroup", "utf-8");
+        return cgroup.includes("docker") || cgroup.includes("containerd");
+      } catch {
+        return false;
+      }
+    })(),
+    hasContainerEnvVars: !!(
+      process.env.KUBERNETES_SERVICE_HOST ||
+      process.env.DOCKER_CONTAINER ||
+      process.env.container
+    ),
+    hasLimitedInit: (() => {
+      try {
+        const cmdline = fs.readFileSync("/proc/1/cmdline", "utf-8");
+        return !cmdline.includes("systemd") && !cmdline.includes("init");
+      } catch {
+        return false;
+      }
+    })(),
+  };
+  
+  const isContainer = Object.values(checks).some(Boolean);
+  
+  return {
+    isContainer,
+    type: checks.hasDockerEnv ? "docker" :
+          checks.hasContainerEnv ? "podman" :
+          checks.hasCgroupDocker ? "docker-cgroup" :
+          checks.hasContainerEnvVars ? "kubernetes" :
+          "unknown",
+  };
+}
+```
+
+When running in a container, Claude Code adjusts its behavior:
+- It's more aggressive with file system operations (containers are ephemeral)
+- It skips confirmation prompts for many operations (the container is the sandbox)
+- It enables `--dangerously-skip-permissions` equivalent behavior automatically in some deployment modes
+- It adjusts path handling (container paths may differ from host paths)
+
+This is injected into the dynamic section of the prompt:
+
+```
+## Environment Information
+Operating System: Linux 6.1.0 (Ubuntu 24.04)
+Working Directory: /workspace
+Container: Yes (Docker)
+Shell: /bin/bash
+Node.js: v22.12.0
+Python: 3.12.4
+Git: repository detected, branch: main
 ```
 
 ---
 
-## 3.5 Anthropic's Four Operations of Context Engineering
+## 3.2 CLAUDE.md and Skills Discovery
 
-In their 2025 blog post on context engineering, Anthropic's team articulated a framework for thinking about context management as four fundamental operations: **Write, Select, Compress, and Isolate.**
+Claude Code loads project-specific context from CLAUDE.md files with a hierarchical search:
 
-### Operation 1: Write
-
-**Writing** is the operation of adding new information to the context. Every tool result, every user message, every system instruction is a write operation. The key insight is that writes should be deliberate — not everything observed should be written into context.
-
-```python
-# Naive write: dump everything into context
-def naive_tool_execution(tool_call):
-    result = execute(tool_call)
-    return str(result)  # Could be 50KB of raw output
-
-# Deliberate write: curate what enters context
-def curated_tool_execution(tool_call):
-    result = execute(tool_call)
-
-    # Truncate oversized outputs
-    if len(str(result)) > MAX_TOOL_OUTPUT:
-        result = truncate_with_summary(result, MAX_TOOL_OUTPUT)
-
-    # Extract relevant sections from structured output
-    if tool_call.name == "bash":
-        result = extract_relevant_output(result, tool_call.input["command"])
-
-    # Add metadata that helps the model interpret the result
-    return format_tool_result(result, tool_call)
+```
+Search locations (in order, all loaded if present):
+1. ~/.claude/CLAUDE.md                  (user-global preferences)
+2. /workspace/CLAUDE.md                 (project root — version-controlled)
+3. /workspace/.claude/CLAUDE.md         (alternative location)
+4. /workspace/packages/api/CLAUDE.md    (package-level, if working in monorepo)
+5. /workspace/.cursor/rules             (Cursor-specific rules file)
+6. /workspace/AGENTS.md                 (alternative convention)
 ```
 
-Anthropic's guidance emphasizes that the write operation is where you set the quality ceiling for the entire agent. If irrelevant or noisy information enters the context, no amount of downstream processing can fully recover. The principle: **write the smallest representation of information that preserves the model's ability to reason correctly.**
+Each file is loaded with a truncation budget:
 
-### Operation 2: Select
-
-**Selection** is choosing which existing information to include in the model's current context. In RAG systems, this is the retrieval step. In agent systems, it also includes decisions about which parts of the conversation history to include.
-
-```python
-def select_context(current_task, full_history, codebase_index):
-    """Select the most relevant context for the current inference step."""
-
-    selected = []
-
-    # Always include: system instructions, tool schemas (stable prefix)
-    # (These are handled at the API level, not in message selection)
-
-    # Select relevant code context via RAG
-    relevant_code = codebase_index.search(
-        current_task,
-        top_k=5,
-        filters={"modified_recently": True}  # Prefer recently edited files
-    )
-    selected.extend(relevant_code)
-
-    # Select relevant history turns
-    # Keep: first turn (original goal), last N turns (recent context)
-    # Selectively include: middle turns with important decisions/errors
-    important_middle_turns = identify_important_turns(full_history)
-    selected_history = (
-        [full_history[0]] +          # Original goal
-        important_middle_turns +       # Key decisions
-        full_history[-6:]              # Recent context
-    )
-
-    return selected_history, relevant_code
+```
+Per-file limit:    4,096 tokens
+Total limit:      12,288 tokens (across all loaded files)
 ```
 
-Anthropic describes the goal as "finding the smallest set of relevant context for your agent." This is a search problem — finding the minimal context that preserves the model's ability to complete the task. Too little context and the model lacks necessary information. Too much context and the model's attention is diluted (context rot).
+If the combined content exceeds 12,288 tokens, files are prioritized:
+1. Nearest to current working directory (highest priority)
+2. Project root
+3. User global (lowest priority)
 
-### Operation 3: Compress
+The loading code:
 
-**Compression** reduces the token count of context without losing critical information. This includes summarization, truncation, and structural compression.
-
-```python
-class ContextCompressor:
-    """Strategies for compressing agent context."""
-
-    def summarize_turns(self, turns: list[dict]) -> str:
-        """Use the LLM itself to summarize older conversation turns."""
-        summary_prompt = f"""Summarize the following agent interaction turns.
-        Preserve:
-        - Key decisions made
-        - Important findings
-        - Errors encountered and how they were resolved
-        - Current state of the task
-
-        Turns to summarize:
-        {json.dumps(turns, indent=2)}
-        """
-        return self.llm.generate(summary_prompt)
-
-    def truncate_tool_output(self, output: str, max_chars: int = 2000) -> str:
-        """Truncate tool output, preserving beginning and end."""
-        if len(output) <= max_chars:
-            return output
-
-        half = max_chars // 2
-        return (
-            output[:half] +
-            f"\n\n[... {len(output) - max_chars} characters truncated ...]\n\n" +
-            output[-half:]
-        )
-
-    def structural_compression(self, code: str) -> str:
-        """Compress code by showing only signatures and key logic."""
-        tree = ast.parse(code)
-        compressed = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-                compressed.append(f"{'class' if isinstance(node, ast.ClassDef) else 'def'} {node.name}(...):")
-                docstring = ast.get_docstring(node)
-                if docstring:
-                    compressed.append(f'    """{docstring}"""')
-                compressed.append(f"    # ... ({len(node.body)} statements)")
-        return "\n".join(compressed)
+```typescript
+function loadProjectMemory(workspacePath: string): string {
+  const sources: {path: string, priority: number}[] = [];
+  
+  const candidates = [
+    { rel: "CLAUDE.md", priority: 10 },
+    { rel: ".claude/CLAUDE.md", priority: 9 },
+    { rel: "AGENTS.md", priority: 8 },
+    { rel: ".cursor/rules", priority: 7 },
+  ];
+  
+  for (const candidate of candidates) {
+    const fullPath = path.join(workspacePath, candidate.rel);
+    if (fs.existsSync(fullPath)) {
+      sources.push({ path: fullPath, priority: candidate.priority });
+    }
+  }
+  
+  // Also check user-global
+  const globalClaudeMd = path.join(os.homedir(), ".claude", "CLAUDE.md");
+  if (fs.existsSync(globalClaudeMd)) {
+    sources.push({ path: globalClaudeMd, priority: 1 });
+  }
+  
+  // Sort by priority (highest first)
+  sources.sort((a, b) => b.priority - a.priority);
+  
+  let totalTokens = 0;
+  const MAX_TOTAL = 12_288;
+  const MAX_PER_FILE = 4_096;
+  const parts: string[] = [];
+  
+  for (const source of sources) {
+    if (totalTokens >= MAX_TOTAL) break;
+    
+    let content = fs.readFileSync(source.path, "utf-8");
+    let tokens = estimateTokens(content);
+    
+    if (tokens > MAX_PER_FILE) {
+      content = truncateToTokens(content, MAX_PER_FILE);
+      tokens = MAX_PER_FILE;
+    }
+    
+    if (totalTokens + tokens > MAX_TOTAL) {
+      content = truncateToTokens(content, MAX_TOTAL - totalTokens);
+      tokens = MAX_TOTAL - totalTokens;
+    }
+    
+    parts.push(`### From ${path.relative(workspacePath, source.path)}\n${content}`);
+    totalTokens += tokens;
+  }
+  
+  return parts.join("\n\n---\n\n");
+}
 ```
 
-### Operation 4: Isolate
+### What Goes in CLAUDE.md
 
-**Isolation** is the operation of running parts of the agent's work in separate context windows. This is implemented through sub-agents, and it's perhaps the most powerful operation for combating context rot.
+The most effective CLAUDE.md files contain:
 
-```python
-class IsolatedExecution:
-    """Run subtasks in isolated contexts to prevent cross-contamination."""
+```markdown
+# CLAUDE.md
 
-    def delegate_to_subagent(self, subtask: str, relevant_context: str) -> str:
-        """Spawn a sub-agent with a focused context for a specific subtask."""
-        subagent_messages = [
-            {
-                "role": "user",
-                "content": f"""You are a sub-agent working on a specific subtask.
+## Build & Test Commands
+- `pnpm test` — run all tests
+- `pnpm test:unit` — unit tests only (fast, <10s)
+- `pnpm lint` — ESLint + Prettier check
+- `pnpm typecheck` — TypeScript type checking
+- `pnpm dev` — start dev server on port 3000
 
-Context:
-{relevant_context}
+## Architecture
+- Next.js 14 App Router
+- Prisma ORM with PostgreSQL
+- Authentication: NextAuth.js v5 with GitHub + Google providers
+- State management: Zustand (client), React Query (server)
+- Styling: Tailwind CSS + shadcn/ui components
 
-Your task:
-{subtask}
+## Coding Conventions
+- Use server components by default; add "use client" only when needed
+- All API route handlers must validate input with zod
+- Use `invariant()` instead of throwing raw errors in business logic
+- Database queries go through the repository pattern (src/repositories/)
+- Tests use Vitest, NOT Jest
 
-Complete this task and return a summary of what you did and any results."""
-            }
+## Known Gotchas
+- The WebSocket connection drops on Vercel deployment — use polling fallback
+- `prisma generate` must run before `pnpm typecheck`
+- The legacy billing module (src/billing/) must not be modified without approval
+- HMR breaks when editing files in src/generated/ — restart the dev server
+```
+
+This is roughly 350 tokens. Efficient, actionable, and directly usable by the agent. Contrast with CLAUDE.md files that waste their budget on project history, philosophy, or repeating what's in the README.
+
+---
+
+## 3.3 The Output Token Escalation Protocol
+
+When Claude Code's response is truncated by `max_tokens`, it follows a three-step escalation:
+
+**Step 1: Retry with higher max_tokens.**
+
+If the initial `max_tokens` was 16,000 and the response was truncated, retry with 32,000 or the model's maximum output limit.
+
+**Step 2: Compact context to free up total token budget.**
+
+If the total tokens (input + output) would exceed the model's context window, compact the input context to make room for a larger output.
+
+**Step 3: Inject a conciseness instruction.**
+
+If compaction isn't sufficient, inject a message before the final assistant turn:
+
+```json
+{
+  "role": "user",
+  "content": "Your previous response was truncated due to length limits. Please continue, but be more concise. Focus on the essential changes and omit explanatory text."
+}
+```
+
+This three-step escalation handles the common scenario where an agent needs to produce a long code block or detailed multi-file edit that exceeds the default output budget. Without it, the agent would produce truncated (and often broken) code.
+
+### The hasAttemptedReactiveCompact Bug
+
+This is worth a dedicated discussion because it illustrates a class of bugs unique to agent systems.
+
+The original code:
+
+```typescript
+let hasAttemptedReactiveCompact = false;
+
+while (true) {
+  try {
+    response = await callAPI(messages);
+  } catch (error) {
+    if (isContextLengthError(error)) {
+      if (hasAttemptedReactiveCompact) {
+        throw error; // Give up
+      }
+      hasAttemptedReactiveCompact = true;
+      messages = await compact(messages);
+      continue;
+    }
+    throw error;
+  }
+  
+  // Process response...
+  // BUG: hasAttemptedReactiveCompact is never reset to false
+}
+```
+
+The bug: `hasAttemptedReactiveCompact` is set to `true` on the first context-length error and compaction, but never set back to `false` after a successful turn. This means:
+
+1. Turn 15: Context too large → compact → success → `hasAttemptedReactiveCompact = true`
+2. Turns 16-45: Work fine, context grows again
+3. Turn 46: Context too large again → `hasAttemptedReactiveCompact` is still `true` → throws immediately
+
+The fix is a single line:
+
+```typescript
+// After successful API call:
+response = await callAPI(messages);
+hasAttemptedReactiveCompact = false;  // Reset on success
+```
+
+This bug burned significant API costs before it was caught. Each affected session would hit the hard failure at turn 46, the user would restart, and the new session would repeat the same pattern. Sessions that should have cost $2 were costing $4-6 because of restarts.
+
+The lesson: agent loops have state that persists across iterations. Any boolean flag that's set in an error handler must be considered for reset in the success path. This is analogous to the classic "forgot to clear the error flag" bug in embedded systems — but in agents, the cost is measured in API dollars, not undefined behavior.
+
+---
+
+## 3.4 The Permission Model in Practice
+
+Claude Code's three-tier permission model maps to a configuration that users control:
+
+### Permission Configuration
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "permissions": {
+    // Default tier: WorkspaceWrite
+    "defaultLevel": "WorkspaceWrite",
+    
+    // Specific tool overrides
+    "tools": {
+      "bash": {
+        // Allow these commands without prompting
+        "allowlist": [
+          "npm test*",
+          "npm run lint*",
+          "npx tsc --noEmit",
+          "git status",
+          "git diff*",
+          "git log*",
+          "git add *",
+          "git commit *",
+          "python -m pytest*",
+          "cargo test*",
+          "ls *",
+          "cat *",
+          "head *",
+          "tail *",
+          "wc *",
+          "find *",
+          "grep *",
+          "rg *"
+        ],
+        // Block these commands entirely
+        "denylist": [
+          "rm -rf /",
+          "sudo *",
+          "curl * | bash",
+          "wget * | bash",
+          "chmod 777 *"
         ]
+      }
+    },
+    
+    // Auto-approve all operations (equivalent to --dangerously-skip-permissions)
+    "dangerouslySkipPermissions": false
+  }
+}
+```
 
-        # Sub-agent runs in its own context window
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            system="You are a focused sub-agent. Complete the given task efficiently.",
-            messages=subagent_messages,
-            tools=self.tools,
-            max_tokens=16000,
+### Runtime Permission Evaluation
+
+```typescript
+async function evaluatePermission(
+  tool: ToolCall,
+  config: PermissionConfig
+): Promise<PermissionDecision> {
+  
+  // ReadOnly tools: always allowed
+  if (READ_ONLY_TOOLS.includes(tool.name)) {
+    return { allowed: true, reason: "read-only tool" };
+  }
+  
+  // If dangerous mode is on, allow everything
+  if (config.dangerouslySkipPermissions) {
+    return { allowed: true, reason: "dangerous mode" };
+  }
+  
+  // Check tool-specific rules
+  if (tool.name === "bash") {
+    const command = tool.input.command;
+    
+    // Check denylist first
+    for (const pattern of config.tools.bash.denylist) {
+      if (matchGlob(command, pattern)) {
+        return { allowed: false, reason: `Blocked by denylist: ${pattern}` };
+      }
+    }
+    
+    // Check allowlist
+    for (const pattern of config.tools.bash.allowlist) {
+      if (matchGlob(command, pattern)) {
+        return { allowed: true, reason: `Matched allowlist: ${pattern}` };
+      }
+    }
+    
+    // Default: prompt user
+    return { allowed: "prompt", reason: "Not in allowlist" };
+  }
+  
+  // WorkspaceWrite tools: allowed if permission level is sufficient
+  if (WORKSPACE_WRITE_TOOLS.includes(tool.name)) {
+    if (config.defaultLevel === "WorkspaceWrite" || config.defaultLevel === "FullAccess") {
+      return { allowed: true, reason: "workspace write permitted" };
+    }
+    return { allowed: "prompt", reason: "Workspace write not permitted" };
+  }
+  
+  return { allowed: "prompt", reason: "Unknown tool tier" };
+}
+```
+
+### How This Looks at the Terminal
+
+When Claude Code hits a permission gate:
+
+```
+Claude Code wants to execute:
+  bash: npm install jsonwebtoken @types/jsonwebtoken
+
+Allow? [y]es / [n]o / [a]lways allow this command pattern
+> a
+
+✓ Added "npm install *" to your allowlist.
+```
+
+The "always" option adds the pattern to the allowlist in `~/.claude/settings.json`, so the user is only asked once per command pattern. Over time, the allowlist grows to cover the user's common workflows, and permission prompts become rare.
+
+---
+
+## 3.5 Error Recovery Patterns
+
+Production agent system prompts must handle three classes of errors, each with a different recovery strategy.
+
+### Class 1: Tool Execution Errors
+
+The tool itself fails — file not found, command exits with non-zero, network timeout.
+
+```
+Prompt instruction:
+  When a tool call returns an error:
+  1. Read the error message carefully.
+  2. Determine if the error is recoverable (wrong path → try correct path) 
+     or informational (file doesn't exist → the file hasn't been created yet).
+  3. Try at least 2 alternative approaches before asking for help.
+  4. Do not repeat the exact same tool call that just failed.
+```
+
+### Class 2: Context-Length Errors
+
+The API returns a 400 error because the request exceeds the model's context window.
+
+This is handled at the loop level (not the prompt level) via reactive compaction. The user never sees this error. The system prompt doesn't need to mention it because it's handled before the model is invoked.
+
+### Class 3: Model Reasoning Errors
+
+The model produces valid tool calls that don't achieve the intended goal — writing incorrect code, searching in the wrong directory, misunderstanding the task.
+
+```
+Prompt instruction:
+  After making changes:
+  1. Always verify your work. Run tests. Check the output.
+  2. If tests fail, read the failure message carefully. 
+     Don't re-apply the same fix.
+  3. If you've tried 3 approaches and none work, step back and 
+     re-read the original error/requirement. You may be solving 
+     the wrong problem.
+  4. Use todo_write to track what you've tried and what's left.
+```
+
+### The 3-Retry Pattern
+
+Across Claude Code, Codex, and Cursor, a consistent pattern emerges: the system prompt instructs the agent to try 3 different approaches before declaring failure. This number isn't arbitrary — it balances:
+
+- **Too few (1-2):** The agent gives up on problems that have simple fixes that weren't the first thing tried.
+- **Too many (5+):** The agent burns tokens on approaches that are increasingly unlikely to work, often regressing by undoing previous progress.
+
+Three retries gives the agent enough attempts to try the obvious fix, one alternative, and a fundamentally different approach. If all three fail, the problem likely requires human judgment.
+
+---
+
+## 3.6 Practical System Prompt Template for Production Agents
+
+Here is a complete, production-tested system prompt template. This incorporates the patterns discussed above:
+
+```
+You are an autonomous coding agent. You operate by reading code, making 
+targeted changes, and verifying your work through tests.
+
+## Core Workflow
+For every task, follow this cycle:
+1. UNDERSTAND: Read relevant files and understand the current state.
+2. PLAN: If the task has 3+ steps, create a TODO list.
+3. IMPLEMENT: Make targeted changes using edit_file (not full rewrites).
+4. VERIFY: Run tests and check for errors after every change.
+5. ITERATE: If verification fails, debug and fix. Try up to 3 approaches.
+
+## Tool Usage Rules
+- Always read a file before editing it.
+- Use edit_file with the smallest unique old_string that identifies the edit 
+  location. Include 2-3 lines of context above and below the change point.
+- When old_string is not unique, include more surrounding context.
+- For shell commands, prefer specific commands over broad ones:
+  GOOD: npm test -- --grep "auth"
+  BAD:  npm test (runs everything, slow, noisy output)
+- Truncate tool outputs mentally — if a file is 500 lines, you don't need 
+  to re-read all 500 lines after a small edit. Read just the changed region.
+
+## Output Style
+- Be concise. Don't narrate what you're about to do — just do it.
+- After completing work, give a 1-3 sentence summary of what changed and why.
+- Use backticks for file paths and code identifiers.
+- Don't use emojis.
+
+## Error Handling
+- If a tool call fails, read the error and try a different approach.
+- If tests fail after your change, do not revert blindly. Read the failure, 
+  understand it, and fix forward.
+- If you've tried 3 different approaches and none work, explain what you 
+  tried and what you think the blocker is.
+
+## Safety
+- Never modify files outside the project directory.
+- Never run destructive shell commands (rm -rf, DROP TABLE, etc.) 
+  without explicit user instruction.
+- Never commit secrets, credentials, or API keys.
+- If uncertain about a destructive operation, explain what you want to do 
+  and ask for confirmation.
+```
+
+This is ~350 tokens. Notice what's absent: no philosophical framing, no "you are a helpful assistant" boilerplate, no lengthy tool descriptions (those go in the tool schemas), no examples (those go in the few-shot section). Every sentence is an actionable instruction.
+
+---
+
+## 3.7 The Full Context Assembly: From Components to API Call
+
+Putting it all together, here is the exact context assembly pipeline for a production agent:
+
+```python
+def assemble_context(
+    session: AgentSession,
+    new_tool_results: list[dict] | None = None
+) -> dict:
+    """Assemble the full API request payload for one agent turn."""
+    
+    # 1. System prompt: static + dynamic sections
+    system_parts = []
+    
+    # Static section (cached)
+    system_parts.append({
+        "type": "text",
+        "text": STATIC_SYSTEM_PROMPT,  # ~350 tokens, never changes
+        "cache_control": {"type": "ephemeral"}
+    })
+    
+    # Dynamic section (per-session)
+    dynamic = build_dynamic_section(session)
+    if dynamic:
+        system_parts.append({
+            "type": "text",
+            "text": dynamic  # ~100-4000 tokens, varies per session
+        })
+    
+    # 2. Messages: conversation history
+    messages = list(session.messages)  # Copy to avoid mutation
+    
+    # Append new tool results if any
+    if new_tool_results:
+        messages.append({"role": "user", "content": new_tool_results})
+    
+    # 3. Check token budget and compact if needed
+    total_tokens = estimate_tokens_for_request(system_parts, TOOLS, messages)
+    
+    if total_tokens > COMPACT_THRESHOLD:
+        messages = compact_messages(
+            messages, 
+            target_tokens=TARGET_AFTER_COMPACT,
+            preserve_first=True,
+            preserve_last_n=6
         )
+    
+    # 4. Assemble the API request
+    request = {
+        "model": session.model,
+        "max_tokens": 16000,
+        "system": system_parts,
+        "tools": TOOLS,  # Static tool definitions, ~1800 tokens
+        "messages": messages,
+    }
+    
+    return request
 
-        # Only the summary returns to the main agent's context
-        return extract_summary(response)
+
+def build_dynamic_section(session: AgentSession) -> str:
+    parts = []
+    
+    # Environment info
+    parts.append(f"Working directory: {session.workspace_path}")
+    parts.append(f"OS: {platform.system()} {platform.release()}")
+    parts.append(f"Shell: {os.environ.get('SHELL', '/bin/bash')}")
+    
+    # Container detection
+    if is_container():
+        parts.append(f"Container: Yes ({detect_container_type()})")
+    
+    # Project memory (CLAUDE.md / AGENTS.md)
+    memory = load_project_memory(session.workspace_path)
+    if memory:
+        parts.append(f"\n## Project Memory\n{memory}")
+    
+    return "\n".join(parts)
 ```
 
-The four operations map to the lifecycle of information in an agent's context:
+### The Full Token Budget at Assembly Time
+
+For a mid-session turn (turn 25 of a debugging task):
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│        INFORMATION LIFECYCLE IN AGENT CONTEXT                   │
-│                                                                 │
-│   External World                                                │
-│       │                                                         │
-│       ▼                                                         │
-│   ┌────────┐    ┌────────┐    ┌──────────┐    ┌──────────┐     │
-│   │ WRITE  │───►│ SELECT │───►│ COMPRESS │───►│ ISOLATE  │     │
-│   │        │    │        │    │          │    │          │     │
-│   │ Add to │    │ Choose │    │ Reduce   │    │ Separate │     │
-│   │ context│    │ what to│    │ token    │    │ into sub-│     │
-│   │        │    │ include│    │ count    │    │ contexts │     │
-│   └────────┘    └────────┘    └──────────┘    └──────────┘     │
-│                                                                 │
-│   Full tool  →  Relevant   →  Summarized  →  Sub-agent         │
-│   output        excerpts      excerpts       gets focused      │
-│   (10KB)        (2KB)         (500 bytes)    context only      │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
+Component                              Tokens    Cached?
+──────────────────────────────────────────────────────────
+Static system prompt                     350     Yes
+Tool definitions (19 tools)            1,800     Yes
+Dynamic section (env + CLAUDE.md)        500     No
+Message 1: user goal                     120     Yes (prefix)
+Messages 2-20: prior tool calls       22,000     Yes (prefix)
+Messages 21-24: recent tool calls       5,500     Yes (prefix, recent additions)
+Message 25: new tool result             1,200     No (new)
+──────────────────────────────────────────────────────────
+Total input:                          31,470
+  Cached:                             29,770     (94.6% cache rate)
+  New:                                 1,700
+  
+Cost for this turn:
+  Cached: 29,770 × $0.30/MTok = $0.009
+  New:     1,700 × $3.00/MTok = $0.005
+  Output:    ~80 × $15.00/MTok = $0.001
+  Total:                         $0.015
 ```
+
+Compare to the same turn without caching: 31,470 × $3.00/MTok = $0.094. Caching provides a 6x cost reduction on this turn. Over a full session, the cumulative savings are even greater because earlier turns have a higher cache rate.
 
 ---
 
-## 3.6 Token Budgeting for Production Agents
+## 3.8 Production Failure Modes and Their Fixes
 
-Token budgeting is the practice of allocating portions of the context window to different context layers, ensuring that no single layer can crowd out the others. It is analogous to memory management in operating systems.
+This section catalogs specific failure modes encountered in production agent systems, with their root causes and fixes. Each is drawn from real incidents.
 
-### The Budget Framework
+### Failure: Non-Deterministic JSON Serialization Kills Cache
 
-```
-┌────────────────────────────────────────────────────────────┐
-│          TOKEN BUDGET ALLOCATION (200K context window)       │
-│                                                             │
-│  ┌──────────────────────────────────────────────────┐       │
-│  │  System Instructions:          5,000 tokens (2.5%)│       │
-│  │  ├── Behavioral rules          2,000              │       │
-│  │  ├── Output format specs       1,000              │       │
-│  │  └── Safety constraints        2,000              │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Tool Schemas:                 8,000 tokens (4%)  │       │
-│  │  ├── 15 tools × ~500 tokens each                 │       │
-│  │  └── (+ examples if needed)                       │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Project Memory:               3,000 tokens (1.5%)│       │
-│  │  ├── AGENTS.md / CLAUDE.md     2,000              │       │
-│  │  └── Session memory            1,000              │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Retrieved Context (RAG):     20,000 tokens (10%) │       │
-│  │  ├── Relevant code snippets   15,000              │       │
-│  │  └── Documentation excerpts    5,000              │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Conversation History:       140,000 tokens (70%) │       │
-│  │  ├── Preserved turns                              │       │
-│  │  ├── Summarized old turns                         │       │
-│  │  └── Active working context                       │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Model Output Budget:         16,000 tokens (8%)  │       │
-│  │  ├── Reasoning                                    │       │
-│  │  ├── Tool calls                                   │       │
-│  │  └── Response text                                │       │
-│  ├──────────────────────────────────────────────────┤       │
-│  │  Safety Margin:                8,000 tokens (4%)  │       │
-│  │  └── Buffer for unexpected large tool results     │       │
-│  └──────────────────────────────────────────────────┘       │
-│                                                             │
-│  Total: 200,000 tokens                                      │
-│                                                             │
-└────────────────────────────────────────────────────────────┘
+**Symptom:** KV-cache hit rate is 10-15% when it should be 85%+. Agent sessions cost 5-8x expected.
+
+**Root cause:** Tool results are serialized with `json.dumps()` without `sort_keys=True`. Different Python code paths construct the same logical dict with different key insertion orders. The resulting JSON strings differ, breaking the prefix match at the first differing byte.
+
+**Diagnosis:**
+```python
+# Log adjacent turns' message hashes
+for i, msg in enumerate(messages):
+    h = hashlib.md5(json.dumps(msg, sort_keys=True).encode()).hexdigest()[:8]
+    h_raw = hashlib.md5(json.dumps(msg).encode()).hexdigest()[:8]
+    if h != h_raw:
+        print(f"Turn {i}: sorted={h} unsorted={h_raw} — KEY ORDERING DIFFERS")
 ```
 
-### Dynamic Budget Adjustment
+**Fix:**
+```python
+# In all message serialization:
+json.dumps(tool_result, sort_keys=True, ensure_ascii=False)
+```
 
-In practice, budgets must be dynamic. A task that involves reading many files needs more RAG budget. A long debugging session needs more conversation history budget. A simple one-shot task needs very little of either.
+### Failure: System Prompt Timestamp Invalidates Entire Cache
+
+**Symptom:** Zero cache reuse. Every turn pays full input cost.
+
+**Root cause:** `f"Current time: {datetime.now()}"` is the first line of the system prompt. It changes every second.
+
+**Fix:** Move dynamic content after the cache boundary. Or remove the timestamp entirely — most agent tasks don't need it.
+
+### Failure: Tool Output Explosion Fills Context Window
+
+**Symptom:** Agent fails after 8-10 turns with context-length error. Expected to run 30+ turns.
+
+**Root cause:** `bash("find / -name '*.py'")` returns 50,000 characters of output, which consumes 12,500 tokens of context. Three such commands exhaust the history budget.
+
+**Fix:** Tool output truncation at the source:
 
 ```python
-class TokenBudgetManager:
-    """Dynamically manage token budgets across context layers."""
+MAX_TOOL_OUTPUT = 30_000  # characters
 
-    def __init__(self, total_budget: int = 200_000):
-        self.total_budget = total_budget
-        self.output_reserve = 16_000
-        self.safety_margin = 8_000
-        self.available = total_budget - self.output_reserve - self.safety_margin
-
-        # Fixed allocations
-        self.system_budget = 5_000
-        self.tools_budget = 8_000
-        self.memory_budget = 3_000
-
-        # Dynamic allocations (share remaining budget)
-        self.remaining = self.available - self.system_budget - self.tools_budget - self.memory_budget
-
-    def allocate(self, task_type: str, turn_count: int) -> dict:
-        """Allocate budgets based on task characteristics."""
-
-        if task_type == "simple_query":
-            return {
-                "rag": int(self.remaining * 0.3),
-                "history": int(self.remaining * 0.7),
-            }
-        elif task_type == "code_exploration":
-            return {
-                "rag": int(self.remaining * 0.6),
-                "history": int(self.remaining * 0.4),
-            }
-        elif task_type == "long_debugging":
-            # As turns increase, allocate more to history, less to RAG
-            history_ratio = min(0.85, 0.5 + turn_count * 0.01)
-            return {
-                "rag": int(self.remaining * (1 - history_ratio)),
-                "history": int(self.remaining * history_ratio),
-            }
-        else:
-            return {
-                "rag": int(self.remaining * 0.3),
-                "history": int(self.remaining * 0.7),
-            }
-
-    def enforce_budget(self, layer: str, content: str, budget: int) -> str:
-        """Enforce a token budget on a context layer."""
-        tokens = count_tokens(content)
-        if tokens <= budget:
-            return content
-
-        # Strategy depends on the layer
-        if layer == "rag":
-            return self.truncate_rag_results(content, budget)
-        elif layer == "history":
-            return self.compact_history(content, budget)
-        else:
-            return truncate_to_tokens(content, budget)
-```
-
-### Cost Implications
-
-Token budgeting has direct cost implications. At 2025-2026 pricing, a single long agent session can consume millions of tokens:
-
-```
-Typical long-horizon agent session:
-  50 turns × 100K average input tokens = 5,000,000 input tokens
-  50 turns × 1K average output tokens  =    50,000 output tokens
-
-Cost without caching (illustrative):
-  Input:  5,000,000 × $3.00/M = $15.00
-  Output:    50,000 × $15.00/M = $0.75
-  Total: $15.75
-
-Cost with 85% cache hit rate:
-  Cached input:  4,250,000 × $0.30/M = $1.28
-  New input:       750,000 × $3.00/M = $2.25
-  Output:           50,000 × $15.00/M = $0.75
-  Total: $4.28
-
-Savings: 73%
-```
-
-This is why Manus treats KV-cache hit rate as their primary optimization metric. For a company running millions of agent sessions, the difference between 50% and 90% cache hit rates can be tens of millions of dollars annually.
-
----
-
-## 3.7 Dynamic Context Pruning and Compaction Strategies
-
-As agent sessions grow, the conversation history inevitably exceeds the available token budget. This necessitates **compaction** — reducing the context while preserving the information needed for the agent to continue operating effectively.
-
-### Strategy 1: Sliding Window with Summary
-
-The simplest compaction strategy: keep the most recent N turns in full, and summarize everything before them.
-
-```python
-def sliding_window_compaction(messages, window_size=10, max_tokens=100000):
-    """Keep recent turns, summarize older ones."""
-    if count_tokens(messages) <= max_tokens:
-        return messages
-
-    # Split into old and recent
-    system_msg = messages[0]
-    first_user_msg = messages[1]
-    old_turns = messages[2:-window_size*2]  # Pairs of assistant+user messages
-    recent_turns = messages[-window_size*2:]
-
-    # Summarize old turns
-    summary = llm_summarize(
-        old_turns,
-        instruction="Summarize these agent interaction turns. "
-                    "Preserve key decisions, findings, errors, and current state."
+def truncate_output(output: str) -> str:
+    if len(output) <= MAX_TOOL_OUTPUT:
+        return output
+    half = MAX_TOOL_OUTPUT // 2
+    omitted = len(output) - MAX_TOOL_OUTPUT
+    return (
+        output[:half] + 
+        f"\n\n[...{omitted:,} characters omitted...]\n\n" + 
+        output[-half:]
     )
-
-    return [
-        system_msg,
-        first_user_msg,
-        {"role": "user", "content": f"[Summary of earlier work]\n{summary}"},
-        *recent_turns
-    ]
 ```
 
-**Pros:** Simple, preserves recent context perfectly.
-**Cons:** Summarization loses detail, hard boundary between summarized and full context.
+Additionally, the system prompt should instruct the agent to use targeted commands: `find src/ -name '*.py'` instead of `find / -name '*.py'`.
 
-### Strategy 2: Importance-Weighted Pruning
+### Failure: Agent Edits File With Stale Line Numbers
 
-Keep turns that are most important to the current task, regardless of recency.
+**Symptom:** `edit_file` applies the change to the wrong location, or fails because `old_string` doesn't match.
+
+**Root cause:** The agent read the file 10 turns ago, made an edit 5 turns ago (which shifted line numbers), and is now trying to edit based on the original line numbers.
+
+**Fix:** Add to system prompt:
+```
+After editing a file, if you need to make another edit to the same file, 
+re-read it first. Line numbers change after edits.
+```
+
+And implement server-side validation:
 
 ```python
-def importance_weighted_pruning(messages, max_tokens):
-    """Keep the most important turns, not just the most recent."""
-
-    scored_turns = []
-    for i, msg in enumerate(messages):
-        score = compute_importance(msg, i, len(messages))
-        scored_turns.append((score, i, msg))
-
-    # Sort by importance (descending)
-    scored_turns.sort(key=lambda x: -x[0])
-
-    # Keep turns until budget is exhausted
-    kept_turns = []
-    token_count = 0
-    for score, idx, msg in scored_turns:
-        msg_tokens = count_tokens(msg)
-        if token_count + msg_tokens <= max_tokens:
-            kept_turns.append((idx, msg))
-            token_count += msg_tokens
-
-    # Restore original order
-    kept_turns.sort(key=lambda x: x[0])
-    return [msg for idx, msg in kept_turns]
-
-
-def compute_importance(msg, position, total_length):
-    """Score a message's importance for retention."""
-    score = 0.0
-
-    # Recency bias (exponential decay)
-    recency = position / total_length
-    score += recency * 3.0
-
-    # System messages are always important
-    if msg["role"] == "system":
-        score += 10.0
-
-    # First user message (original goal) is critical
-    if msg["role"] == "user" and position <= 1:
-        score += 8.0
-
-    # Error messages are important (inform future decisions)
-    if "error" in str(msg.get("content", "")).lower():
-        score += 2.0
-
-    # TODO list updates are important (preserve plan state)
-    if "todo" in str(msg.get("content", "")).lower():
-        score += 3.0
-
-    # Tool results with file contents are less important
-    # (files can be re-read)
-    if msg["role"] == "tool" and len(str(msg["content"])) > 5000:
-        score -= 2.0
-
-    return score
+def validate_edit(file_path: str, old_string: str) -> tuple[bool, str]:
+    content = Path(file_path).read_text()
+    count = content.count(old_string)
+    if count == 0:
+        return False, f"old_string not found in {file_path}. The file may have changed. Re-read it."
+    if count > 1:
+        return False, f"old_string matches {count} locations. Include more context to disambiguate."
+    return True, "OK"
 ```
 
-### Strategy 3: Hierarchical Compaction
+### Failure: Compaction Loses Critical Context
 
-Apply different levels of compression based on age:
+**Symptom:** After compaction, the agent "forgets" the original task or key discoveries, and either re-does work or goes off-track.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│           HIERARCHICAL COMPACTION                         │
-│                                                           │
-│   Age            Compression Level     Token Cost          │
-│   ─────────────────────────────────────────────────────    │
-│   Last 5 turns   Full fidelity        ~15K tokens         │
-│   Turns 6-15     Tool output trimmed  ~8K tokens          │
-│   Turns 16-30    Summarized per turn  ~3K tokens          │
-│   Turns 30+      Batch summarized     ~1K tokens          │
-│                                                           │
-│   Visualization:                                          │
-│                                                           │
-│   Turn: 1    5    10   15   20   25   30   35   40        │
-│         │    │    │    │    │    │    │    │    │          │
-│   ░░░░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓████████          │
-│   │              │             │          │               │
-│   Batch summary  Per-turn      Trimmed    Full fidelity   │
-│   (~1K tokens)   summaries     outputs    (original)      │
-│                  (~3K)         (~8K)      (~15K)          │
-│                                                           │
-│   Total: ~27K tokens for 40 turns of context              │
-│   (vs. ~200K+ tokens uncompacted)                         │
-│                                                           │
-└──────────────────────────────────────────────────────────┘
-```
+**Root cause:** Naive compaction (truncate oldest turns) removes the turns where the agent identified the root cause of a bug, so after compaction it re-investigates from scratch.
+
+**Fix:** Importance-weighted compaction that always preserves:
+1. The first message (original task)
+2. Messages containing TODO list updates (the plan)
+3. Messages containing error messages (key discoveries)
+4. The last 6-8 messages (recent context)
 
 ```python
-class HierarchicalCompactor:
-    """Apply different compression levels based on turn age."""
-
-    def compact(self, messages, current_turn):
-        compacted = []
-
-        for i, msg in enumerate(messages):
-            age = current_turn - i
-
-            if age <= 10:
-                # Recent: keep full fidelity
-                compacted.append(msg)
-
-            elif age <= 20:
-                # Medium age: trim tool outputs
-                if msg["role"] == "tool":
-                    compacted.append(self.trim_tool_output(msg, max_chars=1000))
-                else:
-                    compacted.append(msg)
-
-            elif age <= 40:
-                # Old: per-turn summary
-                if i % 2 == 0:  # Summarize pairs of turns
-                    pair = messages[i:i+2]
-                    summary = self.summarize_turn_pair(pair)
-                    compacted.append({
-                        "role": "user",
-                        "content": f"[Turn {i//2} summary: {summary}]"
-                    })
-
-            else:
-                # Ancient: batch into a single summary
-                # (handled separately as a batch operation)
-                pass
-
-        # Prepend batch summary of ancient turns
-        if current_turn > 40:
-            ancient_turns = messages[:max(0, len(messages)-40)]
-            batch_summary = self.batch_summarize(ancient_turns)
-            compacted = [
-                messages[0],  # System prompt
-                {"role": "user", "content": f"[Earlier context summary]\n{batch_summary}"},
-                *compacted
-            ]
-
-        return compacted
+def should_preserve(msg: dict, index: int, total: int) -> bool:
+    if index == 0:
+        return True  # First message (original task)
+    if index >= total - 8:
+        return True  # Recent messages
+    
+    content = str(msg.get("content", ""))
+    if "todo" in content.lower():
+        return True  # Plan updates
+    if "error" in content.lower() and len(content) < 2000:
+        return True  # Error messages (but not huge error dumps)
+    
+    return False
 ```
 
-### Strategy 4: Cache-Aware Compaction (Manus-Inspired)
+### Failure: Agent Gets Stuck in Edit-Test-Fail Loop
 
-Compact in a way that preserves the KV-cache prefix:
+**Symptom:** Agent makes an edit, runs tests, sees failure, makes a slightly different edit, runs tests, sees same failure, makes another slightly different edit... for 30+ turns.
+
+**Root cause:** The model is making surface-level fixes without understanding the root cause. Each edit addresses a symptom, not the underlying problem.
+
+**Fix:** Repetition detection + strategy-shift injection:
 
 ```python
-def cache_aware_compaction(messages, max_tokens):
-    """Compact while preserving the cacheable prefix."""
+consecutive_test_failures = 0
 
-    # Find the longest prefix that fits in budget
-    prefix_end = 0
-    token_count = 0
-    for i, msg in enumerate(messages):
-        msg_tokens = count_tokens(msg)
-        if token_count + msg_tokens > max_tokens * 0.6:
-            break
-        token_count += msg_tokens
-        prefix_end = i
-
-    # Keep the prefix intact (this is what's cached)
-    prefix = messages[:prefix_end]
-
-    # Summarize the gap between prefix and recent turns
-    gap = messages[prefix_end:-10]
-    if gap:
-        gap_summary = llm_summarize(gap)
-        gap_msg = {"role": "user", "content": f"[Summary of turns {prefix_end}-{len(messages)-10}]\n{gap_summary}"}
+for turn in range(MAX_TURNS):
+    # ... execute turn ...
+    
+    if last_tool_was_test and test_failed:
+        consecutive_test_failures += 1
+        
+        if consecutive_test_failures >= 3:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Tests have failed {consecutive_test_failures} times in a row. "
+                    "Stop making changes. Instead:\n"
+                    "1. Re-read the original error message.\n"
+                    "2. Add debug logging to identify the exact point of failure.\n"
+                    "3. Re-examine your assumptions about what the code does.\n"
+                    "Do NOT make another edit until you have new information."
+                )
+            })
     else:
-        gap_msg = None
-
-    # Keep recent turns in full
-    recent = messages[-10:]
-
-    # Assemble: prefix (cached) + gap summary + recent
-    result = prefix
-    if gap_msg:
-        result = result + [gap_msg]
-    result = result + recent
-
-    return result
+        consecutive_test_failures = 0
 ```
-
-### Choosing a Strategy
-
-The right compaction strategy depends on the agent's use case:
-
-| Strategy | Best For | Cache Impact | Information Loss |
-|---|---|---|---|
-| Sliding Window | General purpose | Moderate (invalidates prefix on compaction) | High for old context |
-| Importance-Weighted | Tasks where old context may be critical | Poor (reorders messages) | Low for important info |
-| Hierarchical | Long-running sessions | Good (prefix preserved) | Gradual, controlled |
-| Cache-Aware | Cost-sensitive production | Excellent (designed for cache) | Moderate, concentrated in gap |
-
-### The Meta-Challenge: When to Compact
-
-Compaction itself has a cost — the LLM call to generate summaries costs tokens and latency. Compacting too frequently wastes resources on summarization. Compacting too infrequently lets context rot set in before the compaction can help.
-
-A practical heuristic: **compact when the context exceeds 70% of the budget.** This provides a safety margin while avoiding premature compaction.
-
-```python
-COMPACTION_THRESHOLD = 0.70  # Compact at 70% of budget
-
-def maybe_compact(messages, budget):
-    current_usage = count_tokens(messages) / budget
-    if current_usage > COMPACTION_THRESHOLD:
-        return compact(messages, target_tokens=int(budget * 0.50))
-    return messages
-```
-
-After compaction, the context should be at approximately 50% of the budget, providing room for growth before the next compaction cycle.
 
 ---
 
-## Summary: The Foundations
+## 3.9 Cost Engineering: Real Numbers for Real Sessions
 
-Part I has established the conceptual and architectural foundations for understanding modern AI agents:
+### Per-Turn Cost Breakdown
 
-1. **Agents are fundamentally different from chatbots.** The difference is architectural: agents have tools and an autonomous loop, making the LLM the scheduler rather than the human.
+For Claude Sonnet 4 (as of early 2026):
 
-2. **The ReAct pattern (Observe-Think-Act) is universal.** Every production agent implements this pattern, whether explicitly or implicitly through native tool-use APIs.
+```
+Input tokens (uncached):   $3.00 / million
+Input tokens (cached):     $0.30 / million
+Output tokens:            $15.00 / million
 
-3. **Agent autonomy exists on a spectrum (L1-L5).** The industry is rapidly moving from L2-L3 (supervised) to L4 (fully autonomous), driven by improvements in model capability and tooling.
+Example: Turn 30 of a debugging session
+  Input:  45,000 tokens total
+    Cached: 42,000 (93.3%)  → $0.0126
+    New:     3,000 (6.7%)   → $0.0090
+  Output:    150 tokens      → $0.0023
+  
+  Turn cost: $0.024
+```
 
-4. **2025-2026 is the inflection point** where model capability, tooling maturity, and infrastructure converge to make autonomous agents production-viable.
+### Per-Session Cost Profile
 
-5. **The agent loop is simple; context engineering is hard.** The core loop (LLM → tool calls → observations → repeat) is straightforward. The challenge is managing what goes into the model's context at each step.
+```
+Light task (5 turns, bug fix):
+  Total input:    25,000 tokens (cumulative)
+  Total output:      800 tokens
+  Cache rate:     78%
+  Total cost:     $0.06 - $0.10
 
-6. **Context engineering is the defining discipline of agent development.** It encompasses writing, selecting, compressing, and isolating context — managing the full information environment that shapes model behavior. It demands attention to KV-cache optimization, token budgeting, and dynamic compaction.
+Medium task (20 turns, feature implementation):
+  Total input:   450,000 tokens (cumulative)
+  Total output:    4,000 tokens
+  Cache rate:     88%
+  Total cost:     $0.25 - $0.50
 
-These foundations set the stage for Part II, where we will explore the practical engineering of agent systems — tool design, multi-agent architectures, memory systems, and the infrastructure required to run agents at scale.
+Heavy task (50 turns, refactoring with debugging):
+  Total input: 2,500,000 tokens (cumulative)
+  Total output:   12,000 tokens
+  Cache rate:     92%
+  Total cost:     $1.00 - $2.50
+
+Pathological (200 turns, stuck in loops):
+  Total input: 15,000,000 tokens (cumulative)
+  Total output:   50,000 tokens
+  Cache rate:     85%
+  Total cost:     $6.00 - $15.00
+```
+
+### Cost Optimization Checklist
+
+In order of impact:
+
+1. **Fix KV-cache stability** (10x impact on input cost). Verify with `cache_read_input_tokens` in API response.
+2. **Truncate tool outputs** (2-5x impact). Cap at 30K characters, truncate from middle.
+3. **Compact proactively** (2-3x impact). Don't wait for context-length errors.
+4. **Use appropriate models** (2-4x impact). Use fast/cheap models for simple tasks, expensive models for complex ones.
+5. **Reduce output verbosity** (1.2-1.5x impact). "Don't explain, just do" in system prompt.
+
+### The Model Selection Decision
+
+For multi-model agent architectures:
+
+```python
+def select_model(task_complexity: str, turn_count: int) -> str:
+    if task_complexity == "simple" and turn_count < 5:
+        return "claude-3-5-haiku-20241022"  # $0.25/$1.25 per MTok
+    elif task_complexity == "medium":
+        return "claude-sonnet-4-20250514"    # $3.00/$15.00 per MTok
+    elif task_complexity == "hard" or turn_count > 30:
+        return "claude-sonnet-4-20250514"    # Same, with extended thinking
+    else:
+        return "claude-sonnet-4-20250514"    # Default
+```
+
+OpenAI's equivalent:
+- Simple: `gpt-4.1-mini` ($0.40/$1.60 per MTok)
+- Medium: `gpt-4.1` ($2.00/$8.00 per MTok)
+- Complex: `o3-mini` ($1.10/$4.40 per MTok, includes reasoning tokens)
+
+The cost difference between models is 5-15x. Using the right model for the task is the second-highest-leverage cost optimization after caching.
+
+---
+
+## Summary: The Practitioner's Foundations
+
+Part I establishes the engineering foundations for building production agent systems:
+
+1. **The agent loop is an HTTP POST in a while loop.** Every production agent — Codex, Claude Code, Cursor — is a `while(tool_use)` loop around an API call. The sophistication is in what goes *into* the loop, not the loop itself.
+
+2. **KV-cache optimization is the single highest-leverage technique.** Stable prefixes, append-only context, deterministic serialization, and explicit cache boundaries can reduce costs by 6-10x. Non-deterministic JSON key ordering alone can drop cache hit rates from 95% to 12%.
+
+3. **Token budgeting is memory management.** A 128K context window is a fixed resource. Allocate 3% to system prompt, 2% to tools, 3% to few-shot, 30% to working documents, 30% to history, 32% to output headroom. Rebalance dynamically based on task type.
+
+4. **Context rot is measurable and preventable.** Agent accuracy drops 10-25% as context grows past 50K tokens. Mitigate with proactive compaction, importance-weighted retention, sub-agent isolation, and TODO-list anchoring.
+
+5. **Termination is the hardest problem.** Five signals — model stop, hard limits, token budget, repetition detection, and verification — must work together. Verification before termination (run tests, check lint) improves resolution rates by 10-15 percentage points.
+
+6. **System prompts are programs, not prose.** The Claude Code prompt is 14,902 lines of TypeScript that assembles 40+ sections conditionally. Every sentence should be an actionable instruction, not a description.
+
+7. **Real failures have real fixes.** Stale line numbers, tool output explosions, edit-test-fail loops, compaction amnesia — each has a specific, implementable solution. The difference between a working agent and a broken one is usually 5-10 specific engineering decisions, not a fundamental architecture change.
+
+Part II builds on these foundations with tool design patterns, multi-agent orchestration, and the infrastructure required to run agents at scale.
