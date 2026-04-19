@@ -1,2191 +1,2004 @@
-# Part II: Architecture Patterns for Production Agents
+# Part II: Memory-Based Self-Evolution
 
 ---
 
-## Chapter 4: Building MCP Servers That Work
+## Preface to Part II
 
-### 4.1 A Complete Working MCP Server in 40 Lines
+Part I established that agents are LLMs running in loops with tool access. But a loop that repeats the same mistakes is just an expensive `while True`. The frontier question in 2025–2026 is not *how to build an agent* but *how to make an agent that gets better at runtime*—without retraining, without human-curated prompt libraries, and without access to gradient signals.
 
-```typescript
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+This part covers four systems that answer that question through memory-based self-evolution: a reinforcement-learning framework that learns utility over episodic memory (MemRL), a dual-feedback agent that combines exploration-aware retrieval with intrinsic reward (RetroAgent), a formal theory grounding all such approaches in augmented MDPs (Memento-II), and a production dialectical user-modeling system that evolves its representation of the human across sessions (Honcho/Hermes Agent).
 
-const server = new McpServer({
-  name: "deployments",
-  version: "1.0.0",
-});
+The unifying thesis: **decouple stable reasoning (the frozen LLM) from plastic adaptation (external memory with learned scores)**. The LLM does not change. The memory does. Together they converge.
 
-server.tool(
-  "get_deployment_status",
-  "Returns the current deployment status for a service. " +
-    "Input: service name as it appears in your Kubernetes namespace " +
-    "(e.g., 'api-gateway', 'auth-service'). " +
-    "Output: JSON with status, replica count, last deploy timestamp, " +
-    "and any error conditions.",
-  {
-    service: z
-      .string()
-      .describe("Kubernetes service name, e.g. 'api-gateway'"),
-    namespace: z
-      .string()
-      .default("production")
-      .describe("Kubernetes namespace, defaults to 'production'"),
-  },
-  async ({ service, namespace }) => {
-    const res = await fetch(
-      `https://deploy.internal/api/v1/status?` +
-        `service=${encodeURIComponent(service)}&ns=${encodeURIComponent(namespace)}`
-    );
-    if (!res.ok) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `Failed to fetch status for ${service}: ${res.status} ${res.statusText}`,
-          },
-        ],
-      };
-    }
-    const data = await res.json();
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2),
-        },
-      ],
-    };
-  }
-);
+Each chapter goes deep: full algorithms with pseudocode, mathematical formulations with convergence analysis, complete benchmark tables with ablation studies, and worked numerical examples showing how the systems behave over time. This is intentional. The details matter because runtime self-evolution is where most agent systems fail—not from lack of ambition but from lack of rigor in the memory architecture. The four systems in this part represent the state of the art as of early 2026, and understanding their machinery is prerequisite to building the next generation.
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-```
+---
 
-Every line in this server exists for a reason. Walk through what matters:
+## Chapter 3: Utility-Learned Memory — MemRL
 
-**The `McpServer` constructor** takes a `name` and `version`. The name is how hosts identify this server during capability negotiation. The version follows semver — clients can use it to detect incompatible changes. Do not use creative names. Use the exact name of the system this server wraps: `"deployments"`, `"postgres"`, `"github"`. The model reads this name to decide which server to query.
+**Paper:** Xiang Zhang, Zheyuan Zhang, Zhongxin Guo, Bingsheng Yao, Dakuo Wang, and Jiaxin Zhang. "Self-Evolving Agents with Reflective and Memory-Augmented Abilities." *arXiv preprint arXiv:2601.03192*, January 2026.
 
-**The `server.tool()` registration** takes four arguments: tool name, description, Zod schema, and handler function. The description is the single most important line in your entire MCP server. The model reads it on every turn to decide whether to invoke this tool. We will cover description writing in depth in section 4.3.
+**Core contribution:** A runtime reinforcement-learning framework that augments a frozen LLM with an episodic memory buffer whose entries carry *learned utility scores*. The LLM's reasoning is stable (no fine-tuning); the memory is plastic (utility scores evolve via Monte Carlo Q-value updates). The system provably converges to optimal memory retrieval under standard RL assumptions, and empirically outperforms both vanilla LLMs and RAG-augmented baselines across four diverse benchmarks.
 
-**The Zod schema** is not optional decoration. The MCP SDK uses it to generate JSON Schema for the tool's `inputSchema` field, which the model reads to understand what parameters are available. Zod's `.describe()` method on individual fields is critical — without it, the model sees parameter names but no guidance on valid values. The `.default("production")` on `namespace` means the model can omit that parameter and get a sensible value, reducing the decision burden per invocation.
+---
 
-**The handler function** receives validated parameters (Zod has already parsed them) and returns a `CallToolResult`. The return type has a specific structure:
+### 3.1 The Stability-Plasticity Dilemma
 
-```typescript
-type CallToolResult = {
-  content: Array<TextContent | ImageContent | EmbeddedResource>;
-  isError?: boolean;
-};
-```
+Every self-improving agent faces a fundamental tension that the neuroscience literature calls the **stability-plasticity dilemma** (Grossberg, 1987; French, 1999):
 
-The `content` array can contain text, images, or embedded resources. Most tools return a single `TextContent` object. The `isError` field is the subject of section 4.5 — it is how you signal recoverable failures without crashing the server.
+1. **Too much plasticity → catastrophic forgetting.** Fine-tuning an LLM on new task experience overwrites previously learned capabilities. Kirkpatrick et al. (2017) documented this in neural networks; in modern LLMs the problem is acute because the parameter space is enormous and task-specific gradients can distort broadly useful representations. A GPT-4-class model fine-tuned on 500 ALFWorld trajectories may improve at household navigation while degrading at code generation, mathematical reasoning, and instruction following—capabilities the base model had before fine-tuning.
 
-**The `StdioServerTransport`** binds this server to stdin/stdout. The host process (Claude Desktop, Cursor, a custom harness) launches this server as a child process, writes JSON-RPC 2.0 messages to its stdin, and reads responses from its stdout. No HTTP, no ports, no certificates — just pipes.
+2. **Too little plasticity → inability to learn.** Frozen LLMs with static prompts cannot incorporate feedback. If a particular chain-of-thought strategy fails on a class of problems, the LLM will repeat the same failure mode. This is the default state of most deployed agent systems in 2025: they are as good on their 1000th invocation as on their 1st.
 
-### 4.2 Adding Resources and Prompt Templates
+3. **RAG occupies a middle ground but has a critical flaw.** Retrieval-Augmented Generation (Lewis et al., 2020; Gao et al., 2023) attaches an external knowledge base to the LLM. The agent can store experiences and retrieve them by semantic similarity. This provides some plasticity—the knowledge base grows over time—without modifying the LLM's weights. However, **similarity is not utility**. Consider an agent that encounters a hard mathematics problem and stores two experiences:
 
-Tools are functions the model invokes. Resources are data the model reads. Prompt templates are predefined workflows the user selects. A production server typically exposes all three.
+   - Experience A: A plausible-looking but incorrect proof approach (cosine similarity to the new query: 0.92)
+   - Experience B: A correct but non-obvious technique (cosine similarity to the new query: 0.87)
 
-```typescript
-server.resource(
-  "deployment-history",
-  "deploy://history/{service}",
-  {
-    description:
-      "Deployment history for a service. Returns the last 50 deploys " +
-      "with timestamps, commit SHAs, deployer, and rollback status.",
-    mimeType: "application/json",
-  },
-  async (uri) => {
-    const service = uri.pathname.split("/").pop();
-    const history = await fetch(
-      `https://deploy.internal/api/v1/history?service=${service}&limit=50`
-    );
-    const data = await history.json();
-    return {
-      contents: [
-        {
-          uri: uri.href,
-          mimeType: "application/json",
-          text: JSON.stringify(data, null, 2),
-        },
-      ],
-    };
-  }
-);
-```
+   Standard RAG retrieves Experience A. The agent follows a wrong approach. It may even fail *more reliably* than an agent with no memory at all, because the retrieved context steers the LLM toward a known-bad path with high confidence.
 
-Resources use URI templates (RFC 6570). The `deploy://history/{service}` template tells the client that this resource is parameterized — the model fills in `{service}` based on context. The `mimeType` hint lets the client render the resource appropriately (syntax highlighting for JSON, markdown rendering for text/markdown, etc.).
+   This failure mode is not hypothetical. Zhang et al. (2026) demonstrate it empirically on the HLE benchmark: RAG-augmented GPT-4o achieves lower accuracy (22.7%) than vanilla GPT-4o with chain-of-thought (23.1%) on several problem categories, precisely because high-similarity but low-utility memories contaminate the context.
 
-When should you use a resource instead of a tool? The rule is simple: **if the model needs to read data but does not need to trigger side effects, use a resource.** Resources are read-only by design. They appear in the client's resource list and can be attached to conversations without a tool call. Tools are for actions — creating, updating, deleting, executing.
+**MemRL's resolution:** Separate the concerns completely.
 
-Prompt templates are predefined conversation starters:
+| Component | Plasticity | Stability |
+|-----------|-----------|-----------|
+| LLM (frozen) | None—weights never change | Full—all pre-trained capabilities preserved |
+| Memory buffer | Full—entries added, scores updated | Structure stable (triplet schema fixed) |
+| Retrieval policy | Adapts via Q-values | Semantic filter provides consistent recall |
 
-```typescript
-server.prompt(
-  "incident-response",
-  "Guided incident response workflow for a service outage. " +
-    "Walks through status checks, log analysis, and rollback decisions.",
-  {
-    service: z.string().describe("Affected service name"),
-    severity: z.enum(["P0", "P1", "P2"]).describe("Incident severity"),
-  },
-  async ({ service, severity }) => {
-    const status = await fetch(
-      `https://deploy.internal/api/v1/status?service=${service}`
-    );
-    const statusData = await status.json();
-    return {
-      messages: [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text:
-              `Incident Response for ${service} (${severity})\n\n` +
-              `Current status:\n${JSON.stringify(statusData, null, 2)}\n\n` +
-              `Walk me through the incident response checklist:\n` +
-              `1. Confirm the failure mode from the status data above\n` +
-              `2. Check deployment history for recent changes\n` +
-              `3. Analyze error logs from the last 30 minutes\n` +
-              `4. Recommend: rollback, hotfix, or investigate further`,
-          },
-        },
-      ],
-    };
-  }
-);
-```
+The LLM provides *reasoning*. The memory provides *experience*. A learned retrieval policy provides *judgment about which experiences are worth reasoning over*. No component is asked to do all three.
 
-Prompt templates are underused in practice but powerful for standardizing workflows. They pre-fill the conversation with structured context and guide the model through a specific procedure. Teams that build internal MCP servers often start with tools, discover common multi-step patterns, and extract them into prompts.
+---
 
-### 4.3 Tool Descriptions: Write for the Model, Not for Humans
+### 3.2 The Intent-Experience-Utility (IEU) Triplet
 
-The tool description is the single highest-leverage string in your MCP server. The model reads it on every turn. A vague description causes misuse. A good description eliminates an entire category of errors.
-
-Here is a bad description:
+MemRL's memory buffer `M` consists of **IEU triplets**:
 
 ```
-"Manages deployments"
+M = {(z_i, e_i, Q_i)}  for i = 1, ..., |M|
 ```
 
-The model cannot determine from this whether the tool lists deployments, creates deployments, rolls back deployments, or shows deployment status. It will guess, and it will guess wrong often enough to matter.
+Each component serves a distinct function:
 
-Here is the actual description from the server above:
+#### 3.2.1 Intent (`z_i`)
 
-```
-"Returns the current deployment status for a service.
-Input: service name as it appears in your Kubernetes namespace
-(e.g., 'api-gateway', 'auth-service').
-Output: JSON with status, replica count, last deploy timestamp,
-and any error conditions."
-```
-
-This description follows four principles that Anthropic documented in their tool design guidelines and that practitioners have validated through production experience:
-
-**1. State the action verb first.** "Returns", "Creates", "Deletes", "Searches". The model uses this verb to match user intent to tool selection. "Returns the current deployment status" is unambiguous — this tool is for reading, not writing.
-
-**2. Describe valid inputs with examples.** "Service name as it appears in your Kubernetes namespace (e.g., 'api-gateway', 'auth-service')". Without examples, the model might pass a friendly display name ("API Gateway") instead of the actual Kubernetes service name. The examples anchor the model's understanding of the expected format.
-
-**3. Describe what the output looks like.** "JSON with status, replica count, last deploy timestamp, and any error conditions." The model uses this to plan its next step. If it knows the output contains a `replica_count` field, it can extract that value without asking a follow-up question. If the output is opaque, the model wastes a turn interpreting it.
-
-**4. Mention failure conditions.** "Any error conditions" signals that the output may contain error information. More explicitly:
+The **intent** is a dense vector embedding of the task or query that generated this memory entry:
 
 ```
-"If the service does not exist, returns isError: true with a message
-listing similar service names. If the deploy API is unreachable,
-returns isError: true with the HTTP status code."
+z_i = Embed(q_i) ∈ ℝ^d
 ```
 
-This is prompt engineering applied to tool definitions. The same principles that make system prompts effective — specificity, examples, expected output format, failure modes — make tool descriptions effective.
+where `q_i` is the natural-language task description and `Embed(·)` is a pre-trained embedding model (MemRL uses `text-embedding-3-large` with `d = 3072` in the reference implementation, though the framework is embedding-model-agnostic).
 
-Here is a real comparison. Cloudflare's engineering team reported this finding when building their MCP server for the Cloudflare API: their API has approximately 2,500 endpoints. Exposing each endpoint as a separate tool would consume over 1,000,000 tokens just for the tool definitions. The model would never reach the user's message.
+The intent serves as the *retrieval key*. When a new task with query `q` arrives, its embedding `z = Embed(q)` is compared against all stored intents to identify semantically relevant memories.
 
-Their solution: two tools.
+**Design choice: embedding the query, not the solution.** MemRL embeds the *task description*, not the *experience*. This is deliberate. Two tasks may have very different solutions but very similar problem statements ("Prove that √2 is irrational" and "Prove that √3 is irrational"). Embedding the query clusters memories by *problem type*, which is the correct retrieval axis for an agent that must generalize.
 
-```typescript
-server.tool(
-  "search",
-  "Search the Cloudflare API for endpoints matching a query. " +
-    "Input: natural language description of what you want to do " +
-    "(e.g., 'list DNS records', 'create a worker', 'purge cache'). " +
-    "Output: up to 10 matching API endpoints with their paths, " +
-    "methods, descriptions, and required parameters.",
-  { query: z.string().describe("Natural language search query") },
-  async ({ query }) => {
-    const results = await searchEndpoints(query);
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-    };
-  }
-);
+#### 3.2.2 Experience (`e_i`)
 
-server.tool(
-  "execute",
-  "Execute a Cloudflare API endpoint. " +
-    "Input: the endpoint path and method from a search result, " +
-    "plus any required parameters. " +
-    "Output: the API response.",
-  {
-    method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
-    path: z.string().describe("API path from search results, e.g. '/zones/{zone_id}/dns_records'"),
-    pathParams: z.record(z.string()).optional().describe("URL path parameters"),
-    queryParams: z.record(z.string()).optional().describe("URL query parameters"),
-    body: z.any().optional().describe("Request body for POST/PUT/PATCH"),
-  },
-  async ({ method, path, pathParams, queryParams, body }) => {
-    const response = await executeEndpoint(method, path, pathParams, queryParams, body);
-    return {
-      content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-    };
-  }
-);
-```
-
-Two tools. Approximately 1,000 tokens for the complete tool list, regardless of how many API endpoints exist behind them. The model searches first, gets the specific endpoint details it needs, then executes. This is the "Code Mode" pattern — expose a search-and-execute interface rather than the full API surface.
-
-The token savings are not marginal. They are the difference between a system that works and a system that fails before reading the user's message:
-
-| Approach | Tools | Token Cost | Context Remaining |
-|---|---|---|---|
-| One tool per endpoint | 2,500 | ~1,000,000 | None (exceeds window) |
-| Grouped by category | ~50 | ~40,000 | ~160K of 200K |
-| Search + Execute | 2 | ~1,000 | ~199K of 200K |
-
-### 4.4 The `isError` Pattern: Recoverable vs. Hard Failures
-
-MCP defines two failure mechanisms. Using the wrong one causes the model to either give up prematurely or spin in a retry loop.
-
-**`isError: true` in the return value** signals a recoverable failure. The model receives the error message as content and can decide what to do — retry with different parameters, try a different tool, or explain the error to the user.
-
-```typescript
-server.tool(
-  "query_database",
-  "Execute a read-only SQL query against the analytics database.",
-  {
-    sql: z.string().describe("SQL SELECT query"),
-  },
-  async ({ sql }) => {
-    try {
-      const result = await db.query(sql);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
-      };
-    } catch (err) {
-      if (err.code === "42P01") {
-        // Table does not exist
-        const tables = await db.query(
-          "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                `Table not found. Error: ${err.message}\n\n` +
-                `Available tables:\n${tables.rows.map((r) => r.tablename).join("\n")}`,
-            },
-          ],
-        };
-      }
-      if (err.code === "42601") {
-        // Syntax error
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                `SQL syntax error: ${err.message}\n` +
-                `Position: ${err.position}\n` +
-                `Hint: Check for missing quotes, unmatched parentheses, ` +
-                `or reserved keywords used as identifiers.`,
-            },
-          ],
-        };
-      }
-      // Unknown errors: throw to signal a hard failure
-      throw err;
-    }
-  }
-);
-```
-
-When the model sends a query referencing a nonexistent table, it receives the error message plus the list of available tables. It can then reformulate the query with the correct table name. This is a recoverable failure — the model has enough information to self-correct.
-
-**Throwing an `McpError` (or any uncaught exception)** signals a hard failure. The transport layer catches it and returns a JSON-RPC error response. The model typically cannot recover from this — the error may be an authentication failure, a server crash, or a protocol violation.
-
-```typescript
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-
-server.tool(
-  "execute_migration",
-  "Run a database migration.",
-  { migration_id: z.string() },
-  async ({ migration_id }) => {
-    if (!process.env.MIGRATION_TOKEN) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        "MIGRATION_TOKEN environment variable is not set. " +
-          "This server cannot execute migrations without authentication."
-      );
-    }
-    // ...
-  }
-);
-```
-
-The rule of thumb: **if the model can fix it, return `isError: true`. If a human must fix it, throw.** Table not found? Model can fix its query. Authentication missing? Human must set the environment variable.
-
-Production MCP servers that use `isError` correctly see significantly fewer "I'm sorry, I encountered an error" dead ends. The model treats `isError: true` responses as useful information, not terminal failures.
-
-### 4.5 The stdout Pollution Bug
-
-This bug has bitten every team that has built a nontrivial MCP server using the stdio transport. It is subtle, intermittent, and produces impossible-looking error messages.
-
-The stdio transport uses stdout for JSON-RPC messages. The host reads stdout line by line, expecting each line to be a valid JSON-RPC message. If anything else appears on stdout — a log message, a dependency's debug output, a progress bar, a deprecation warning — the host receives a line that is not valid JSON-RPC. It either crashes the connection or silently corrupts the protocol state.
-
-Here is how it looks in practice. You install a database driver that prints a connection banner on first use:
+The **experience** is the natural-language record of the agent's solution attempt:
 
 ```
-Connected to PostgreSQL 15.3 on localhost:5432
+e_i = (reasoning_i, actions_i, outcome_i)
 ```
 
-This line appears on stdout. The host tries to parse it as JSON-RPC:
+In practice this is a structured text string that captures:
+
+- **Reasoning trace:** The chain-of-thought, intermediate conclusions, and strategy the agent employed.
+- **Action sequence:** The concrete steps taken (tool calls, code execution, sub-agent invocations).
+- **Outcome:** Whether the task succeeded or failed, and any error messages or partial results.
+
+The experience is what gets injected into the LLM's context when this memory is retrieved. It functions as a *worked example* or *case study* that the LLM can learn from in-context.
+
+**Storage format.** MemRL stores experiences as plain text with lightweight markdown structure. The reference implementation uses the following template:
 
 ```
-Error: Unexpected token 'C' at position 0 in JSON
+## Task
+{task_description}
+
+## Approach
+{reasoning_trace}
+
+## Actions Taken
+{action_sequence}
+
+## Result
+{outcome_description}
+
+## Lessons
+{self_reflection}
 ```
 
-The connection drops. Your MCP server appears to crash randomly, but only on first use, and only when the database driver is loaded.
+The `Lessons` field is generated by prompting the LLM to reflect on the outcome after task completion. This reflection step costs one additional LLM call but significantly improves the informational density of the stored experience.
 
-The fix is comprehensive and non-negotiable:
+#### 3.2.3 Utility (`Q_i`)
 
-```typescript
-// 1. Redirect all logging to stderr
-import { createWriteStream } from "fs";
-const logStream = createWriteStream("/dev/stderr", { flags: "a" });
-const originalConsoleLog = console.log;
-console.log = (...args) => {
-  logStream.write(args.join(" ") + "\n");
-};
-console.warn = console.log;
-console.info = console.log;
-console.debug = console.log;
-// console.error already goes to stderr in Node.js
+The **utility** is a scalar Q-value that quantifies how helpful this memory has been when retrieved in the past:
 
-// 2. Intercept process.stdout.write to catch rogue dependencies
-const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-process.stdout.write = (chunk, encoding, callback) => {
-  // Check if this looks like a JSON-RPC message
-  const str = typeof chunk === "string" ? chunk : chunk.toString();
-  if (str.startsWith("{") && str.includes('"jsonrpc"')) {
-    return originalStdoutWrite(chunk, encoding, callback);
-  }
-  // Redirect everything else to stderr
-  return process.stderr.write(chunk, encoding, callback);
-};
+```
+Q_i ∈ [0, 1]
 ```
 
-This is aggressive, but necessary. The second technique — intercepting `process.stdout.write` — catches dependencies that bypass `console.log` and write directly to stdout. Popular culprits include database connection pools (pg, mysql2), HTTP clients (axios debug mode), and monitoring libraries (OpenTelemetry console exporter).
+This is the critical innovation. Unlike RAG, where retrieval is purely similarity-based, MemRL's retrieval is *utility-weighted*. A memory with high semantic similarity but consistently poor outcomes (Q → 0) will be deprioritized in favor of a less-similar but more-useful memory (Q → 1).
 
-In Python, the equivalent fix:
+**Initialization.** New memories are initialized with `Q_i = 0.5` (maximum uncertainty). This ensures they are neither favored nor penalized before any evidence is collected.
 
-```python
-import sys
-import io
+**Update mechanism.** After each task, Q-values of all retrieved memories are updated via Monte Carlo reinforcement learning (detailed in §3.4).
 
-# Redirect stdout to stderr before importing anything
-real_stdout = sys.stdout
-sys.stdout = sys.stderr
+#### 3.2.4 Memory Buffer Size and Management
 
-# Your MCP server writes to real_stdout via the transport
-# Everything else goes to stderr
+The buffer `M` grows monotonically during the agent's lifetime. MemRL does not delete memories; instead, low-utility memories are naturally deprioritized by the retrieval policy. In the reference implementation:
 
-# Alternative: use the logging module exclusively
-import logging
-logging.basicConfig(stream=sys.stderr, level=logging.INFO)
-logger = logging.getLogger("mcp-server")
-```
+- **Maximum buffer size:** 10,000 entries (configurable).
+- **Entry creation policy:** One entry per completed task, regardless of outcome. Failed tasks produce valuable negative examples.
+- **Deduplication:** Before adding a new entry, check if any existing entry has `cos(z_new, z_i) > 0.98`. If so, update the existing entry's experience rather than creating a duplicate.
 
-The Python MCP SDK's `stdio_server` context manager handles this automatically — it captures stdout for protocol messages and redirects print statements to stderr. But any dependency that uses `os.write(1, ...)` directly will bypass this protection. Test by grepping your dependency tree for direct stdout writes.
-
-### 4.6 Progressive Disclosure: From 134,000 Tokens to 20,000
-
-A five-server MCP setup can consume the majority of a context window before the model reads a single user message. Anthropic reported internal configurations where tool definitions alone consumed 134,000 tokens out of a 200,000 token context window. This is not a theoretical concern — it is the default behavior when you connect multiple MCP servers to Claude Desktop or Cursor.
-
-Here are real numbers from a production configuration:
-
-| MCP Server | Tools | Avg Token Cost per Tool | Total Tokens |
-|---|---|---|---|
-| GitHub | 35 | ~740 | ~26,000 |
-| Slack | 11 | ~1,900 | ~21,000 |
-| Jira | 12 | ~1,400 | ~17,000 |
-| Postgres | 8 | ~500 | ~4,000 |
-| Sentry | 5 | ~600 | ~3,000 |
-| Grafana | 5 | ~600 | ~3,000 |
-| Deploy | 4 | ~750 | ~3,000 |
-| **Total** | **80** | | **~77,000** |
-
-That is 38% of a 200K context window consumed before the conversation starts. Add a system prompt (5,000-10,000 tokens) and the user's message with attached files (10,000-50,000 tokens), and you have very little room for the model to reason.
-
-**Progressive disclosure** is the solution. Claude Code implements it with approximately 20 core tools always loaded, plus an Agent Skills system for extended capabilities, plus a Tool Search Tool for discovery. The implementation:
-
-**Layer 1: Core tools (always loaded, ~5,000 tokens).** These are the tools the model needs on virtually every turn: Read, Write, Edit, Bash, Grep, Glob, Agent, TodoWrite.
-
-**Layer 2: Agent Skills (~500 tokens for the skill index).** Extended capabilities stored as Markdown files in `.claude/agents/`. The model sees a list of skill names and descriptions. When it needs a skill, it reads the file and gains the instructions for that capability. This is progressive disclosure at the skill level — hundreds of capabilities, loaded one at a time.
-
-**Layer 3: Tool Search Tool (~500 tokens).** For MCP-connected tools, the Tool Search Tool lets the model discover tools by semantic search instead of loading all definitions upfront.
-
-The token savings are dramatic:
-
-| Loading Strategy | Tokens at Start | Tokens on Demand | Total Savings |
-|---|---|---|---|
-| All tools upfront | 77,000 | 0 | 0% |
-| Core + Search | 6,000 | ~2,000 per query | 85-92% |
-
-Anthropic's Tool Search Tool (introduced November 2025) comes in two variants:
-
-**Regex variant** (`tool_search_tool_regex_20251119`): The model constructs a Python regex pattern to search tool names and descriptions. Best for precise lookups when the model knows the tool name pattern.
-
-**BM25 variant** (`tool_search_tool_bm25_20251119`): The model writes a natural language query. BM25 keyword matching returns relevant tools. Best for exploratory searches when the model knows what it wants to do but not what the tool is called.
-
-The API configuration:
+The buffer can be serialized as a JSON file for persistence across agent sessions. The embedding vectors are stored alongside the text to avoid recomputation:
 
 ```json
 {
-  "tools": [
+  "memory_buffer": [
     {
-      "type": "tool_search_tool_regex_20251119",
-      "name": "tool_search"
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "github_create_pr",
-        "description": "Create a pull request on GitHub",
-        "parameters": { ... }
-      },
-      "defer_loading": true
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "slack_post_message",
-        "description": "Post a message to a Slack channel",
-        "parameters": { ... }
-      },
-      "defer_loading": true
+      "id": "mem_0001",
+      "intent_text": "Prove that the sum of two odd numbers is even",
+      "intent_embedding": [0.0234, -0.0891, ...],
+      "experience": "## Task\nProve that the sum of two odd...",
+      "q_value": 0.73,
+      "retrieval_count": 12,
+      "last_retrieved": "2026-01-15T08:30:00Z",
+      "created": "2026-01-02T14:22:00Z"
     }
   ]
 }
 ```
 
-Tools marked with `defer_loading: true` are not included in the model's context. Only their names and descriptions are indexed for search. When the model searches for "github", it receives 3-5 matching `tool_reference` blocks with full schemas. Only those tools consume context.
+---
 
-The Tool Search Tool itself costs approximately 500 tokens — a constant overhead regardless of how many tools are registered. This makes it economical even with thousands of deferred tools.
+### 3.3 Two-Phase Retrieval — Full Algorithm
 
-### 4.7 Production MCP Server Checklist
+MemRL's retrieval operates in two sequential phases. This design is not arbitrary—it directly addresses the computational and statistical limitations of each retrieval signal.
 
-Every MCP server going to production needs to handle these concerns. This is not theoretical hygiene — each item on this list has caused outages, data leaks, or corrupted agent behavior in real deployments.
+#### 3.3.1 Phase 1: Semantic Filter
 
-#### Zod Validation on All Inputs
+Given a new task with query `q`:
 
-The MCP SDK validates inputs against your Zod schema before calling your handler. But your Zod schema must be comprehensive. Common mistakes:
+```
+z = Embed(q)
 
-```typescript
-// BAD: accepts any string as a file path
-{ path: z.string() }
-
-// GOOD: validates path format and prevents directory traversal
-{
-  path: z
-    .string()
-    .regex(/^[a-zA-Z0-9_\-\/\.]+$/, "Path contains invalid characters")
-    .refine(
-      (p) => !p.includes(".."),
-      "Path must not contain directory traversal sequences"
-    )
-    .refine(
-      (p) => p.startsWith("/workspace/"),
-      "Path must be within the workspace directory"
-    )
-}
+C_1 = { (z_i, e_i, Q_i) ∈ M : cos(z, z_i) ≥ θ_sim }
 ```
 
-#### Path Sandboxing
+**Parameters:**
+- `θ_sim = 0.7` (default in reference implementation)
+- Cosine similarity: `cos(z, z_i) = (z · z_i) / (‖z‖ · ‖z_i‖)`
 
-An MCP server that reads or writes files must enforce a sandbox. Without it, the model can read `/etc/shadow`, write to `/usr/bin`, or traverse into other users' directories:
+**Purpose:** Phase 1 is a *recall-oriented* filter. Its job is to ensure that all potentially relevant memories are included in the candidate set. The threshold `θ_sim = 0.7` is deliberately permissive—it admits memories that are topically related even if not exact matches.
 
-```typescript
-import { resolve, relative } from "path";
+**Computational complexity:** For a buffer of size `|M|`, Phase 1 requires `|M|` cosine similarity computations. With `d = 3072` and `|M| = 10,000`, this takes approximately 2ms on modern hardware. For larger buffers, approximate nearest-neighbor indices (FAISS, Annoy) can reduce this to sub-linear time.
 
-const SANDBOX_ROOT = resolve(process.env.WORKSPACE || "/workspace");
+**Typical candidate set size:** On the benchmarks tested, Phase 1 typically returns `|C_1| ∈ [5, 50]` candidates. If `|C_1| = 0` (no relevant memories), the agent proceeds without memory augmentation—it falls back to its base LLM capabilities.
 
-function sandboxPath(requestedPath: string): string {
-  const resolved = resolve(SANDBOX_ROOT, requestedPath);
-  const rel = relative(SANDBOX_ROOT, resolved);
-  if (rel.startsWith("..") || resolve(SANDBOX_ROOT, rel) !== resolved) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Path '${requestedPath}' resolves outside sandbox root '${SANDBOX_ROOT}'`
-    );
-  }
-  return resolved;
-}
+#### 3.3.2 Phase 2: Q-Value Selection
+
+From the candidate set `C_1`, select the top-k memories by utility:
+
+```
+C_2 = top_k( C_1, key = Q_i, k = K )
 ```
 
-Claude Code implements path sandboxing by default — tools can only access files within the project directory unless the user explicitly grants broader access. Your custom MCP servers need the same protection.
+**Parameters:**
+- `K = 3` (default; configurable based on context window budget)
 
-#### Rate Limiting
+**Purpose:** Phase 2 is a *precision-oriented* selector. From the set of semantically relevant memories, it picks those with the highest demonstrated utility. This is where MemRL departs from RAG: instead of selecting by similarity rank, it selects by learned quality.
 
-An agent in a loop can call your MCP server hundreds of times per minute. If your server wraps an external API with rate limits, you need to enforce them proactively:
+#### 3.3.3 Full Retrieval Algorithm (Pseudocode)
 
-```typescript
-import { RateLimiter } from "limiter";
+```
+Algorithm 1: MemRL Two-Phase Retrieval
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input: query q, memory buffer M, similarity threshold θ_sim,
+       retrieval count K, embedding model Embed
+Output: retrieved memories R
 
-const limiter = new RateLimiter({
-  tokensPerInterval: 30,
-  interval: "minute",
-});
-
-server.tool("search_issues", "...", { query: z.string() }, async ({ query }) => {
-  const remaining = await limiter.removeTokens(1);
-  if (remaining < 0) {
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text:
-            "Rate limit reached (30 requests/minute). " +
-            "Wait 60 seconds before retrying, or narrow your search query " +
-            "to reduce the number of calls needed.",
-        },
-      ],
-    };
-  }
-  // ... execute search
-});
+1:  z ← Embed(q)
+2:  C ← ∅                                    // candidate set
+3:  for each (z_i, e_i, Q_i) in M do
+4:      sim ← cos(z, z_i)
+5:      if sim ≥ θ_sim then
+6:          C ← C ∪ {(z_i, e_i, Q_i, sim)}
+7:      end if
+8:  end for
+9:  if |C| = 0 then
+10:     return ∅                              // no relevant memories
+11: end if
+12: Sort C by Q_i in descending order        // Phase 2: utility ranking
+13: R ← first K elements of C
+14: return R
 ```
 
-The error message tells the model both the limit and a strategy to stay within it. Without this guidance, the model will retry immediately and burn through its own retry budget.
+#### 3.3.4 Why Two Phases Beat One: A Concrete Example
 
-#### Graceful Shutdown
+Consider an agent that has accumulated 200 memories from math competition problems. A new problem arrives: "Find all integer solutions to x³ + y³ = z³ for z ≤ 100."
 
-When the host process terminates, your MCP server receives a SIGTERM (or the stdin pipe closes). You must clean up database connections, flush logs, and release locks:
+**Pure similarity retrieval (standard RAG):** The top-3 most similar memories might be:
+1. A memory about x³ + y³ = z³ + w³ (Ramanujan's taxi-cab numbers) — `sim = 0.94, Q = 0.2` (misleading; different problem structure)
+2. A memory about integer solutions to x² + y² = z² — `sim = 0.91, Q = 0.9` (useful Pythagorean-triple techniques, adaptable)
+3. A memory about cubic Diophantine equations with no solutions — `sim = 0.89, Q = 0.1` (mentions Fermat's Last Theorem but with an incorrect proof sketch)
 
-```typescript
-const cleanup = async () => {
-  console.error("[MCP] Shutting down gracefully...");
-  await db.end();
-  await cache.disconnect();
-  process.exit(0);
-};
+RAG retrieves memories 1, 2, 3 in that order. The agent receives two misleading memories and one useful one.
 
-process.on("SIGTERM", cleanup);
-process.on("SIGINT", cleanup);
+**MemRL two-phase retrieval:**
+- Phase 1 (θ_sim = 0.7) returns all three memories plus 8 others with lower similarity.
+- Phase 2 ranks by Q-value:
+  1. Memory 2: `Q = 0.9` (proven useful in past number-theory problems)
+  2. A memory about modular arithmetic techniques: `sim = 0.76, Q = 0.85`
+  3. A memory about Fermat's Last Theorem (correct version): `sim = 0.73, Q = 0.82`
 
-// Also handle stdin closing (host crashed or disconnected)
-process.stdin.on("end", cleanup);
+MemRL retrieves memories 2, the modular arithmetic memory, and the correct FLT memory. The agent receives three high-utility memories, including one (the modular arithmetic memory) that RAG would never have surfaced because its similarity score was too low.
+
+**Measured impact:** On HLE (Humanity's Last Exam), this two-phase design produces a 4.3 percentage-point improvement over RAG-style single-phase retrieval (Table 3 in the paper), with the gap widening on problems where misleading similar memories exist in the buffer.
+
+#### 3.3.5 Context Injection
+
+Retrieved memories are injected into the LLM prompt using a structured template:
+
+```
+You are solving a new task. Here are relevant past experiences
+that may help you. Each experience includes the approach used
+and whether it succeeded or failed. Use these as reference but
+think critically about whether the same approach applies here.
+
+[EXPERIENCE 1 — Utility: HIGH]
+{experience_text_1}
+
+[EXPERIENCE 2 — Utility: HIGH]
+{experience_text_2}
+
+[EXPERIENCE 3 — Utility: MODERATE]
+{experience_text_3}
+
+---
+Now solve the following task:
+{current_task_description}
 ```
 
-Without graceful shutdown, your server leaks database connections. Under pm2 or systemd (common in production), leaked connections accumulate until the database rejects new connections and the entire system goes down.
-
-#### Session Isolation
-
-If your MCP server maintains state (database connections, caches, in-memory data), that state must be isolated per session. Two concurrent conversations using the same MCP server must not interfere with each other:
-
-```typescript
-const sessions = new Map<string, SessionState>();
-
-server.tool(
-  "set_context",
-  "Set the working context for this session.",
-  {
-    project: z.string(),
-    environment: z.enum(["dev", "staging", "production"]),
-  },
-  async ({ project, environment }, { meta }) => {
-    const sessionId = meta?.sessionId || "default";
-    sessions.set(sessionId, { project, environment, startedAt: Date.now() });
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Context set to ${project} (${environment}) for session ${sessionId}`,
-        },
-      ],
-    };
-  }
-);
-```
-
-The MCP protocol includes session identification in the `meta` field of tool calls. Use it. Without session isolation, one conversation's `set_context("payments", "production")` affects another conversation that was querying the staging environment.
-
-#### Timeouts on External Calls
-
-Every `fetch`, database query, or subprocess execution in your handler must have a timeout. An agent waiting indefinitely for a response consumes context window space (the pending tool call is in the model's context) and blocks the agent loop:
-
-```typescript
-const controller = new AbortController();
-const timeout = setTimeout(() => controller.abort(), 10_000); // 10s timeout
-
-try {
-  const res = await fetch(url, { signal: controller.signal });
-  clearTimeout(timeout);
-  // ...
-} catch (err) {
-  clearTimeout(timeout);
-  if (err.name === "AbortError") {
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: `Request timed out after 10 seconds. The service at ${url} may be down or slow. ` +
-            `Try again in 30 seconds, or check service health first.`,
-        },
-      ],
-    };
-  }
-  throw err;
-}
-```
-
-Ten seconds is a reasonable default for API calls. Database queries should timeout at 30 seconds. Subprocess executions (build commands, test runs) may need 5-10 minutes. Match the timeout to the expected operation duration and always communicate the timeout to the model in the error message.
-
-### 4.8 Remote MCP Servers: Streamable HTTP and OAuth 2.1
-
-The stdio transport works for local servers — the host launches them as child processes. For shared infrastructure (a team's deployment server, a company's internal API gateway), you need remote MCP servers that run as HTTP services.
-
-MCP's Streamable HTTP transport uses HTTP POST for client-to-server messages and Server-Sent Events (SSE) for server-to-client streaming. Authentication uses OAuth 2.1:
-
-```typescript
-import { StreamableHttpServerTransport } from "@modelcontextprotocol/sdk/server/streamablehttp.js";
-import express from "express";
-
-const app = express();
-
-const transport = new StreamableHttpServerTransport({
-  sessionIdGenerator: () => crypto.randomUUID(),
-});
-
-// OAuth 2.1 middleware (simplified)
-app.use("/mcp", async (req, res, next) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  if (!token) {
-    return res.status(401).json({
-      error: "unauthorized",
-      error_description: "Bearer token required",
-    });
-  }
-  try {
-    const claims = await verifyToken(token);
-    req.user = claims;
-    next();
-  } catch {
-    return res.status(401).json({
-      error: "invalid_token",
-      error_description: "Token expired or invalid",
-    });
-  }
-});
-
-app.post("/mcp", transport.handleRequest.bind(transport));
-app.get("/mcp", transport.handleSse.bind(transport));
-
-await server.connect(transport);
-app.listen(3001);
-```
-
-The client configuration in Claude Desktop for a remote server:
-
-```json
-{
-  "mcpServers": {
-    "deployments": {
-      "url": "https://mcp.internal.example.com/mcp",
-      "transport": "streamable-http",
-      "auth": {
-        "type": "oauth2",
-        "clientId": "claude-desktop",
-        "authorizationUrl": "https://auth.example.com/authorize",
-        "tokenUrl": "https://auth.example.com/token",
-        "scopes": ["deployments:read", "deployments:write"]
-      }
-    }
-  }
-}
-```
-
-Remote servers have different failure modes than stdio servers. Network partitions, TLS certificate expiry, OAuth token refresh failures, and load balancer timeouts all need handling. The MCP SDK's `StreamableHttpServerTransport` handles reconnection and session resumption, but your application logic must be idempotent — the client may retry a request that the server already processed if the response was lost in transit.
+The utility label (HIGH / MODERATE / LOW) is derived from the Q-value: HIGH if `Q ≥ 0.7`, MODERATE if `0.4 ≤ Q < 0.7`, LOW if `Q < 0.4`. This label helps the LLM calibrate its confidence in the retrieved experience.
 
 ---
 
-## Chapter 5: Multi-Agent Orchestration — What Actually Works
+### 3.4 Q-Value Update — Monte Carlo Reinforcement Learning
 
-### 5.1 The Math That Kills Multi-Agent
+After each task completes, MemRL updates the Q-values of all memories that were retrieved for that task.
 
-Before building a multi-agent system, do this calculation:
-
-```
-Single agent reliability: 99%
-Two agents in sequence: 0.99 × 0.99 = 0.9801 (98%)
-Three agents: 0.99³ = 0.9703 (97%)
-Five agents: 0.99⁵ = 0.9510 (95.1%)
-Ten agents: 0.99¹⁰ = 0.9044 (90.4%)
-```
-
-A 1% failure rate per agent becomes a 10% failure rate across ten agents. And 99% per-agent reliability is optimistic — real agents on real tasks with real tool calls fail at 3-10% per step, depending on the task complexity and tool reliability.
-
-At 97% per-agent reliability:
+#### 3.4.1 Update Rule
 
 ```
-Five agents: 0.97⁵ = 0.8587 (85.9%)
-Ten agents: 0.97¹⁰ = 0.7374 (73.7%)
+After task with binary outcome r ∈ {0, 1}:
+  For each retrieved memory (z_i, e_i, Q_i):
+    Q_i ← (1 - α) · Q_i + α · r
 ```
 
-One in four runs fails with ten agents at 97% reliability. At 95%:
+**Parameters:**
+- `α = 0.1` (learning rate; default in reference implementation)
+- `r = 1` if the task succeeded, `r = 0` if it failed
+
+This is a **first-visit Monte Carlo update** (Sutton & Barto, 2018, Chapter 5). Each task constitutes one episode. The retrieved memories are the "states visited" during that episode. The outcome `r` is the return.
+
+#### 3.4.2 Why Monte Carlo, Not TD or Policy Gradient?
+
+Several alternative RL update schemes were considered and rejected:
+
+1. **Temporal Difference (TD) learning** requires a bootstrapped value estimate of the next state. In MemRL's formulation, there is no meaningful "next state"—each task is an independent episode. TD would degenerate to Monte Carlo anyway.
+
+2. **Policy gradient methods** (REINFORCE, PPO) optimize a parameterized policy. MemRL's retrieval policy is non-parametric (it directly uses Q-values for ranking), so policy gradients are inapplicable without introducing unnecessary architecture.
+
+3. **Multi-armed bandit formulations** (UCB, Thompson Sampling) treat each memory as an arm. This is closer to MemRL's setup but ignores the semantic structure of the memory space. MemRL's two-phase design already captures the "bandit-like" tradeoff in Phase 2 while leveraging semantic structure in Phase 1.
+
+Monte Carlo is the natural choice: it is simple, unbiased, and well-suited to episodic settings with binary rewards.
+
+#### 3.4.3 Convergence Behavior
+
+Under standard stochastic approximation assumptions (Robbins-Monro conditions), the Q-value converges to the true expected utility of a memory:
 
 ```
-Five agents: 0.95⁵ = 0.7738 (77.4%)
-Ten agents: 0.95¹⁰ = 0.5987 (59.9%)
+Q_i → E[r | memory i is retrieved and used]  as  n_i → ∞
 ```
 
-Nearly half of all runs fail.
+where `n_i` is the number of times memory `i` has been retrieved.
 
-This is why Anthropic's consistent guidance is: **get each agent to 97%+ reliability before you chain them.** If a single agent cannot reliably complete its subtask, adding more agents makes the system worse, not better. The failure rate of the chain is always worse than the failure rate of its weakest link.
+**Convergence rate:** With `α = 0.1`, the Q-value reaches within 5% of its true value after approximately 30 retrievals (assuming stationary task distribution). This is fast enough for practical use: an active agent encounters similar tasks frequently.
 
-The practical implication: before building a multi-agent system, build each agent as a standalone system and measure its reliability on representative inputs. If any agent is below 97%, improve it first. Common improvements:
-
-1. Better tool descriptions (section 4.3)
-2. More specific system prompts with examples
-3. Retries with exponential backoff for transient failures
-4. Input validation that catches malformed requests before they reach the model
-5. Fallback paths for known failure modes
-
-Only after each agent individually exceeds 97% reliability should you compose them.
-
-### 5.2 Context Drift: The Silent Killer
-
-Context drift is the most insidious failure mode in multi-agent systems. It does not cause crashes. It does not trigger error handlers. It silently degrades output quality until the final result is wrong but plausible.
-
-Here is how it happens. A user asks a five-agent pipeline to "analyze our Q4 sales data and recommend pricing changes for products that are underperforming in the European market."
-
-Agent 1 (data extraction) correctly queries Q4 sales data for European markets.
-
-Agent 2 (analysis) receives Agent 1's output. It identifies underperforming products. But it interprets "underperforming" as "below average revenue" rather than "below target revenue." This is a subtle reinterpretation — both are reasonable definitions, but the user meant "below target."
-
-Agent 3 (pricing) receives Agent 2's analysis. It does not question the definition of "underperforming." It designs pricing changes for products that are below average revenue. Some of these products are actually meeting their targets.
-
-Agent 4 (risk assessment) evaluates the pricing changes. It finds them reasonable because the input data looks correct — it is correct, just for the wrong set of products.
-
-Agent 5 (report generation) produces a confident, well-formatted report recommending price reductions for products that do not need them.
-
-The original intent — "products below target in Europe" — was silently reinterpreted to "products below average globally" by agent 2, and every subsequent agent treated that reinterpretation as ground truth.
-
-**Fix: Shared state with write-once immutable intent.**
-
-Define the user's intent as a structured, immutable object that every agent reads but no agent modifies:
-
-```python
-from pydantic import BaseModel, Field
-from typing import Literal
-from datetime import date
-
-class TaskIntent(BaseModel):
-    """Immutable intent object. Created once at task start.
-    Every agent reads this. No agent modifies it."""
-
-    objective: str = Field(
-        description="The user's objective in their exact words"
-    )
-    scope_region: str = Field(
-        description="Geographic scope, e.g. 'Europe', 'North America'"
-    )
-    scope_time: str = Field(
-        description="Time period, e.g. 'Q4 2025', '2025-10 to 2025-12'"
-    )
-    metric: str = Field(
-        description="The specific metric to evaluate against, e.g. "
-        "'revenue vs target', 'units sold vs forecast'"
-    )
-    threshold_definition: str = Field(
-        description="Exact definition of the threshold, e.g. "
-        "'below 90% of quarterly target'"
-    )
-    created_at: date = Field(default_factory=date.today)
-    created_by: str = Field(description="ID of the agent or user that created this intent")
-
-    class Config:
-        frozen = True  # Immutable after creation
-
-class AgentOutput(BaseModel):
-    """Every agent writes its output here with explicit reference to intent."""
-
-    agent_id: str
-    intent_hash: str = Field(
-        description="SHA256 of the TaskIntent, proving this output "
-        "was produced against the original intent"
-    )
-    interpretation: str = Field(
-        description="This agent's interpretation of its subtask, "
-        "written in plain language for downstream agents to verify"
-    )
-    output_data: dict
-    confidence: float = Field(ge=0.0, le=1.0)
-    assumptions: list[str] = Field(
-        default_factory=list,
-        description="Any assumptions this agent made that were not "
-        "explicit in the intent"
-    )
-```
-
-The `TaskIntent` is frozen (immutable after creation). Every agent reads it before starting its work. Every agent writes its `interpretation` field, explaining how it understood its subtask. Every agent includes `assumptions` — explicit statements about what it inferred that was not in the intent.
-
-The `intent_hash` field is the key mechanism. Every agent computes a hash of the `TaskIntent` and includes it in its output. If the intent is accidentally modified (a bug in the orchestrator, a serialization error), the hash mismatch is detectable.
-
-Downstream agents read their predecessor's `interpretation` and `assumptions` fields. If agent 3 reads agent 2's interpretation — "I defined 'underperforming' as below average revenue" — and it contradicts the intent's `threshold_definition` — "below 90% of quarterly target" — agent 3 can flag the discrepancy instead of silently propagating it.
-
-### 5.3 Race Conditions in Multi-Agent Systems
-
-Race conditions occur when agents execute concurrently and make decisions based on incomplete information from other agents.
-
-Consider a travel-booking multi-agent system:
+**Non-stationarity:** In practice, the task distribution is not perfectly stationary—the agent encounters progressively harder problems, or the problem domain shifts. The constant learning rate `α = 0.1` provides exponential recency weighting:
 
 ```
-Agent A (Inquiry):    Collecting user preferences for a trip
-Agent B (Scheduling): Booking calendar slots for meetings
-Agent C (Flights):    Searching and booking flights
-Agent D (Hotels):     Searching and booking hotels
+Effective weight of observation t steps ago: α(1-α)^t
+
+t = 0:   0.100  (most recent)
+t = 5:   0.059
+t = 10:  0.035
+t = 20:  0.012
+t = 50:  0.001
 ```
 
-Agent B starts booking meetings before Agent A finishes collecting all requirements. Agent B books a 9 AM Monday meeting in London. Agent A then discovers the user cannot travel until Tuesday. Agent C has already purchased a non-refundable flight arriving Monday evening based on Agent B's calendar. The system has committed resources based on incomplete information.
+This means MemRL naturally adapts to distributional shift: old evidence decays exponentially, and Q-values track the most recent performance of each memory.
 
-**Fix: Event Spine with ordered event streams.**
+#### 3.4.4 Worked Example: Q-Value Trajectory
 
-An Event Spine is a centralized, ordered log of events that all agents publish to and subscribe from. No agent acts on stale state — every agent reads the latest events before making decisions.
-
-```python
-import asyncio
-from dataclasses import dataclass, field
-from typing import Any
-from datetime import datetime
-import json
-
-@dataclass
-class Event:
-    source_agent: str
-    event_type: str
-    data: dict[str, Any]
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    sequence_number: int = 0
-    context_id: str = ""  # Links events to a specific task/conversation
-
-    def to_dict(self) -> dict:
-        return {
-            "source": self.source_agent,
-            "type": self.event_type,
-            "data": self.data,
-            "timestamp": self.timestamp.isoformat(),
-            "seq": self.sequence_number,
-            "context_id": self.context_id,
-        }
-
-
-class EventSpine:
-    """Ordered event log with subscription-based delivery.
-    All agents publish events here. All agents read from here.
-    Events are strictly ordered by sequence number."""
-
-    def __init__(self):
-        self._events: list[Event] = []
-        self._sequence = 0
-        self._subscribers: dict[str, asyncio.Queue] = {}
-        self._lock = asyncio.Lock()
-
-    async def publish(self, event: Event) -> int:
-        async with self._lock:
-            self._sequence += 1
-            event.sequence_number = self._sequence
-            self._events.append(event)
-            for queue in self._subscribers.values():
-                await queue.put(event)
-            return self._sequence
-
-    def subscribe(self, agent_id: str) -> asyncio.Queue:
-        queue = asyncio.Queue()
-        self._subscribers[agent_id] = queue
-        return queue
-
-    def get_events_since(self, sequence: int) -> list[Event]:
-        return [e for e in self._events if e.sequence_number > sequence]
-
-    def get_events_by_type(self, event_type: str) -> list[Event]:
-        return [e for e in self._events if e.event_type == event_type]
-
-
-class SpineAwareAgent:
-    """Base class for agents that coordinate through the Event Spine."""
-
-    def __init__(self, agent_id: str, spine: EventSpine):
-        self.agent_id = agent_id
-        self.spine = spine
-        self.last_seen_sequence = 0
-        self._event_queue = spine.subscribe(agent_id)
-
-    async def wait_for_event(self, event_type: str, timeout: float = 30.0) -> Event | None:
-        """Block until a specific event type appears, or timeout."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                remaining = deadline - asyncio.get_event_loop().time()
-                event = await asyncio.wait_for(
-                    self._event_queue.get(), timeout=max(0.1, remaining)
-                )
-                self.last_seen_sequence = event.sequence_number
-                if event.event_type == event_type:
-                    return event
-            except asyncio.TimeoutError:
-                continue
-        return None
-
-    async def publish(self, event_type: str, data: dict) -> int:
-        event = Event(
-            source_agent=self.agent_id,
-            event_type=event_type,
-            data=data,
-        )
-        return await self.spine.publish(event)
-
-    def check_prerequisites(self, required_events: list[str]) -> list[str]:
-        """Check which prerequisite events have NOT been published yet."""
-        published_types = {e.event_type for e in self.spine._events}
-        return [req for req in required_events if req not in published_types]
-```
-
-The scheduling agent now waits for the inquiry agent to publish a `requirements_complete` event before booking anything:
-
-```python
-class SchedulingAgent(SpineAwareAgent):
-    async def run(self):
-        # Wait for requirements to be finalized
-        missing = self.check_prerequisites(["requirements_complete"])
-        if missing:
-            req_event = await self.wait_for_event("requirements_complete", timeout=120)
-            if req_event is None:
-                await self.publish("scheduling_error", {
-                    "reason": "Timed out waiting for requirements",
-                })
-                return
-
-        requirements = req_event.data
-        travel_dates = requirements["travel_dates"]
-        # Now safe to book — we have confirmed travel dates
-        await self.book_meetings(travel_dates)
-        await self.publish("meetings_booked", {
-            "meetings": self.booked_meetings,
-            "travel_dates": travel_dates,
-        })
-```
-
-The Event Spine imposes ordering constraints without requiring agents to know about each other. The scheduling agent does not import the inquiry agent or call its methods — it subscribes to an event type. This decoupling means you can add, remove, or replace agents without modifying the others.
-
-### 5.4 Cascade Failures and Inter-Agent Validation
-
-A cascade failure occurs when one agent produces marginally incorrect output, and subsequent agents treat it as ground truth, amplifying the error at each stage.
-
-Agent A extracts data from a PDF and misreads "$1.2M" as "$12M" due to a formatting artifact. Agent B builds a financial model using the $12M figure. Agent C generates investment recommendations based on that model. The recommendations are wrong by an order of magnitude, but every intermediate step looks internally consistent.
-
-This is different from context drift (section 5.2). Context drift changes the interpretation of the task. Cascade failures corrupt the data while keeping the interpretation correct. The task definition is fine — "analyze revenue" — but the revenue number is wrong.
-
-**Fix: Inter-agent validation with sampled contracts.**
-
-Define explicit contracts between agents. A contract specifies what the output of one agent should look like, and downstream agents validate against it before proceeding:
-
-```python
-from pydantic import BaseModel, validator
-from typing import Optional
-
-class DataExtractionContract(BaseModel):
-    """Contract for data extraction agent output.
-    Downstream agents validate against this before using the data."""
-
-    source_document: str
-    extraction_method: str  # "ocr", "text_parse", "table_extract"
-    confidence_score: float
-    revenue_figures: list[dict]
-
-    @validator("confidence_score")
-    def confidence_must_be_reasonable(cls, v):
-        if v < 0.7:
-            raise ValueError(
-                f"Confidence score {v} is below threshold 0.7. "
-                f"Data extraction may be unreliable."
-            )
-        return v
-
-    @validator("revenue_figures")
-    def revenues_must_be_sane(cls, v):
-        for fig in v:
-            amount = fig.get("amount", 0)
-            if amount > 1e12:
-                raise ValueError(
-                    f"Revenue figure ${amount:,.0f} exceeds sanity check "
-                    f"threshold of $1T. Likely an extraction error."
-                )
-            if amount < 0:
-                raise ValueError(
-                    f"Negative revenue ${amount:,.0f} is likely an error."
-                )
-        return v
-
-
-class ContractValidator:
-    """Validates agent outputs against inter-agent contracts.
-    Uses sampling for expensive validations."""
-
-    def __init__(self, sample_rate: float = 0.1):
-        self.sample_rate = sample_rate
-        self.validation_log: list[dict] = []
-
-    def validate(self, output: dict, contract_class: type[BaseModel]) -> tuple[bool, Optional[str]]:
-        """Validate an agent's output against a contract.
-
-        Returns (is_valid, error_message).
-        """
-        try:
-            contract_class(**output)
-            self.validation_log.append({
-                "contract": contract_class.__name__,
-                "valid": True,
-                "sampled": True,
-            })
-            return True, None
-        except Exception as e:
-            self.validation_log.append({
-                "contract": contract_class.__name__,
-                "valid": False,
-                "error": str(e),
-                "sampled": True,
-            })
-            return False, str(e)
-```
-
-Contracts catch two categories of errors:
-
-1. **Structural errors**: missing fields, wrong types, unexpected formats. Pydantic catches these automatically.
-2. **Semantic errors**: values that are technically valid but obviously wrong. The `revenues_must_be_sane` validator catches order-of-magnitude extraction errors.
-
-For expensive validations (e.g., calling another model to verify the extracted data against the source document), use sampling: validate 10% of outputs at full depth, validate all outputs at the structural level. The `sample_rate` parameter controls this tradeoff.
-
-### 5.5 The 79% Statistic: Most Failures Are Not Model Failures
-
-The MAST (Multi-Agent System Testing) research framework found that **79% of multi-agent system failures are specification and coordination failures, not model failures.** The model did its job correctly — it followed the instructions it was given. The instructions were wrong, incomplete, or contradictory.
-
-The failure categories:
-
-| Category | % of Failures | Example |
-|---|---|---|
-| Ambiguous task specification | 34% | "Process the data" — which data? Which processing? |
-| Missing coordination constraints | 22% | Two agents modify the same resource concurrently |
-| Incorrect delegation boundaries | 13% | Agent A is given work that requires Agent B's tools |
-| Schema mismatches between agents | 10% | Agent A outputs `{ "total": 42 }`, Agent B expects `{ "sum": 42 }` |
-| Model reasoning errors | 21% | Model misunderstands a clear instruction |
-
-The implication: **you will get more reliability improvement from better specifications and coordination than from better models.** Upgrading from GPT-4 to GPT-4.5 improves the 21% model failure category. Fixing your specifications and coordination fixes the 79%.
-
-Concrete actions based on this data:
-
-1. **Write task specifications in structured formats**, not natural language. Use Pydantic models, JSON schemas, or typed interfaces. "Process the data" becomes a `ProcessingTask` object with explicit `input_schema`, `output_schema`, `constraints`, and `validation_rules`.
-
-2. **Define coordination constraints explicitly.** Which agents can run concurrently? Which must be sequential? What shared resources exist? Use the Event Spine pattern (section 5.3) or explicit dependency declarations.
-
-3. **Test agent boundaries independently.** Before composing agents, verify that each agent's input/output schemas match what its neighbors produce/expect. Schema mismatches are trivially detectable with type checking but frequently missed in dynamic systems.
-
-### 5.6 OpenAI Codex Subagents in Practice
-
-OpenAI Codex (GA March 2026) implements multi-agent through a configuration file at `.codex/config.toml`:
-
-```toml
-# .codex/config.toml — Production configuration
-
-model = "o4-mini"
-
-# Agent concurrency settings
-[agents]
-max_threads = 6
-max_depth = 1
-job_max_runtime_seconds = 1800
-
-# Custom agent: PR Explorer
-[agents.pr_explorer]
-description = "Read-only codebase explorer. Maps dependencies, traces call graphs, builds context for workers."
-config_file = "agents/pr_explorer.toml"
-
-# Custom agent: Security Reviewer
-[agents.security_reviewer]
-description = "Reviews code changes for security vulnerabilities, auth bypasses, and data exposure risks."
-config_file = "agents/security_reviewer.toml"
-
-# Custom agent: Test Writer
-[agents.test_writer]
-description = "Generates unit and integration tests for changed code. Runs tests to verify coverage."
-config_file = "agents/test_writer.toml"
-```
-
-Each custom agent gets its own TOML file:
-
-```toml
-# agents/pr_explorer.toml
-role = "explorer"
-model = "o4-mini"
-
-[system_prompt]
-content = """You are a codebase explorer. Your job is to:
-1. Map the dependency graph of the changed files
-2. Trace the call graph from changed functions to their callers
-3. Identify all test files that cover the changed code
-4. Build a context summary for worker agents
-
-Output format:
-- Changed files with line ranges
-- Direct dependencies (imports/requires)
-- Reverse dependencies (who imports these files)
-- Related test files
-- Risk assessment: HIGH/MEDIUM/LOW for each changed file
-
-Do NOT modify any files. Read-only access only."""
-```
-
-The three built-in roles have different permissions:
-
-| Role | File Access | Shell Access | Purpose |
-|---|---|---|---|
-| `default` | Read/Write | Yes | General-purpose operations |
-| `worker` | Read/Write | Yes | Focused implementation tasks |
-| `explorer` | Read-only | No | Safe codebase scanning |
-
-The `explorer` role is the most important for multi-agent reliability. Before workers make changes, an explorer maps the codebase. Workers receive the explorer's context map and scope their edits accordingly. This prevents a common failure: a worker agent modifying a file based on incomplete understanding of its dependencies, breaking code it never read.
-
-**The `spawn_agents_on_csv` feature** is experimental but powerful for batch operations:
-
-```python
-# spawn_agents_on_csv usage (from Codex manager agent)
-# Each CSV row becomes a separate worker agent
-
-# Input: review_tasks.csv
-# file,task,context
-# src/auth.ts,security review,"Authentication module, handles JWT tokens"
-# src/db.ts,security review,"Database layer, raw SQL queries"
-# src/api.ts,security review,"REST API handlers, processes user input"
-
-# The manager agent invokes:
-spawn_agents_on_csv("review_tasks.csv", agent="security_reviewer", max_concurrent=3)
-
-# Output: review_results.csv
-# file,task,status,findings
-# src/auth.ts,security review,done,"[{severity: HIGH, issue: 'JWT not validated on /admin/*'}]"
-# src/db.ts,security review,done,"[{severity: CRITICAL, issue: 'SQL injection in search()'}]"
-# src/api.ts,security review,error,"Timeout after 1800s"
-```
-
-Each CSV row spawns an independent worker agent. Workers run concurrently up to `max_threads` (6 in the config above). Results are collected back into a CSV. The manager agent reads the results CSV and synthesizes a report.
-
-The `max_depth = 1` constraint is deliberate. Codex does not allow workers to spawn sub-workers. Anthropic and OpenAI arrived at the same constraint independently — depth-1 is the sweet spot where delegation is useful but the system remains predictable.
-
-### 5.7 Claude Code Subagents: Clean Context Through Depth-1 Delegation
-
-Claude Code's subagent model solves a specific problem: **the main agent's context fills up with intermediate work (file reads, grep results, test output) that is needed for one step but irrelevant to subsequent steps.**
-
-Without subagents, reading 20 files to understand an authentication module consumes 40,000+ tokens of context. Those tokens are permanent — they stay in the context for the rest of the conversation, displacing space that could be used for actual implementation work.
-
-With subagents, the exploration happens in a separate 200K token context. Only the summary (200-500 tokens) returns to the parent:
+Consider a memory `m_42` that stores a solution strategy for matrix decomposition problems, initialized at `Q_42 = 0.5`:
 
 ```
-Parent agent context:
-  [User message: "Fix the login bug where OAuth tokens expire prematurely"]
-  [Subagent result: "The OAuth token handling is in src/auth/oauth.ts.
-   Tokens are created with a 1-hour expiry in createToken() at line 47.
-   The refresh logic in refreshToken() at line 92 has a bug: it checks
-   Date.now() > token.expiresAt but expiresAt is stored in seconds
-   while Date.now() returns milliseconds. Tokens appear expired
-   immediately after creation. Fix: change the comparison to
-   Date.now() / 1000 > token.expiresAt"]
-  [Agent reads src/auth/oauth.ts line 92]
-  [Agent edits the comparison]
+Retrieval 1:  Task succeeds   → Q = 0.9·0.50 + 0.1·1.0 = 0.55
+Retrieval 2:  Task fails      → Q = 0.9·0.55 + 0.1·0.0 = 0.495
+Retrieval 3:  Task succeeds   → Q = 0.9·0.495 + 0.1·1.0 = 0.546
+Retrieval 4:  Task succeeds   → Q = 0.9·0.546 + 0.1·1.0 = 0.591
+Retrieval 5:  Task succeeds   → Q = 0.9·0.591 + 0.1·1.0 = 0.632
+Retrieval 6:  Task fails      → Q = 0.9·0.632 + 0.1·0.0 = 0.569
+Retrieval 7:  Task succeeds   → Q = 0.9·0.569 + 0.1·1.0 = 0.612
+Retrieval 8:  Task succeeds   → Q = 0.9·0.612 + 0.1·1.0 = 0.651
+...
+Retrieval 30: (after ~24 successes, ~6 failures) → Q ≈ 0.79
 ```
 
-The parent never saw the 20 files the subagent read. It got a focused summary with the exact file, line number, and diagnosis. Total context cost: ~500 tokens instead of ~40,000.
+If the memory's true helpfulness rate is 80% (it leads to success 4 out of 5 times when retrieved for appropriate tasks), the Q-value converges to approximately 0.8.
 
-**The `parent_tool_use_id` tracking mechanism** links subagent outputs back to the tool call that spawned them. This is how the parent agent knows which subagent result corresponds to which delegation:
+Now consider a superficially similar but misleading memory `m_43`, which has a 20% success rate:
 
-```json
-{
-  "type": "tool_result",
-  "tool_use_id": "toolu_01ABC...",
-  "content": [
-    {
-      "type": "text",
-      "text": "Subagent summary: The OAuth token handling is in..."
-    }
-  ]
-}
+```
+Retrieval 1:  Task fails      → Q = 0.9·0.50 + 0.1·0.0 = 0.450
+Retrieval 2:  Task fails      → Q = 0.9·0.45 + 0.1·0.0 = 0.405
+Retrieval 3:  Task succeeds   → Q = 0.9·0.405 + 0.1·1.0 = 0.465
+Retrieval 4:  Task fails      → Q = 0.9·0.465 + 0.1·0.0 = 0.418
+Retrieval 5:  Task fails      → Q = 0.9·0.418 + 0.1·0.0 = 0.377
+...
+Retrieval 30: → Q ≈ 0.21
 ```
 
-The `tool_use_id` matches the original `Agent(...)` tool call. When the parent spawns three subagents in parallel, it can match results to requests without ambiguity.
+After 30 retrievals each, `Q_42 ≈ 0.79` and `Q_43 ≈ 0.21`. Phase 2 will consistently prefer `m_42` over `m_43`, even if `m_43` has higher cosine similarity to the query. **The Q-value has learned to discriminate helpful from unhelpful memories.**
 
-**Clean context per subagent** means each subagent starts with:
-1. The parent's system prompt (inherited)
-2. The specific task description (from the `Agent()` call)
-3. Nothing else — no conversation history, no previous tool results
+#### 3.4.5 Credit Assignment
 
-This is intentional. The subagent does not need to know what the parent discussed five turns ago. It needs to know exactly what to do right now. Clean context prevents the subagent from being distracted by irrelevant prior conversation.
+A subtle issue: when multiple memories are retrieved for a single task, the binary outcome `r` is attributed equally to all of them. This is a form of *uniform credit assignment* and is known to be noisy—a task might succeed because of memory A despite memory B being useless (or even harmful).
 
-The built-in subagent types optimize for different cost/capability tradeoffs:
+MemRL accepts this noise as a pragmatic tradeoff. Alternatives were considered:
 
-| Type | Model | Tools | Cost | Use Case |
-|---|---|---|---|---|
-| Explore | Haiku | Read, Grep, Glob | Low | File discovery, code search |
-| Plan | Inherited | Read, Grep, Glob | Medium | Architectural analysis |
-| General | Inherited | All | Medium | Terminal commands, edits |
-| Guide | Haiku | None | Lowest | Answering questions about Claude Code |
+- **Attention-based credit:** Use the LLM's attention weights to determine which memory contributed most. Rejected because attention weights are unreliable indicators of causal contribution (Jain & Wallace, 2019).
+- **Leave-one-out credit:** Re-run the task K times, each time omitting one memory, to isolate individual contributions. Rejected because it requires K additional LLM calls per task, which is prohibitively expensive.
+- **Self-reported credit:** Ask the LLM which memory was most helpful. Rejected because LLMs are poor self-reporters of internal reasoning processes (Turpin et al., 2024).
 
-Explore agents use Haiku (the smallest, cheapest Claude model) because file reading does not require sophisticated reasoning. Plan agents inherit the parent's model because architectural analysis requires the full reasoning capability. General agents have all tools because they may need to run builds, execute tests, or make edits.
-
-Custom subagents are defined as Markdown files with YAML frontmatter:
-
-```markdown
----
-name: db-migration-checker
-description: "Validates database migrations for safety. Checks for irreversible operations, missing rollback scripts, and data loss risks."
-model: sonnet
-tools: ["Read", "Grep", "Glob", "Bash"]
-permissionMode: plan
----
-
-You are a database migration safety reviewer. For each migration file:
-
-1. Check for irreversible operations (DROP TABLE, DROP COLUMN, TRUNCATE)
-2. Verify a corresponding rollback migration exists
-3. Check for data loss risks (column type changes that truncate data)
-4. Verify the migration is idempotent (can be run twice without error)
-5. Check for lock contention (ALTER TABLE on large tables without CONCURRENTLY)
-
-Output format:
-SAFE: Migration can be applied without risk
-WARNING: Migration has risks that should be reviewed (list them)
-BLOCK: Migration must not be applied (explain why)
-
-For WARNING and BLOCK, include the specific SQL statement and line number.
-```
-
-Place this at `.claude/agents/db-migration-checker.md`. Invoke it with `@"db-migration-checker" check the pending migrations`.
-
-### 5.8 When NOT to Use Multi-Agent
-
-Anthropic's production experience and research systems converge on a clear principle: **most tasks do not benefit from multi-agent orchestration.** From their multi-agent research system documentation:
-
-> "Most coding tasks involve fewer truly parallelizable tasks than research. For coding, you often need sequential steps: understand the codebase, plan the change, implement, test. Research tasks can parallelize better: search multiple sources simultaneously, analyze from multiple angles. Even then, coordination overhead can negate the parallelism benefit."
-
-The Anthropic team learned this the hard way with their early multi-agent research system:
-
-> "Early agents made errors like spawning 50 subagents for simple queries. We had to embed explicit scaling rules into the prompts: simple fact-finding requires 1 agent with 3-10 tool calls; direct comparisons might need 2-3 agents; comprehensive research might need 5+."
-
-Here is the decision framework that reflects production experience:
-
-**Use a single agent when:**
-- The task fits in one context window (under 100K tokens of work)
-- Steps are sequential and dependent (each step uses the previous step's output)
-- The task requires consistent reasoning about a single artifact (code review, bug analysis)
-- Error recovery requires understanding the full context of what went wrong
-
-**Use multi-agent when:**
-- The task requires more context than one window can hold (large codebase refactoring)
-- Subtasks are genuinely independent (reviewing different files in parallel)
-- Different subtasks need different capabilities (read-only analysis vs. write access)
-- Verification quality matters (separate generator and evaluator contexts)
-- The task involves batch processing (same operation on many inputs)
-
-**Never use multi-agent when:**
-- You are trying to improve quality through "collaboration" (agents agreeing with each other is not verification — it is echo-chambering)
-- The coordination overhead exceeds the parallelism benefit (two agents spending 3,000 tokens each on coordination to save 2,000 tokens of serial execution)
-- Agent boundaries are arbitrary (splitting a task into "Plan Agent" and "Execute Agent" when one agent can plan and execute perfectly well)
-
-The overhead budget for multi-agent is non-trivial:
-
-| Overhead Source | Token Cost | Latency Cost |
-|---|---|---|
-| Orchestrator reasoning (per delegation) | 500-2,000 | 2-5 seconds |
-| Context duplication (background per agent) | 2,000-10,000 | 0 (parallel) |
-| Result synthesis (per agent response) | 500-1,500 | 2-5 seconds |
-| Error handling / retry (per failure) | 1,000-5,000 | 5-30 seconds |
-
-A five-agent system with two retries consumes 15,000-50,000 tokens in coordination overhead alone. If the serial single-agent approach costs 30,000 tokens total, the multi-agent version may cost 60,000-100,000 tokens for marginal quality improvement.
+In practice, uniform credit assignment works because of the **law of large numbers**: over many tasks, a consistently useful memory will co-occur with success more often than a useless one, and the Q-values will separate accordingly. The worked example in §3.4.4 demonstrates this separation.
 
 ---
 
-## Chapter 6: Long-Horizon Agent Harnesses — The Initializer Pattern
+### 3.5 Results and Ablations
 
-### 6.1 The Initializer Creates Three Files
+#### 3.5.1 Benchmark Suite
 
-Anthropic's "Effective Harnesses for Long-Running Agents" (2025) documented a pattern that became the foundation for every production long-horizon coding agent. The pattern has two phases: an initializer agent that runs once, and a coding agent that runs repeatedly. The initializer creates three artifacts that the coding agent reads on every session.
+MemRL is evaluated on four benchmarks chosen to test different aspects of agent capability:
 
-**Artifact 1: `init.sh`** — A script that sets up and starts the development environment.
+| Benchmark | Domain | Metric | Tasks | What It Tests |
+|-----------|--------|--------|-------|---------------|
+| **HLE** (Humanity's Last Exam) | Expert-level STEM | Accuracy (%) | 3,000 | Hardest reasoning; requires graduate-level domain knowledge |
+| **BigCodeBench** | Code generation | Pass@1 (%) | 1,140 | Complex multi-library coding with precise API usage |
+| **ALFWorld** | Embodied tasks | Success rate (%) | 134 | Multi-step household tasks; requires planning over long horizons |
+| **Lifelong Agent Bench** | Mixed sequential | Cumulative accuracy (%) | 400+ | Tests continual adaptation across shifting task distributions |
 
-```bash
-#!/bin/bash
-# init.sh — Autonomous agent development environment setup
-# This script is run by the coding agent at the start of every session.
-# It must be idempotent (safe to run multiple times).
+#### 3.5.2 Main Results
 
-set -e
+**Table 1: MemRL Performance vs. Baselines (GPT-4o backbone)**
 
-echo "[init.sh] Installing dependencies..."
-npm install 2>&1 | tail -5
+| Method | HLE (%) | BigCodeBench (%) | ALFWorld (%) | Lifelong Agent (%) |
+|--------|---------|-------------------|--------------|---------------------|
+| GPT-4o (vanilla) | 21.4 | 61.2 | 67.2 | 45.8 |
+| GPT-4o + CoT | 23.1 | 63.5 | 71.6 | 48.3 |
+| GPT-4o + RAG | 22.7 | 64.8 | 74.5 | 51.2 |
+| GPT-4o + Reflexion | 24.6 | 65.1 | 78.4 | 53.7 |
+| GPT-4o + MemRL | **28.9** | **69.7** | **85.1** | **61.4** |
 
-echo "[init.sh] Starting dev server in background..."
-if lsof -i :3000 > /dev/null 2>&1; then
-    echo "[init.sh] Dev server already running on port 3000"
-else
-    npm run dev > /tmp/dev-server.log 2>&1 &
-    DEV_PID=$!
-    echo "[init.sh] Dev server PID: $DEV_PID"
+**Key observations:**
 
-    # Wait for server to be ready (max 30 seconds)
-    for i in $(seq 1 30); do
-        if curl -s http://localhost:3000 > /dev/null 2>&1; then
-            echo "[init.sh] Dev server ready at http://localhost:3000"
-            break
-        fi
-        if [ "$i" = "30" ]; then
-            echo "[init.sh] ERROR: Dev server did not start within 30 seconds"
-            cat /tmp/dev-server.log
-            exit 1
-        fi
-        sleep 1
-    done
-fi
+1. **MemRL outperforms all baselines on every benchmark.** The margins are substantial: +4.3pp over RAG on HLE, +4.9pp on BigCodeBench, +6.7pp on ALFWorld, +7.7pp on Lifelong Agent Bench.
 
-echo "[init.sh] Starting database..."
-if ! pg_isready -q 2>/dev/null; then
-    pg_ctl start -D /var/lib/postgresql/data -l /tmp/pg.log
-    sleep 2
-fi
+2. **RAG underperforms CoT on HLE.** This confirms the misleading-memory problem described in §3.1: on the hardest reasoning tasks, retrieved memories that are similar but wrong are worse than no memory at all.
 
-echo "[init.sh] Running migrations..."
-npx prisma migrate deploy 2>&1 | tail -3
+3. **The gap widens on sequential benchmarks.** On Lifelong Agent Bench, which presents tasks in sequence and rewards continual improvement, MemRL's advantage over RAG grows to 10.2pp. This is because Q-values accumulate information over the sequence—later tasks benefit from the learned utility of earlier experiences.
 
-echo "[init.sh] Environment ready."
-```
+4. **MemRL on ALFWorld approaches oracle performance.** The best possible single-agent ALFWorld score with GPT-4o is approximately 88% (limited by the LLM's spatial reasoning failures). MemRL reaches 85.1%, suggesting that almost all recoverable failures are being addressed by memory-augmented learning.
 
-The key design decisions:
+#### 3.5.3 Ablation Studies
 
-- **Idempotent**: checks if services are already running before starting them. The coding agent may run `init.sh` multiple times in a session (after a context reset, after a crash, to verify the environment).
-- **Quiet output**: pipes verbose output through `tail -5` to keep the agent's context clean. The agent does not need to see 200 lines of npm install output.
-- **Error reporting**: if the dev server does not start, the script dumps the server log and exits with a non-zero code. The coding agent sees the error and can diagnose it.
-- **Background processes**: the dev server runs in the background (`&`) so the script returns and the agent can continue working.
+**Table 2: Ablation Results (GPT-4o backbone, averaged across benchmarks)**
 
-**Artifact 2: `claude-progress.txt`** — A structured progress log.
+| Configuration | HLE | BigCodeBench | ALFWorld | Lifelong Agent | Δ avg |
+|--------------|-----|-------------|----------|----------------|-------|
+| Full MemRL | 28.9 | 69.7 | 85.1 | 61.4 | — |
+| Remove Phase 2 (Q-value selection) | 23.2 | 65.0 | 75.2 | 52.1 | −7.4 |
+| Remove Phase 1 (semantic filter) | 25.1 | 66.3 | 79.8 | 55.6 | −4.6 |
+| Remove both phases (random retrieval) | 20.8 | 60.4 | 65.3 | 44.1 | −13.2 |
+| Replace Q-update with popularity count | 24.8 | 66.1 | 77.9 | 54.2 | −5.5 |
+| Set α = 0.5 (high learning rate) | 27.3 | 68.2 | 82.5 | 58.9 | −1.9 |
+| Set α = 0.01 (low learning rate) | 25.4 | 66.8 | 79.1 | 55.3 | −4.5 |
+| K = 1 (retrieve single memory) | 26.1 | 67.4 | 81.3 | 57.8 | −2.8 |
+| K = 5 (retrieve five memories) | 28.2 | 69.1 | 84.6 | 60.7 | −0.6 |
 
-```
-# Claude Progress Log
-# Format: Each session gets a dated entry with completed work and next priorities.
-# Rules: Only append. Never delete or modify previous entries.
+**Ablation analysis:**
 
-## Session 1 (Initializer) — 2025-11-15T09:00:00Z
-- Created project structure (Next.js 14 + Prisma + PostgreSQL)
-- Created feature_list.json with 147 testable features
-- Created init.sh for development environment
-- Initialized git repository
-- Implemented project skeleton:
-  - Layout component with navigation
-  - Home page with placeholder content
-  - Database schema for users table
-- 3/147 features passing
-- Commit: a1b2c3d "Initial project setup"
+1. **Removing Phase 2 is catastrophic (−7.4pp average).** Without Q-value selection, the system degenerates to standard RAG. This is the single most important ablation: it confirms that *learned utility, not similarity, drives MemRL's advantage.*
 
-## Next Session Priorities:
-1. Authentication system (features 4-12)
-2. User profile page (features 13-18)
-3. Fix: navigation links not active on current page
+2. **Removing Phase 1 is also damaging (−4.6pp average).** Without semantic filtering, the Q-value selector operates over the entire memory buffer including semantically irrelevant entries. High-Q but irrelevant memories contaminate the context. Phase 1 is necessary to keep Phase 2 focused.
 
-## Known Issues:
-- Tailwind dark mode not configured (needed for features 89-95)
-- No test infrastructure yet (needed before feature 50)
-```
+3. **Random retrieval is worse than no retrieval.** The "Remove both phases" configuration (random selection from the buffer) scores below vanilla GPT-4o on BigCodeBench and ALFWorld. Random memories are actively harmful.
 
-The format matters:
+4. **Popularity-based ranking underperforms Q-values (−5.5pp average).** Replacing Q-values with simple retrieval counts tests whether utility learning is necessary or whether frequently-retrieved memories are already the best ones. The answer is clearly no: popular memories may be popular because they are general, not because they are helpful.
 
-- **Dated session headers** with timestamps. The coding agent can calculate how much work was done per session and estimate remaining effort.
-- **Specific commit hashes**. The coding agent can run `git diff a1b2c3d..HEAD` to see exactly what changed since the last session.
-- **Feature count progress** (`3/147 features passing`). This is the single most important metric. If the number goes down, the agent has introduced a regression and must fix it before continuing.
-- **Next session priorities** at the end. The coding agent reads this first and starts immediately on the highest-priority item.
-- **Known issues** section. Problems discovered but not fixed get tracked here so they are not forgotten across context boundaries.
+5. **Learning rate sensitivity is moderate.** The default `α = 0.1` outperforms both `α = 0.5` (too noisy, Q-values oscillate) and `α = 0.01` (too slow, Q-values don't differentiate within the benchmark horizon). The system is robust within the range `α ∈ [0.05, 0.2]`.
 
-**Artifact 3: `feature_list.json`** — A comprehensive, testable feature specification.
+6. **K = 3 is near-optimal.** Retrieving fewer memories (`K = 1`) loses useful context; retrieving more (`K = 5`) introduces marginal noise. The system is not very sensitive to K in the range [2, 5].
 
-```json
-{
-  "project": "Task Management App",
-  "total_features": 147,
-  "features": [
-    {
-      "id": 1,
-      "name": "Home page renders",
-      "category": "core",
-      "priority": 1,
-      "passes": true,
-      "testing_steps": [
-        "Navigate to http://localhost:3000/",
-        "Verify the page loads without errors",
-        "Verify the navigation bar is visible",
-        "Verify the main content area displays"
-      ],
-      "last_tested": "2025-11-15T09:30:00Z",
-      "tested_by": "initializer"
-    },
-    {
-      "id": 4,
-      "name": "User can sign up with email and password",
-      "category": "authentication",
-      "priority": 2,
-      "passes": false,
-      "testing_steps": [
-        "Navigate to http://localhost:3000/signup",
-        "Enter email 'test@example.com' in the email field",
-        "Enter password 'TestPassword123!' in the password field",
-        "Click the 'Sign Up' button",
-        "Verify redirect to /dashboard",
-        "Verify welcome message 'Welcome, test@example.com' is visible",
-        "Verify a new user record exists in the database"
-      ],
-      "last_tested": null,
-      "tested_by": null
-    },
-    {
-      "id": 5,
-      "name": "User can log in with existing credentials",
-      "category": "authentication",
-      "priority": 2,
-      "passes": false,
-      "testing_steps": [
-        "Ensure test user exists (run feature 4 first)",
-        "Navigate to http://localhost:3000/login",
-        "Enter email 'test@example.com'",
-        "Enter password 'TestPassword123!'",
-        "Click 'Log In'",
-        "Verify redirect to /dashboard",
-        "Verify user name is displayed in the header"
-      ],
-      "last_tested": null,
-      "tested_by": null
-    }
-  ]
-}
-```
+#### 3.5.4 Cross-Model Generalization
 
-Critical design rules for the feature list:
+A critical question: does MemRL's advantage transfer across LLM backbones, or is it specific to GPT-4o? The paper reports results with three backbone models:
 
-1. **Features can only transition from `false` to `true`.** They can never be removed, reworded, or reordered. This prevents the agent from silently dropping hard features.
-2. **Testing steps are concrete and automatable.** "Verify the page loads" is too vague. "Verify the navigation bar is visible" is specific. "Verify a new user record exists in the database" is testable with a SQL query.
-3. **Dependencies between features are implicit in priority ordering.** Feature 5 (login) depends on feature 4 (signup). The priority field ensures the agent works on feature 4 first.
-4. **The `last_tested` and `tested_by` fields** create an audit trail. If a feature was last tested three sessions ago, it may need re-verification.
+**Table 3: MemRL Across LLM Backbones (ALFWorld benchmark)**
 
-### 6.2 The Coding Agent Orientation Sequence
+| Backbone | Vanilla | + CoT | + RAG | + MemRL | Δ (MemRL − RAG) |
+|----------|---------|-------|-------|---------|------------------|
+| GPT-4o | 67.2 | 71.6 | 74.5 | 85.1 | +10.6 |
+| Claude 3.5 Sonnet | 65.8 | 70.3 | 73.1 | 83.7 | +10.6 |
+| Llama 3.1 70B | 52.4 | 57.1 | 61.8 | 72.3 | +10.5 |
+| GPT-3.5 Turbo | 41.3 | 45.9 | 50.2 | 59.8 | +9.6 |
 
-Every coding session follows an exact startup sequence. The sequence is embedded in the coding agent's system prompt, and the agent executes it before doing any implementation work:
+**Key finding:** The MemRL advantage over RAG is remarkably consistent across models (~10pp). This is predicted by Memento-II's theory (Chapter 5): the convergence guarantee depends on the M-MDP structure, not on the specific LLM. Weaker models benefit slightly less (GPT-3.5 Turbo gains +9.6pp vs. +10.6pp for GPT-4o), likely because their in-context learning from retrieved memories is less effective (weaker satisfaction of Memento-II's condition 5).
+
+**Practical implication:** MemRL can meaningfully elevate a weaker (cheaper) model. GPT-3.5 Turbo + MemRL (59.8%) outperforms vanilla GPT-4o (67.2%)—no, but it approaches GPT-4o + RAG (74.5%) at a fraction of the inference cost. For cost-constrained deployments, MemRL on a smaller model is a viable strategy.
+
+#### 3.5.5 Scaling Behavior
+
+Zhang et al. (2026) also report how MemRL's performance changes as the memory buffer grows:
 
 ```
-Step 1: pwd
-  → Confirms the working directory is correct.
-  → If wrong, navigate to the project root.
-
-Step 2: cat claude-progress.txt
-  → Read the progress log to understand:
-     - What was done in previous sessions
-     - What priorities were set for this session
-     - What known issues exist
-
-Step 3: cat feature_list.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{sum(1 for f in d[\"features\"] if f[\"passes\"])}/{d[\"total_features\"]} features passing')"
-  → Quick progress check. If the count decreased since last session,
-    a regression was introduced.
-
-Step 4: git log --oneline -20
-  → Read recent commits to understand what changed and when.
-  → Look for commits from other agents or human developers.
-
-Step 5: ./init.sh
-  → Start the development environment.
-  → If init.sh fails, diagnose and fix before proceeding.
-
-Step 6: Smoke test
-  → Run a basic end-to-end test to verify the app works.
-  → For web apps: curl http://localhost:3000 + Puppeteer MCP navigation
-  → For CLI tools: run the main command with --help
-  → For APIs: hit the health check endpoint
-
-Step 7: Check for regressions
-  → If the smoke test fails, stop and fix the regression.
-  → Do NOT implement new features on top of a broken app.
-
-Step 8: Pick the highest-priority incomplete feature
-  → Read feature_list.json, filter for passes: false,
-    sort by priority, take the first one.
-
-Step 9: Implement the feature
-  → Write code, run tests, verify manually.
-
-Step 10: Test the feature against its testing_steps
-  → Execute each step from feature_list.json.
-  → All steps must pass.
-
-Step 11: Update feature_list.json
-  → Set passes: true, last_tested: now, tested_by: "coding-agent"
-
-Step 12: Commit
-  → git add -A && git commit -m "feat: [feature name] (feature #N)"
-
-Step 13: Update claude-progress.txt
-  → Append session entry with completed work and next priorities.
+Buffer size:     0      50     100    200    500    1000   5000
+HLE accuracy:   21.4   24.1   25.8   27.2   28.5   28.9   29.1
+ALFWorld:        67.2   74.3   78.6   81.9   84.2   85.1   85.4
 ```
 
-The "fix before build" discipline in steps 6-7 is the single most important principle. Without it, agents accumulate technical debt across sessions. Each new feature is built on top of untested assumptions from the previous session. By session 5, the app is a house of cards.
+Performance improves logarithmically with buffer size. Most of the gain is captured in the first 200–500 entries. Beyond 1000 entries, improvements are marginal. This has a practical implication: **MemRL reaches near-peak performance after a few hundred tasks**, making it viable for deployment in production systems with moderate task volumes.
 
-Here is the actual claude-progress.txt format with timestamps and commit hashes as used in production:
+#### 3.5.7 Learning Curves: Evolution Over Time
 
-```
-## Session 4 — 2025-11-16T14:22:00Z
-- Started: 45/147 features passing
-- Ran init.sh: dev server started on port 3000
-- Smoke test: PASSED (homepage loads, auth works, dashboard renders)
-- Regression check: NONE detected
-- Implemented:
-  - Feature #46: Task creation form validates required fields
-    - Added Zod validation to task creation API route
-    - Added client-side validation to TaskForm component
-    - Commit: f8e2a1b "feat: task creation form validation (feature #46)"
-  - Feature #47: Task list displays all user tasks
-    - Added /api/tasks GET endpoint with pagination
-    - Added TaskList component with infinite scroll
-    - Commit: 3c9d4e5 "feat: task list with pagination (feature #47)"
-  - Feature #48: User can mark task as complete
-    - Added PATCH /api/tasks/:id endpoint
-    - Added checkbox toggle in TaskList component
-    - Fixed: checkbox did not update optimistically (added useSWR mutate)
-    - Commit: 7a1b2c3 "feat: task completion toggle (feature #48)"
-- Ended: 48/147 features passing
-- Session duration: ~45 minutes (estimated from commit timestamps)
+The paper includes a critical analysis of how MemRL's performance evolves as the agent accumulates experience, measured at fixed intervals during sequential task execution:
 
-## Next Session Priorities:
-1. Feature #49: Task due dates with date picker
-2. Feature #50: Overdue tasks highlighted in red
-3. Feature #51: Task filtering by status (all/active/completed)
+**Table 5: MemRL Performance by Experience Level (ALFWorld, GPT-4o)**
 
-## Known Issues:
-- Tailwind dark mode not configured (needed for features 89-95)
-- Test infrastructure needed before feature 60 (API integration tests)
-- TaskList infinite scroll has a flicker on slow connections (cosmetic)
-```
+| Tasks Completed | Vanilla (%) | RAG (%) | MemRL (%) | MemRL − RAG |
+|----------------|------------|---------|-----------|-------------|
+| 0 (cold start) | 67.2 | 67.2 | 67.2 | 0.0 |
+| 10 | 67.2 | 68.1 | 69.4 | +1.3 |
+| 25 | 67.2 | 69.5 | 73.8 | +4.3 |
+| 50 | 67.2 | 71.2 | 78.1 | +6.9 |
+| 100 | 67.2 | 73.8 | 82.4 | +8.6 |
+| 200 | 67.2 | 74.3 | 84.3 | +10.0 |
+| 500 | 67.2 | 74.5 | 85.0 | +10.5 |
+| 1000 | 67.2 | 74.5 | 85.1 | +10.6 |
 
-### 6.3 The Four Failure Modes and Their Fixes
+**Observations:**
 
-Anthropic documented these failure modes from extensive experimentation with long-running agents. Each failure mode has a specific cause, a specific symptom, and a specific structural fix.
+1. **MemRL starts slow, then accelerates.** At 10 tasks, MemRL has only a 1.3pp advantage over RAG—the Q-values haven't differentiated yet. By 50 tasks, the gap has grown to 6.9pp. By 200 tasks, it's 10pp. The Q-value learning curve is roughly logarithmic.
 
-| # | Failure Mode | Symptom | Root Cause | Fix | Mechanism |
-|---|---|---|---|---|---|
-| 1 | Agent tries to do too much | Quality degrades, code becomes buggy, tests are skipped | Agent attempts 10+ features in one session | Feature list + one feature per session | `feature_list.json` decomposes work; agent picks ONE feature |
-| 2 | Agent declares victory early | Core happy paths work, edge cases and error handling missing | Agent self-evaluates ("looks done to me") | Verification against feature list | Agent cannot mark done without passing ALL testing_steps |
-| 3 | Agent loses state | Re-implements existing features, introduces regressions, starts from scratch | New context window has no memory of prior sessions | Progress files + structured artifacts | `claude-progress.txt` + `feature_list.json` + `git log` |
-| 4 | Agent cannot test its work | Marks features as done based on code review alone, missing runtime bugs | No way to run the app and verify behavior | `init.sh` + end-to-end testing | Script starts dev environment; Puppeteer/Playwright MCP enables browser testing |
+2. **RAG plateaus early.** RAG's performance stops improving around 100 tasks. Adding more memories to a similarity-only retrieval system provides diminishing returns because the retrieval quality doesn't improve—it just retrieves more (and potentially more misleading) similar memories.
 
-**Failure mode 1** is the most common. The agent reads the feature list, sees 100 remaining features, and tries to batch them. This is especially prevalent with larger models that have more context capacity — they attempt more, but quality degrades as the context fills. The fix is prompt-level: "Pick ONE feature. Implement it. Test it. Commit it. Then update progress. Do not start a second feature until the first is complete and committed."
+3. **MemRL continues to improve.** Even between 200 and 1000 tasks, MemRL ekes out another 0.8pp. The Q-values continue to refine, finding subtle distinctions between good and bad strategies for edge cases.
 
-**Failure mode 2** is the most dangerous. The agent implements the happy path for user authentication — signup and login work. It marks the feature as done. But the testing steps include "Verify error message when email is already registered" and "Verify error message when password is too short." The agent did not test these. The fix is structural: the feature cannot be marked as `passes: true` until every testing step has been executed and verified. The testing steps are the acceptance criteria, not the agent's judgment.
+4. **Vanilla never improves.** The frozen LLM without any memory is a flat line. This starkly illustrates the stability-plasticity point: without external memory, there is no learning.
 
-**Failure mode 3** occurs at context boundaries. The agent's 200K token context is consumed. A new session starts. Without `claude-progress.txt`, the agent has no memory. It reads the codebase, forms its own understanding of the project state (which may be wrong), and starts implementing features that already work. The fix costs approximately 2,000 tokens per session (reading the three artifacts) and provides complete situational awareness.
+The crossover point—where MemRL overtakes RAG—occurs at approximately 25 tasks. This is the "warm-up cost" of MemRL: the first 25 tasks are necessary to build a buffer with differentiated Q-values. Before this point, RAG is marginally better because it at least retrieves relevant examples even without quality filtering.
 
-**Failure mode 4** creates silent quality degradation. The agent writes a form component, eyeballs the code, decides it looks correct, and moves on. The form has a bug: the submit button does not disable during submission, allowing double-submits. The agent would have caught this if it could click the button. The fix is `init.sh` (which starts the dev server) combined with browser automation (Puppeteer MCP or Playwright MCP). The agent navigates to the form, fills it out, clicks submit, and verifies the behavior in a real browser.
+#### 3.5.8 Limitations
 
-### 6.4 Production Example: "Koda" — An Agent Running 24/7
+1. **Binary reward signal.** MemRL uses `r ∈ {0, 1}`, which discards the degree of success or failure. A task that produces a 99%-correct answer and one that produces gibberish are treated identically. Extending to continuous rewards is straightforward mathematically but requires a task-specific reward function.
 
-"Koda" is a production agent system running continuously under pm2 (a Node.js process manager). It handles 21 scheduled tasks across 11 MCP servers with 43 helper scripts and 18 learned skills. This is not a demo — it is a real system running in a real company.
+2. **Uniform credit assignment.** As discussed in §3.4.5, all retrieved memories receive the same reward update. This is noisy but converges; however, convergence is slower than it would be with accurate credit assignment.
 
-The architecture follows what the operators call "thin runtime + fat filesystem":
+3. **No memory revision.** MemRL adds new memories but never revises old ones. A memory from an early, low-quality experience persists forever (though its Q-value will decay). Explicit memory editing or consolidation could improve buffer quality over time.
 
-```
-~/koda/
-├── soul.md              # Identity: who this agent is, what it values,
-│                        # how it communicates. Never modified by the agent.
-├── learnings.md         # Accumulated lessons. The agent appends here
-│                        # after every significant experience.
-├── goals.md             # Current objectives. Updated weekly by humans,
-│                        # read daily by the agent.
-├── tasks.json           # Active task queue with priorities, deadlines,
-│                        # and dependencies.
-├── skills/              # 18 skill files — step-by-step procedures
-│   ├── deploy.md        # How to deploy a service
-│   ├── incident.md      # How to respond to an incident
-│   ├── self-heal.md     # How to diagnose and fix its own failures
-│   ├── code-review.md   # How to review a PR
-│   ├── standup.md       # How to generate a daily standup summary
-│   └── ...
-├── scripts/             # 43 helper scripts the agent can invoke
-│   ├── check-health.sh  # Service health checks
-│   ├── run-tests.sh     # Test suite execution
-│   ├── deploy.sh        # Deployment pipeline
-│   ├── rollback.sh      # Emergency rollback
-│   └── ...
-├── mcp-servers/         # 11 MCP server configurations
-│   ├── github.json
-│   ├── slack.json
-│   ├── jira.json
-│   ├── postgres.json
-│   ├── grafana.json
-│   └── ...
-└── logs/                # Session logs, task completion records
-    ├── 2025-11-15.log
-    ├── 2025-11-16.log
-    └── ...
-```
+4. **Embedding model dependency.** The quality of Phase 1 filtering depends entirely on the embedding model's ability to capture task-relevant similarity. If the embedding model is weak in a particular domain, Phase 1 may miss relevant memories or admit irrelevant ones.
 
-The "thin runtime" is the agent loop itself — a Claude API call with tool use. The "fat filesystem" is everything the agent knows, can do, and has learned. This separation means:
+5. **Cold start.** With an empty buffer, MemRL provides no benefit. The system requires a "warm-up" period of approximately 50–100 tasks before meaningful Q-value separation emerges. Potential mitigations include seeding the buffer with synthetic experiences generated from the LLM's own reasoning (bootstrap sampling), or transferring memories from a related agent that has already accumulated experience on similar tasks.
 
-1. **The agent can be restarted without losing state.** All knowledge is on disk.
-2. **Skills can be added without changing code.** Drop a new `.md` file in `skills/`.
-3. **The agent evolves through its filesystem.** `learnings.md` grows over time. New scripts appear as the team automates more. Skills are refined based on observed failures.
+6. **Single-agent scope.** MemRL is designed for a single agent operating on a single memory buffer. In multi-agent settings, the question of whether to share memories, partition them, or maintain separate buffers per agent remains unexplored within the MemRL framework. Memento-II's M-MDP formalism could be extended to multi-agent M-MDPs, but this is an open theoretical question.
 
-The `soul.md` file defines the agent's identity and operating principles:
-
-```markdown
-# Koda — Soul
-
-You are Koda, a production operations agent. You run 24/7 under pm2.
-
-## Core principles
-1. Safety first. Never deploy without tests passing. Never modify
-   production data without a backup. Never ignore an alert.
-2. Ask when uncertain. If a task is ambiguous, ask in #koda-questions
-   on Slack. Do not guess.
-3. Log everything. Every action, every decision, every error goes
-   in the session log. Future-you depends on past-you's notes.
-4. Incremental progress. Do one thing, verify it, then do the next.
-   Never batch risky operations.
-
-## Communication style
-- Be concise in Slack. Use bullet points.
-- Be detailed in logs. Include timestamps, command outputs, error traces.
-- Never say "I think" — say "I checked X and found Y" or "I don't know".
-
-## Boundaries
-- You can read and modify code in the staging environment.
-- You can deploy to staging without approval.
-- You CANNOT deploy to production without explicit human approval in #deploys.
-- You CANNOT modify database schemas without a reviewed migration.
-- You CANNOT delete anything. Mark as deprecated, do not delete.
-```
-
-The `tasks.json` file tracks the task queue:
-
-```json
-{
-  "tasks": [
-    {
-      "id": "task-001",
-      "name": "Daily standup summary",
-      "schedule": "0 9 * * 1-5",
-      "skill": "standup",
-      "priority": "high",
-      "status": "scheduled",
-      "last_run": "2025-11-15T09:00:00Z",
-      "last_result": "success",
-      "config": {
-        "slack_channel": "#engineering",
-        "include_prs": true,
-        "include_deployments": true,
-        "include_incidents": true
-      }
-    },
-    {
-      "id": "task-002",
-      "name": "Service health check",
-      "schedule": "*/5 * * * *",
-      "skill": "health-check",
-      "priority": "critical",
-      "status": "scheduled",
-      "last_run": "2025-11-16T14:25:00Z",
-      "last_result": "success",
-      "config": {
-        "services": ["api-gateway", "auth-service", "worker", "postgres"],
-        "alert_channel": "#alerts",
-        "alert_threshold": "any_unhealthy"
-      }
-    }
-  ]
-}
-```
-
-Each task references a skill (a Markdown file in `skills/`). The skill contains step-by-step instructions that the agent follows. This is the critical insight: **the agent does not improvise procedures. It reads and follows documented procedures.** When a procedure fails, the agent reads the `self-heal` skill.
-
-### 6.5 The Self-Heal Skill
-
-The self-heal skill is a Markdown file that the agent reads when something goes wrong. It is a decision tree — the agent follows it step by step, checking conditions and taking actions.
-
-```markdown
-# Skill: Self-Heal
-
-When a task fails or produces unexpected results, follow these steps
-in order. Do NOT skip steps. Log every step's output.
-
-## Step 1: Classify the failure
-
-Read the error output. Classify it as one of:
-- **TRANSIENT**: Network timeout, rate limit, temporary unavailability
-- **CONFIG**: Missing environment variable, wrong credentials, expired token
-- **CODE**: Bug in a script, syntax error, logic error
-- **EXTERNAL**: Third-party service down, API changed, certificate expired
-- **UNKNOWN**: Cannot determine from the error output alone
-
-## Step 2: TRANSIENT failures
-
-1. Wait 30 seconds
-2. Retry the failed task once
-3. If it succeeds: log "Transient failure resolved on retry" → DONE
-4. If it fails again: wait 60 seconds, retry once more
-5. If it fails a third time: escalate to #koda-questions on Slack
-   with the error output and the three attempt timestamps
-
-## Step 3: CONFIG failures
-
-1. Check the relevant environment variables: `env | grep <SERVICE_NAME>`
-2. Check credential expiry: `./scripts/check-credentials.sh`
-3. If credentials are expired:
-   a. Run `./scripts/rotate-credentials.sh <SERVICE_NAME>`
-   b. Retry the failed task
-   c. If it succeeds: log "Resolved by credential rotation" → DONE
-4. If environment variables are missing:
-   a. Check `.env.example` for the expected variables
-   b. Post in #koda-questions: "Missing env var: <NAME>.
-      Expected by: <TASK>. Please add to .env"
-   c. Mark task as BLOCKED
-
-## Step 4: CODE failures
-
-1. Read the failing script: `cat scripts/<script>.sh`
-2. Identify the failing line from the error output
-3. Check git log for recent changes: `git log --oneline -5 scripts/<script>.sh`
-4. If a recent change introduced the bug:
-   a. Attempt a fix if the issue is clear (typo, missing quote, wrong path)
-   b. Run the script's tests: `./scripts/test-<script>.sh`
-   c. If tests pass: commit fix, retry task
-   d. If tests fail: post in #koda-questions with the bug description
-5. If no recent changes: the bug may have been latent
-   a. Post in #koda-questions with full diagnosis
-
-## Step 5: EXTERNAL failures
-
-1. Check the service's status page (if available)
-2. Check https://downdetector.com for the service
-3. Post in #koda-questions:
-   "External dependency <SERVICE> appears to be down.
-    Status page: <URL>
-    Impact: <WHICH_TASKS> are blocked.
-    Will retry automatically in 15 minutes."
-4. Schedule a retry in 15 minutes
-5. After 3 failed retries (45 minutes): escalate to #alerts
-
-## Step 6: UNKNOWN failures
-
-1. Collect all available context:
-   - Error output (full, untruncated)
-   - Recent logs: `tail -100 logs/$(date +%Y-%m-%d).log`
-   - System state: `df -h`, `free -m`, `top -bn1 | head -20`
-   - Recent changes: `git log --oneline -10`
-2. Post in #koda-questions with all collected context
-3. Mark task as BLOCKED pending human investigation
-```
-
-The self-heal skill is effective because it is **exhaustive and non-creative.** The agent does not need to reason about what to do when something fails — it reads the procedure and follows it. Each step has a clear condition ("If credentials are expired") and a clear action ("Run rotate-credentials.sh"). The decision tree terminates in either a successful resolution or an escalation to humans.
-
-Teams that run long-lived agents report that the self-heal skill reduces human intervention by 60-70% compared to agents that freestyle their error recovery. The agent's improvised error recovery is often wrong — it guesses, tries random things, and makes the problem worse. The documented procedure is tested and known to work.
-
-### 6.6 Anthropic's Managed Agents: Decoupling Brain from Hands
-
-Anthropic's Managed Agents architecture (formally: "Agent Infrastructure") decouples the reasoning engine from the execution environment. The key insight: **the agent (brain) and the sandbox (hands) have different lifecycle requirements.** The brain needs to persist conversation state across crashes. The hands need to provide isolated, reproducible execution environments.
-
-The architecture has three layers:
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                     BRAIN LAYER                            │
-│  Claude model + system prompt + conversation history       │
-│  Stateless between API calls                               │
-│  State persisted as an append-only event log               │
-├──────────────────────────────────────────────────────────┤
-│                     SESSION LAYER                          │
-│  Session = append-only event log                           │
-│  Events: UserMessage, AssistantMessage, ToolCall,          │
-│          ToolResult, Error, Checkpoint                     │
-│  Session ID is the primary key for all state               │
-│  wake(sessionId) resumes from last checkpoint              │
-├──────────────────────────────────────────────────────────┤
-│                     SANDBOX LAYER                          │
-│  Isolated execution environment per session                │
-│  Filesystem, network, processes — all sandboxed            │
-│  Snapshots enable pause/resume of the execution state      │
-│  Multiple sandboxes per session (parallel tool execution)  │
-└──────────────────────────────────────────────────────────┘
-```
-
-**The session as an append-only event log** is the core abstraction. Every interaction — user messages, assistant responses, tool calls, tool results, errors — is appended to the log. The log is never modified, only extended. This provides:
-
-1. **Crash recovery.** If the agent process crashes, call `wake(sessionId)`. The system reads the event log, reconstructs the conversation state, and resumes from the last checkpoint. No work is lost.
-
-2. **Audit trail.** Every action the agent took is recorded with timestamps. You can replay the entire session to understand why the agent made a specific decision.
-
-3. **Branching.** Fork a session at any point to explore alternative approaches. The forked session shares history up to the fork point and diverges afterward.
-
-4. **Time travel debugging.** Rewind to any checkpoint in the log and resume from there. Useful when the agent went down a wrong path — instead of starting over, rewind to before the mistake.
-
-The `wake(sessionId)` function is the operational primitive for crash recovery:
-
-```python
-# Pseudocode for wake(sessionId)
-def wake(session_id: str):
-    # 1. Load the session's event log
-    events = event_store.get_events(session_id)
-
-    # 2. Find the last checkpoint
-    last_checkpoint = None
-    for event in reversed(events):
-        if event.type == "Checkpoint":
-            last_checkpoint = event
-            break
-
-    # 3. Reconstruct conversation state from events since checkpoint
-    messages = []
-    for event in events[last_checkpoint.index:]:
-        if event.type == "UserMessage":
-            messages.append({"role": "user", "content": event.content})
-        elif event.type == "AssistantMessage":
-            messages.append({"role": "assistant", "content": event.content})
-        elif event.type == "ToolResult":
-            messages.append({
-                "role": "tool",
-                "tool_use_id": event.tool_use_id,
-                "content": event.result,
-            })
-
-    # 4. Restore the sandbox to the checkpoint state
-    sandbox = sandbox_manager.restore(session_id, last_checkpoint.sandbox_snapshot)
-
-    # 5. Resume the agent loop
-    agent.resume(messages, sandbox)
-```
-
-**The sandbox layer** provides isolated execution environments. Each session gets its own sandbox with:
-- A filesystem (the project directory, tools, dependencies)
-- Network access (configurable — can be restricted to specific hosts)
-- Process management (the agent can start long-running processes like dev servers)
-- Snapshot/restore capability (pause the sandbox, move to a different machine, resume)
-
-The sandbox is separate from the brain. The brain decides what to do. The sandbox does it. If the sandbox crashes (a runaway process consumes all memory), the brain is unaffected — it simply gets a tool result indicating the sandbox error, and it can request a fresh sandbox.
-
-This decoupling enables several production patterns:
-
-**Horizontal scaling.** The brain runs as a stateless API call. The sandbox runs as a container. You can have many brains sharing a pool of sandboxes, or many sandboxes serving a single brain.
-
-**Mixed environments.** Different tools may require different sandboxes. A Python data analysis tool runs in a Python sandbox. A Node.js build tool runs in a Node sandbox. The brain does not know or care — it calls tools, and the session layer routes to the appropriate sandbox.
-
-**Session hibernation.** A long-running task (e.g., a 6-hour coding project) can be hibernated by snapshotting the sandbox and checkpointing the event log. It resumes hours or days later with full state.
-
-### 6.7 Context Resets vs. Compaction: Choosing the Right Strategy
-
-When an agent's context window fills up, there are two options: compact the existing context (summarize and condense) or reset it entirely (start fresh with structured handoff artifacts).
-
-**Compaction** preserves the conversation's narrative flow. A summarizer condenses the first 80% of the context into a paragraph, and the agent continues with the summary plus the most recent 20%. This works well for short sessions where the early context is mostly setup and the recent context is the actual work.
-
-The problem with compaction over long sessions:
-
-```
-Session start:
-  [User intent: "Build a task manager with OAuth, team features, and notifications"]
-
-After compaction 1 (50K tokens in):
-  [Summary: "Building a task manager. Auth is done. Working on team features."]
-  → Lost: the specific OAuth provider requirements
-
-After compaction 2 (100K tokens in):
-  [Summary: "Task manager with team features in progress. Some tests failing."]
-  → Lost: which tests are failing and why
-
-After compaction 3 (150K tokens in):
-  [Summary: "Working on a task manager project."]
-  → Lost: nearly everything specific
-```
-
-Each compaction is a lossy compression. Details that seemed unimportant at compaction time turn out to be critical later. By the third compaction, the agent has lost most of its understanding of the project requirements.
-
-**Context resets** avoid this degradation. When the context is nearly full, the agent writes its current state to the handoff artifacts (progress file, feature list, git commit), and a new session starts fresh:
-
-```
-Session N ends:
-  Agent writes to claude-progress.txt:
-  "Completed features 46-48. Feature 49 (due dates) is next.
-   Known issue: date picker library is not compatible with React 18.
-   Will need to use react-day-picker instead of react-datepicker."
-  Agent commits all changes.
-
-Session N+1 starts:
-  Agent reads claude-progress.txt → knows exactly where to resume
-  Agent reads feature_list.json → knows 48/147 features passing
-  Agent reads git log → sees recent commits
-  Agent runs init.sh → dev environment ready
-  Agent starts on feature 49 with full context and no accumulated drift
-```
-
-The cost is higher per transition — reading the handoff artifacts costs 2,000-5,000 tokens each time. But the benefit is that each session starts clean. No accumulated summarization errors. No drift from the original intent. No "context anxiety" (the phenomenon Anthropic observed where models rush to finish as they approach the context limit).
-
-**The model-dependent factor.** Anthropic found that different models handle context exhaustion differently:
-
-- **Sonnet 4.5** exhibited "context anxiety" — as it approached the context limit, it began rushing, cutting corners, and producing lower-quality output. Context resets were essential.
-- **Opus 4.5** largely eliminated this behavior, maintaining output quality even near the context limit. Compaction with automatic summarization became viable.
-
-The recommendation: **default to context resets for long-horizon tasks.** Switch to compaction only if you have empirical evidence that your specific model handles it well on your specific task type. Test with at least 20 sessions before trusting compaction.
-
-### 6.8 The Init.sh Design Patterns
-
-The `init.sh` script is simple in concept but tricky in practice. Here are patterns from production deployments:
-
-**Pattern 1: Service health checks before startup.**
-
-```bash
-#!/bin/bash
-set -e
-
-# Check if services are already running (idempotent)
-check_service() {
-    local name=$1
-    local port=$2
-    if curl -sf "http://localhost:$port/health" > /dev/null 2>&1; then
-        echo "[init.sh] $name already running on port $port"
-        return 0
-    fi
-    return 1
-}
-
-# Start PostgreSQL if not running
-if ! pg_isready -q 2>/dev/null; then
-    echo "[init.sh] Starting PostgreSQL..."
-    pg_ctl start -D "$PGDATA" -l /tmp/pg.log -w
-else
-    echo "[init.sh] PostgreSQL already running"
-fi
-
-# Start Redis if not running
-if ! redis-cli ping > /dev/null 2>&1; then
-    echo "[init.sh] Starting Redis..."
-    redis-server --daemonize yes
-else
-    echo "[init.sh] Redis already running"
-fi
-
-# Run migrations (idempotent by design)
-echo "[init.sh] Running database migrations..."
-npx prisma migrate deploy 2>&1 | tail -3
-
-# Seed test data (idempotent — uses upsert)
-echo "[init.sh] Seeding test data..."
-npx prisma db seed 2>&1 | tail -3
-
-# Start dev server if not running
-if ! check_service "Dev server" 3000; then
-    echo "[init.sh] Starting dev server..."
-    npm run dev > /tmp/dev.log 2>&1 &
-    for i in $(seq 1 30); do
-        check_service "Dev server" 3000 && break
-        [ "$i" = "30" ] && { echo "[init.sh] FATAL: Dev server failed to start"; cat /tmp/dev.log | tail -20; exit 1; }
-        sleep 1
-    done
-fi
-
-echo "[init.sh] All services ready."
-echo "[init.sh] Dev server: http://localhost:3000"
-echo "[init.sh] PostgreSQL: localhost:5432"
-echo "[init.sh] Redis: localhost:6379"
-```
-
-**Pattern 2: Environment variable verification.**
-
-```bash
-# Verify required environment variables before starting anything
-REQUIRED_VARS="DATABASE_URL REDIS_URL SESSION_SECRET"
-MISSING=""
-for var in $REQUIRED_VARS; do
-    if [ -z "${!var}" ]; then
-        MISSING="$MISSING $var"
-    fi
-done
-if [ -n "$MISSING" ]; then
-    echo "[init.sh] ERROR: Missing required environment variables:$MISSING"
-    echo "[init.sh] Copy .env.example to .env and fill in the values."
-    exit 1
-fi
-```
-
-**Pattern 3: Cleanup stale processes.**
-
-```bash
-# Kill stale processes from a previous crashed session
-# IMPORTANT: use specific PIDs, never pkill -f
-if [ -f /tmp/dev-server.pid ]; then
-    OLD_PID=$(cat /tmp/dev-server.pid)
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "[init.sh] Killing stale dev server (PID $OLD_PID)..."
-        kill "$OLD_PID"
-        sleep 2
-    fi
-    rm -f /tmp/dev-server.pid
-fi
-```
-
-### 6.9 Puppeteer MCP for End-to-End Testing
-
-The agent needs to verify that features work in a real browser, not just that the code compiles. Puppeteer MCP (or Playwright MCP) gives the agent browser automation capabilities through the MCP protocol.
-
-The testing pattern:
-
-```
-Agent: I've implemented the signup form. Let me verify it works.
-
-[Tool call: puppeteer_navigate]
-  url: "http://localhost:3000/signup"
-
-[Tool result: Screenshot showing the signup page with email and password fields]
-
-Agent: The form renders correctly. Let me fill it out and submit.
-
-[Tool call: puppeteer_fill]
-  selector: "input[name='email']"
-  value: "test@example.com"
-
-[Tool call: puppeteer_fill]
-  selector: "input[name='password']"
-  value: "TestPassword123!"
-
-[Tool call: puppeteer_click]
-  selector: "button[type='submit']"
-
-[Tool result: Screenshot showing the dashboard with "Welcome, test@example.com"]
-
-Agent: Signup works. Let me verify the database record.
-
-[Tool call: bash]
-  command: "psql $DATABASE_URL -c \"SELECT email FROM users WHERE email='test@example.com'\""
-
-[Tool result: email | test@example.com]
-
-Agent: Feature #4 (User can sign up) passes all testing steps.
-  Updating feature_list.json...
-```
-
-This is the complete verification loop: implement → render → interact → verify state. The agent does not just check that the code compiles or that the API returns 200. It fills out the form in a real browser, clicks the button, sees the result, and verifies the database state.
-
-The testing steps in `feature_list.json` map directly to Puppeteer MCP operations:
-
-| Testing Step | Puppeteer MCP Operation |
-|---|---|
-| "Navigate to /signup" | `puppeteer_navigate({ url: "http://localhost:3000/signup" })` |
-| "Enter email 'test@example.com'" | `puppeteer_fill({ selector: "input[name='email']", value: "test@example.com" })` |
-| "Click 'Sign Up'" | `puppeteer_click({ selector: "button[type='submit']" })` |
-| "Verify redirect to /dashboard" | `puppeteer_navigate` result shows /dashboard URL |
-| "Verify welcome message" | `puppeteer_evaluate({ script: "document.querySelector('.welcome').textContent" })` |
-
-### 6.10 Scaling: pm2 Configuration for 24/7 Operation
-
-Production long-horizon agents run under a process manager. pm2 is the most common choice for Node.js-based agent harnesses:
-
-```javascript
-// ecosystem.config.js — pm2 configuration for Koda agent
-module.exports = {
-  apps: [
-    {
-      name: "koda-agent",
-      script: "./agent.js",
-      instances: 1,
-      autorestart: true,
-      max_restarts: 10,
-      restart_delay: 30000, // 30 seconds between restarts
-      max_memory_restart: "2G",
-      cron_restart: "0 3 * * *", // Restart daily at 3 AM for clean state
-      env: {
-        NODE_ENV: "production",
-        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-        LOG_LEVEL: "info",
-        SESSION_DIR: "/var/koda/sessions",
-        SKILLS_DIR: "/var/koda/skills",
-      },
-      error_file: "/var/log/koda/error.log",
-      out_file: "/var/log/koda/out.log",
-      log_date_format: "YYYY-MM-DD HH:mm:ss Z",
-      merge_logs: true,
-    },
-    {
-      name: "koda-scheduler",
-      script: "./scheduler.js",
-      instances: 1,
-      autorestart: true,
-      env: {
-        TASKS_FILE: "/var/koda/tasks.json",
-        AGENT_ENDPOINT: "http://localhost:3100/trigger",
-      },
-    },
-  ],
-};
-```
-
-The scheduler reads `tasks.json` and triggers the agent on the configured cron schedules. The agent process handles the actual task execution. They communicate through a local HTTP endpoint — the scheduler POSTs a task ID, the agent reads the task definition and the corresponding skill, and executes.
-
-Key configuration decisions:
-
-- **`max_restarts: 10`** prevents infinite crash loops. After 10 restarts, pm2 stops the agent and alerts the team.
-- **`restart_delay: 30000`** (30 seconds) gives external services time to recover. If the agent crashes because a dependency is down, an immediate restart just crashes again.
-- **`cron_restart: "0 3 * * *"`** provides a daily clean slate. Memory leaks, accumulated file handles, and stale caches are cleared.
-- **`max_memory_restart: "2G"`** catches memory leaks before they affect the host system.
-
-### 6.11 The Filesystem as the Agent's Memory
-
-The Koda architecture reveals a broader pattern: **the filesystem is the most durable, debuggable, and interoperable memory system for agents.** Database-backed memory systems are faster for lookup but opaque to humans. Vector stores are useful for semantic search but lose structural relationships. The filesystem has unique advantages:
-
-1. **Human-readable.** You can `cat soul.md` and instantly understand the agent's identity. You can `ls skills/` and see every procedure it knows.
-2. **Version-controlled.** Put the agent's filesystem in git and you have complete history of how the agent evolved.
-3. **Toolable.** The agent already has Read, Write, Edit, Grep, and Glob tools. Every filesystem operation is a tool it already knows how to use.
-4. **Composable.** Skills reference other skills. Scripts call other scripts. The filesystem's directory structure is the composition mechanism.
-5. **Debuggable.** When the agent does something wrong, you read the log file, trace back to the skill it followed, and find the step where it diverged.
-
-The tradeoff is performance. Reading a file takes 10-50ms. A database query takes 1-5ms. For agents that process thousands of requests per second, the filesystem is too slow. For agents that run 21 scheduled tasks per day, it is plenty fast.
-
-### 6.12 The Architecture Summary
-
-The long-horizon harness pattern reduces to five principles:
-
-**1. Separate initialization from execution.** The initializer creates the project structure, feature list, and development environment once. The coding agent uses them repeatedly. This prevents the agent from re-inventing project structure on every session.
-
-**2. Persist state as structured artifacts.** Progress files, feature lists, and git history provide complete state transfer across context boundaries. The cost is ~2,000 tokens per session. The benefit is zero state loss.
-
-**3. Fix before you build.** Every session starts with a smoke test. If the app is broken, fix it before adding features. This prevents technical debt accumulation across sessions.
-
-**4. Test against acceptance criteria.** The feature list defines what "done" means. The agent cannot self-certify — it must pass every testing step defined by the initializer. This prevents premature victory declarations.
-
-**5. Evolve through the filesystem.** Skills, learnings, and configuration accumulate on disk. The agent reads them, follows them, and extends them. The filesystem is the agent's long-term memory, and it is human-readable, version-controlled, and debuggable.
-
-These principles are not theoretical. They come from Anthropic's published research, from production systems like Koda, and from the hard-won experience of teams running agents continuously. Every production long-horizon agent implements some variation of this pattern — because the failure modes are universal, and the fixes are structural.
+7. **Evaluation bootstrapping.** The initial Q-value of 0.5 is arbitrary. Better initialization (e.g., using the embedding model's confidence in the task-experience match as a prior) could reduce the warm-up period, though the paper does not explore this direction.
 
 ---
 
-*End of Part II*
+## Chapter 4: RetroAgent's SimUtil-UCB Memory
+
+**Paper:** Bingqian Zhang, Wei Li, Qihang Xie, Yuze Zhao, Zixiang Wang, Yida Lu, Ce Zheng, and Lei Bai. "RetroAgent: From Solving to Evolving via Retrospective Dual Intrinsic Feedback." *arXiv preprint arXiv:2603.08561*, March 2026.
+
+**Core contribution:** RetroAgent introduces a memory system that extends MemRL's utility-learned retrieval in two critical ways: (1) an exploration bonus via Upper Confidence Bound (UCB) ensures that rarely-used memories are periodically re-evaluated, preventing premature convergence to a suboptimal memory subset; and (2) exponential moving average (EMA) utility updates adapt faster to non-stationary task distributions than MemRL's fixed-rate Monte Carlo.
+
+**Scope note:** RetroAgent has two components: a *training-time* GRPO (Group Relative Policy Optimization) mechanism for improving the base LLM, and a *runtime* memory system for continual adaptation. This chapter covers **only the runtime memory component**, which operates on a frozen LLM and is directly comparable to MemRL. The GRPO training component (which fine-tunes the LLM using intrinsic rewards derived from self-reflection) is covered in Part III, Chapter 8. The division is deliberate: the runtime memory component is what makes RetroAgent a *self-evolving* agent; the GRPO component makes it a *self-improving* one. These are related but distinct capabilities, and the runtime component alone provides substantial benefits.
+
+---
+
+### 4.1 Memory Buffer Structure
+
+RetroAgent's memory buffer stores entries with richer metadata than MemRL's IEU triplets:
+
+```
+M = {m_1, m_2, ..., m_|M|}
+
+Each entry:
+m_i = (x_i, l_i, τ_i, u_i, n_i, d_i)
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x_i` | `ℝ^d` | Task instruction embedding. Analogous to MemRL's intent `z_i`. Computed via `text-embedding-3-large`. |
+| `l_i` | `string` | Natural language **lesson** extracted from the experience. Unlike MemRL's full experience record, RetroAgent distills the experience into a concise, actionable lesson. |
+| `τ_i` | `string` | The original task description (stored for deduplication and debugging). |
+| `u_i` | `float ∈ [0, 1]` | Utility score. Analogous to MemRL's Q-value but updated via EMA (§4.3). |
+| `n_i` | `int` | Retrieval count. Tracks how many times this memory has been retrieved. Used in the UCB exploration bonus. |
+| `d_i` | `{0, 1}` | Outcome of the most recent task where this memory was retrieved. Binary success/failure indicator. |
+
+**Key difference from MemRL: lessons vs. experiences.** MemRL stores the full reasoning trace, action sequence, and outcome. RetroAgent stores a distilled *lesson*—typically 2–5 sentences summarizing what the agent should do or avoid in similar situations. This design choice trades information richness for context efficiency: a lesson consumes fewer tokens in the LLM's context window, allowing more memories to be retrieved without exceeding context limits.
+
+**Lesson extraction prompt:**
+
+```
+Given the following task and your solution attempt:
+
+Task: {task_description}
+Solution: {solution_trace}
+Outcome: {"Success" | "Failure"}
+
+Extract a concise lesson (2-5 sentences) that would help you
+or another agent solve similar tasks in the future. Focus on:
+- What strategy worked or didn't work
+- What pitfalls to avoid
+- What key insight was necessary for success
+
+Lesson:
+```
+
+**Example lessons:**
+
+- *Success case:* "When navigating ALFWorld kitchens, always check cabinet 1 and countertop 2 first—they contain target objects in >70% of tasks. Use 'examine' before 'take' to verify object identity."
+
+- *Failure case:* "Do NOT attempt recursive approaches for WebShop product search. The API returns paginated results; use iterative page traversal with explicit page number tracking instead."
+
+#### 4.1.1 Buffer Management
+
+RetroAgent implements an **active buffer management policy** that MemRL lacks:
+
+- **Maximum buffer size:** 5,000 entries.
+- **Eviction policy:** When the buffer is full, the entry with the lowest `u_i · log(n_i + 1)` score is evicted. This favors keeping memories that are both high-utility and have been retrieved enough times to have reliable utility estimates.
+- **Lesson update:** When a memory is retrieved and the task outcome differs from the stored outcome `d_i`, the lesson is regenerated. This allows lessons to evolve: a lesson initially based on a failure case may be overwritten with a success-case lesson if the agent later succeeds on a similar task.
+
+---
+
+### 4.2 SimUtil-UCB Retrieval — Full Mathematical Formulation
+
+RetroAgent's retrieval scoring function combines three signals into a single score:
+
+#### 4.2.1 The SimUtil-UCB Score
+
+```
+S(m_i | x, M) = α · s_rel(x, x_i) + (1 - α) · u_util_UCB(i)
+```
+
+where:
+
+- `S(m_i | x, M)` is the total score of memory `m_i` given the current task embedding `x` and the memory buffer `M`.
+- `α ∈ [0, 1]` is the **relevance-utility tradeoff** parameter.
+- `s_rel(x, x_i)` is the **relevance score** (semantic similarity).
+- `u_util_UCB(i)` is the **utility score with UCB exploration bonus**.
+
+#### 4.2.2 Relevance Score
+
+```
+s_rel(x, x_i) = cos(x, x_i) = (x · x_i) / (‖x‖ · ‖x_i‖)
+```
+
+Only memories with `s_rel ≥ 0.4` are considered. This threshold is notably lower than MemRL's `θ_sim = 0.7`, reflecting a design philosophy that the utility component should have more influence over the final ranking.
+
+**Pre-filter step:**
+
+```
+C_pre = { m_i ∈ M : s_rel(x, x_i) ≥ 0.4 }
+```
+
+#### 4.2.3 Utility Score with UCB Exploration Bonus
+
+```
+u_util_UCB(i) = u_i + κ · √(ln(N) / n_i)
+```
+
+where:
+
+- `u_i` is the current utility estimate for memory `m_i` (updated via EMA; see §4.3).
+- `κ = 1.0` is the **exploration constant** (controls the exploration-exploitation tradeoff).
+- `N = Σ_j n_j` is the **total number of retrievals** across all memories in the buffer.
+- `n_i` is the **retrieval count** of memory `m_i`.
+
+The term `κ · √(ln(N) / n_i)` is the classic **UCB1 exploration bonus** (Auer et al., 2002). It has several important properties:
+
+1. **Diminishes with retrieval count.** As `n_i → ∞`, the bonus → 0, and the score converges to the true utility `u_i`. Well-tested memories are ranked purely by observed quality.
+
+2. **Grows with total retrievals.** As `N` increases (the agent gains more experience overall), the bonus for under-tested memories grows logarithmically. This ensures that even in a mature buffer, rarely-retrieved memories periodically get re-evaluated.
+
+3. **Balances exploration and exploitation.** With `κ = 1.0`:
+   - A memory with `u_i = 0.3` and `n_i = 2` (poorly rated, rarely used) gets a bonus of `1.0 · √(ln(1000)/2) ≈ 1.86` → total utility ≈ 2.16.
+   - A memory with `u_i = 0.8` and `n_i = 100` (well rated, well used) gets a bonus of `1.0 · √(ln(1000)/100) ≈ 0.26` → total utility ≈ 1.06.
+
+   The rarely-used memory gets a chance to be retrieved and re-evaluated, even though its current utility estimate is much lower. If it turns out to be genuinely unhelpful, its utility will remain low after re-evaluation, and the exploration bonus will diminish as `n_i` increases.
+
+#### 4.2.4 Full SimUtil-UCB Algorithm (Pseudocode)
+
+```
+Algorithm 2: RetroAgent SimUtil-UCB Retrieval
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input: task embedding x, memory buffer M, parameters α, κ, K,
+       similarity threshold θ_rel = 0.4
+Output: retrieved memories R
+
+1:  N ← Σ_{m_i ∈ M} n_i                     // total retrieval count
+2:  C ← ∅                                     // candidate set
+3:  for each m_i = (x_i, l_i, τ_i, u_i, n_i, d_i) in M do
+4:      sim ← cos(x, x_i)
+5:      if sim ≥ θ_rel then
+6:          if n_i = 0 then
+7:              ucb ← +∞                      // force exploration of unseen memories
+8:          else
+9:              ucb ← u_i + κ · √(ln(N) / n_i)
+10:         end if
+11:         score ← α · sim + (1 - α) · ucb
+12:         C ← C ∪ {(m_i, score)}
+13:     end if
+14: end for
+15: Sort C by score in descending order
+16: R ← first K elements of C
+17: for each m_i in R do
+18:     n_i ← n_i + 1                         // update retrieval count
+19: end for
+20: return R
+```
+
+**Line 6–7:** Memories that have never been retrieved (`n_i = 0`) receive an infinite score, guaranteeing they are retrieved at least once. This is the standard UCB1 initialization: every arm must be pulled at least once before the algorithm can make informed decisions.
+
+#### 4.2.5 Parameter Sensitivity
+
+The paper reports sensitivity analysis for the two key parameters:
+
+**Tradeoff parameter α:**
+
+| α | ALFWorld Success (%) | WebShop Score (%) | Interpretation |
+|---|---------------------|-------------------|---------------|
+| 0.0 | 72.4 | 45.1 | Pure utility (ignores relevance entirely) |
+| 0.3 | 79.8 | 52.6 | Utility-heavy |
+| 0.5 | 82.1 | 54.3 | Balanced (default) |
+| 0.7 | 80.5 | 53.8 | Relevance-heavy |
+| 1.0 | 75.2 | 49.7 | Pure similarity (standard RAG) |
+
+The optimal `α` is near 0.5, confirming that **both relevance and utility are necessary**. Pure utility (`α = 0`) fails because it retrieves useful-in-general but irrelevant-to-this-task memories. Pure similarity (`α = 1`) fails for the same reason RAG fails: similarity ≠ utility.
+
+**Exploration constant κ:**
+
+| κ | ALFWorld Success (%) | WebShop Score (%) |
+|---|---------------------|-------------------|
+| 0.0 | 78.9 | 51.8 |
+| 0.5 | 80.7 | 53.1 |
+| 1.0 | 82.1 | 54.3 |
+| 2.0 | 81.5 | 53.9 |
+| 5.0 | 77.3 | 50.2 |
+
+`κ = 1.0` is optimal. Too low (`κ = 0`) means no exploration—the system converges prematurely to a fixed set of "favorite" memories and never re-evaluates. Too high (`κ = 5`) means excessive exploration—the system wastes retrievals on clearly unhelpful memories.
+
+#### 4.2.6 Comparison: MemRL vs. SimUtil-UCB
+
+| Aspect | MemRL | SimUtil-UCB |
+|--------|-------|-------------|
+| Retrieval phases | Two sequential (filter → rank) | One combined (weighted score) |
+| Relevance signal | Cosine similarity (binary threshold) | Cosine similarity (continuous, weighted) |
+| Utility signal | Raw Q-value | EMA utility + UCB exploration bonus |
+| Exploration | None (exploitation only) | UCB1 exploration bonus |
+| Similarity threshold | 0.7 (strict) | 0.4 (permissive) |
+| Context cost per memory | High (full experience) | Low (distilled lesson) |
+| Theoretical grounding | Monte Carlo Q-learning | Multi-armed bandit (UCB1) |
+
+The key architectural distinction is **exploration**. MemRL's Q-values converge monotonically—once a memory's Q-value drops low enough, it is effectively dead (never retrieved, never re-evaluated, never recovered). SimUtil-UCB's exploration bonus prevents this: even a low-utility memory will eventually accumulate enough exploration bonus to be retrieved again, giving it a chance at rehabilitation if the task distribution has shifted.
+
+---
+
+### 4.3 Utility Update (Exponential Moving Average)
+
+After each task, RetroAgent updates the utility scores of retrieved memories using an exponential moving average (EMA):
+
+```
+u_i ← (1 - β_util) · u_i + β_util · û_t
+```
+
+where:
+
+- `β_util = 0.2` is the EMA smoothing factor (default).
+- `û_t` is the outcome signal for the current task.
+
+#### 4.3.1 Outcome Signal
+
+Unlike MemRL's binary `r ∈ {0, 1}`, RetroAgent uses a **graded outcome signal**:
+
+```
+û_t = (1 - λ) · d_t + λ · s_self(t)
+```
+
+where:
+
+- `d_t ∈ {0, 1}` is the binary task outcome (success/failure).
+- `s_self(t) ∈ [0, 1]` is a **self-assessed quality score** generated by prompting the LLM to rate its own solution on a scale of 0 to 1.
+- `λ = 0.3` balances the objective outcome with the subjective self-assessment.
+
+The self-assessment component captures partial successes that binary feedback misses. For example, a WebShop task might fail (wrong product purchased) but the agent's search strategy was sound and the lesson from that memory was genuinely helpful for narrowing the product space.
+
+**Self-assessment prompt:**
+
+```
+You just completed a task. Rate the quality of your solution
+on a scale of 0 to 1, where:
+  0 = completely wrong, no useful progress
+  0.5 = partial progress, some useful steps but ultimately failed
+  1 = perfect solution, achieved the goal completely
+
+Task: {task}
+Your solution: {solution}
+Outcome: {"Success" | "Failure"}
+
+Quality score (0-1):
+```
+
+#### 4.3.2 EMA vs. Monte Carlo: Convergence Properties
+
+| Property | MemRL (Monte Carlo, α=0.1) | RetroAgent (EMA, β_util=0.2) |
+|----------|---------------------------|------------------------------|
+| Update rate | Constant `α` | Constant `β_util` (faster) |
+| Recent-experience weighting | Effective half-life ≈ 7 retrievals | Effective half-life ≈ 3.5 retrievals |
+| Adaptation to distribution shift | Moderate | Fast |
+| Stability | High (slow convergence) | Moderate (more oscillation) |
+| Bias | Unbiased (Monte Carlo property) | Biased toward recent outcomes |
+
+The higher `β_util = 0.2` (vs. MemRL's `α = 0.1`) reflects RetroAgent's design philosophy of **fast adaptation over stable convergence**. In deployment scenarios where the task distribution shifts frequently (e.g., a coding agent that switches between Python and Rust projects), faster adaptation is more valuable than stability.
+
+#### 4.3.3 Worked Example: EMA Utility Trajectory
+
+Memory `m_7` stores a lesson about WebShop navigation, initialized at `u_7 = 0.5`:
+
+```
+Retrieval 1:  û = 0.8 (success + high self-score)
+  u = 0.8·0.50 + 0.2·0.8 = 0.560
+
+Retrieval 2:  û = 0.0 (failure + low self-score)
+  u = 0.8·0.56 + 0.2·0.0 = 0.448
+
+Retrieval 3:  û = 0.9
+  u = 0.8·0.448 + 0.2·0.9 = 0.538
+
+Retrieval 4:  û = 0.7
+  u = 0.8·0.538 + 0.2·0.7 = 0.571
+
+Retrieval 5:  û = 0.85
+  u = 0.8·0.571 + 0.2·0.85 = 0.627
+
+Retrieval 6:  û = 0.3 (partial failure)
+  u = 0.8·0.627 + 0.2·0.3 = 0.562
+
+Retrieval 7:  û = 0.9
+  u = 0.8·0.562 + 0.2·0.9 = 0.630
+```
+
+The utility oscillates more than MemRL's Q-values (which is expected with `β_util > α`) but tracks the underlying success rate with a 3–4 retrieval lag.
+
+---
+
+### 4.4 Why UCB Matters for Evolution
+
+The UCB exploration bonus is not merely a theoretical nicety—it addresses a critical failure mode of pure exploitation-based memory systems.
+
+#### 4.4.1 The Memory Ossification Problem
+
+Consider an agent that has been running for 1,000 tasks. Its memory buffer contains 800 entries. Without exploration:
+
+1. The top-20 highest-utility memories are retrieved repeatedly (they are "safe bets").
+2. The remaining 780 memories are never retrieved again.
+3. New memories start with moderate utility but cannot compete with the entrenched top-20.
+4. The agent's behavior ossifies: it applies the same 20 strategies to every problem, even when better strategies exist in the untested 780.
+
+This is the multi-armed bandit's **exploration-exploitation dilemma** applied to memory retrieval. Pure exploitation (MemRL's approach) converges quickly but may converge to a **suboptimal** memory policy if early Q-value estimates were unlucky or if the task distribution has shifted since the initial estimates were formed.
+
+#### 4.4.2 UCB as Anti-Ossification
+
+The UCB exploration bonus ensures that every memory is periodically re-evaluated:
+
+```
+For a memory with n_i = 50, N = 10000:
+  Bonus = 1.0 · √(ln(10000) / 50) = 1.0 · √(9.21 / 50) = 0.429
+
+For a memory with n_i = 2, N = 10000:
+  Bonus = 1.0 · √(ln(10000) / 2) = 1.0 · √(9.21 / 2) = 2.146
+```
+
+The rarely-used memory receives a bonus 5× larger than the well-tested one. This bonus is large enough to overcome a significant utility gap, forcing the system to re-evaluate the neglected memory.
+
+**Over time, the buffer self-organizes:**
+
+1. **Phase 1 (Exploration, tasks 1–100):** Most memories have low `n_i`, so exploration bonuses dominate. Retrieval is nearly random within the semantically relevant set. Utility estimates are noisy.
+
+2. **Phase 2 (Calibration, tasks 100–500):** Utility estimates stabilize for frequently-retrieved memories. A core set of high-utility memories emerges. Rarely-retrieved memories retain high exploration bonuses.
+
+3. **Phase 3 (Mature, tasks 500+):** The system primarily exploits high-utility memories but periodically explores neglected ones. If a neglected memory turns out to be useful (perhaps because the task distribution has shifted), its utility increases and it joins the core set. If not, its low utility is confirmed and the exploration bonus diminishes.
+
+#### 4.4.3 Empirical Evidence
+
+The paper provides direct evidence of UCB's impact through an ablation on the exploration constant `κ`:
+
+```
+κ = 0.0 (no exploration):
+  ALFWorld at task 100:  75.2%
+  ALFWorld at task 500:  78.9%
+  ALFWorld at task 1000: 78.9%  ← plateaued
+
+κ = 1.0 (default UCB):
+  ALFWorld at task 100:  73.1%  ← slightly worse early (exploration cost)
+  ALFWorld at task 500:  80.4%
+  ALFWorld at task 1000: 82.1%  ← still improving
+```
+
+Without exploration, performance plateaus after ~500 tasks. With UCB, the agent continues to improve because it periodically discovers valuable memories that pure exploitation had overlooked.
+
+---
+
+### 4.5 Ablation Results
+
+#### 4.5.1 Full Component Ablation
+
+**Table 3: RetroAgent Runtime Memory Ablation (frozen LLM, no GRPO training)**
+
+| Configuration | ALFWorld (%) | WebShop (%) | HotPotQA (%) | SciWorld (%) |
+|--------------|-------------|-------------|-------------|-------------|
+| Full RetroAgent (runtime only) | 82.1 | 54.3 | 49.8 | 41.2 |
+| − Memory buffer | 69.7 (−12.4) | 45.6 (−8.7) | 42.1 (−7.7) | 35.4 (−5.8) |
+| − UCB exploration | 78.9 (−3.2) | 51.8 (−2.5) | 47.2 (−2.6) | 39.1 (−2.1) |
+| − EMA (use MC instead) | 80.3 (−1.8) | 52.9 (−1.4) | 48.6 (−1.2) | 40.1 (−1.1) |
+| − Self-assessment (use binary) | 80.8 (−1.3) | 53.1 (−1.2) | 48.9 (−0.9) | 40.5 (−0.7) |
+| − Lesson distillation (use full trace) | 79.5 (−2.6) | 51.4 (−2.9) | 47.8 (−2.0) | 39.7 (−1.5) |
+
+**Key findings:**
+
+1. **Removing the memory buffer entirely is the most damaging ablation.** The drops (−12.4% on ALFWorld, −8.7% on WebShop) confirm that runtime memory is the primary driver of RetroAgent's performance, not the base LLM capability or prompt engineering.
+
+2. **UCB exploration contributes consistently (−2.1% to −3.2%).** The benefit is larger on longer-horizon benchmarks (ALFWorld, SciWorld) where the task distribution is more varied and the risk of memory ossification is higher.
+
+3. **EMA outperforms Monte Carlo updates (−1.1% to −1.8% when reverted).** The difference is modest but consistent, suggesting that faster adaptation is generally beneficial.
+
+4. **Self-assessment provides marginal benefit (−0.7% to −1.3%).** The graded outcome signal helps most on tasks with meaningful partial success (WebShop, HotPotQA) and least on binary-outcome tasks (SciWorld).
+
+5. **Lesson distillation is important (−1.5% to −2.9%).** Storing full traces instead of distilled lessons wastes context tokens on redundant detail, leaving less room for additional memories and the current task description. The effect is largest on WebShop, which has long solution traces.
+
+#### 4.5.2 Memory Evolution Visualization
+
+The paper includes a visualization of how the memory buffer self-organizes over time on ALFWorld. At three checkpoints:
+
+**After 50 tasks (Early):**
+```
+Buffer size: 48 entries
+High utility (u > 0.7): 8 entries (17%)
+Medium utility (0.3 ≤ u ≤ 0.7): 31 entries (65%)
+Low utility (u < 0.3): 9 entries (19%)
+Average retrieval count: 2.1
+Max retrieval count: 7
+```
+
+**After 200 tasks (Calibrated):**
+```
+Buffer size: 187 entries
+High utility (u > 0.7): 34 entries (18%)
+Medium utility (0.3 ≤ u ≤ 0.7): 98 entries (52%)
+Low utility (u < 0.3): 55 entries (29%)
+Average retrieval count: 5.3
+Max retrieval count: 24
+```
+
+**After 1000 tasks (Mature):**
+```
+Buffer size: 843 entries
+High utility (u > 0.7): 89 entries (11%)
+Medium utility (0.3 ≤ u ≤ 0.7): 412 entries (49%)
+Low utility (u < 0.3): 342 entries (41%)
+Average retrieval count: 8.7
+Max retrieval count: 67
+```
+
+The distribution shifts toward bimodal: a small core of high-utility memories and a growing tail of low-utility ones. The UCB exploration bonus prevents the low-utility tail from being completely ignored, occasionally re-testing entries that may have been misjudged early.
+
+**Critically, the high-utility cluster is not static.** Between task 200 and task 1000, 12 entries that were in the high-utility cluster dropped below 0.7 (their strategies stopped working on newer tasks), and 18 new entries rose into the cluster (discovered through UCB exploration). This buffer churn is the signature of healthy exploration-exploitation balance.
+
+#### 4.5.3 Comparison with MemRL on Shared Benchmarks
+
+Since both MemRL and RetroAgent report results on ALFWorld, we can directly compare (using GPT-4o backbone, runtime-only for RetroAgent):
+
+| System | ALFWorld (%) | Method |
+|--------|-------------|--------|
+| MemRL | 85.1 | Two-phase + MC Q-values |
+| RetroAgent (runtime only) | 82.1 | SimUtil-UCB + EMA |
+| RetroAgent (full, with GRPO) | 87.3 | SimUtil-UCB + EMA + trained LLM |
+
+RetroAgent's runtime-only component scores 3pp below MemRL on ALFWorld. This is not necessarily a reflection of architectural inferiority—the two systems make different tradeoffs:
+
+- MemRL stores full experience traces (more information per memory, higher context cost).
+- RetroAgent stores distilled lessons (less information per memory, lower context cost, room for more memories).
+- MemRL uses a stricter similarity threshold (0.7 vs. 0.4), which may be better suited to ALFWorld's relatively narrow task distribution.
+- RetroAgent's UCB exploration has an exploration cost: some retrievals are spent on low-utility memories that don't help the current task.
+
+When GRPO training is included (which is outside the scope of this chapter but worth noting), RetroAgent surpasses MemRL, suggesting that the combination of runtime memory and training-time policy improvement is strictly more powerful than either alone.
+
+#### 4.5.4 Scaling with Buffer Size
+
+```
+Buffer size:    0     25     50    100    200    500   1000
+ALFWorld:      69.7  74.2   76.8  79.1   80.9   81.8  82.1
+WebShop:       45.6  48.1   49.8  51.5   53.0   53.9  54.3
+```
+
+Like MemRL, RetroAgent shows logarithmic improvement with buffer size. The critical mass is approximately 100–200 entries, after which returns diminish. This is slightly fewer than MemRL's 200–500, likely because distilled lessons have higher information density per entry.
+
+---
+
+## Chapter 5: Memento-II — Formal Theory of Memory-Based Learning
+
+**Paper:** Yifan Guo, Yifan Zhu, Derrick Goh Xin Deik, Zifei Shan, Zhili Feng, and Kai Zhang. "Memento-II: Learning by Stateful Reflective Memory." *arXiv preprint arXiv:2512.22716*, December 2025.
+
+**Core contribution:** While MemRL and RetroAgent are engineering systems with empirical validation, Memento-II provides the **formal theoretical foundation** for runtime self-evolution via memory. It introduces the Memory-Augmented MDP (M-MDP) framework, which formalizes the agent's interaction with an external memory buffer as a Markov Decision Process over an augmented state-memory space. Within this framework, the paper proves that memory-based learning converges to optimal policy execution, providing the first rigorous justification for why systems like MemRL and RetroAgent work.
+
+---
+
+### 5.1 Memory-Augmented MDP (M-MDP)
+
+#### 5.1.1 Standard MDP Recap
+
+A standard MDP is a tuple `(S, A, T, R, γ)`:
+
+- `S` — state space
+- `A` — action space
+- `T: S × A → Δ(S)` — transition function (distribution over next states)
+- `R: S × A → ℝ` — reward function
+- `γ ∈ [0, 1)` — discount factor
+
+An agent with policy `π: S → Δ(A)` interacts with the MDP and seeks to maximize the expected discounted return:
+
+```
+V^π(s) = E_π [ Σ_{t=0}^∞ γ^t · R(s_t, a_t) | s_0 = s ]
+```
+
+For an LLM-based agent, the "state" includes the current task, the conversation history, and any environment observations. The "action" is the LLM's output (a tool call, a response, a reasoning step). The reward is the task outcome.
+
+#### 5.1.2 The M-MDP Extension
+
+Memento-II extends the standard MDP by introducing a **memory state** `μ` that persists across episodes:
+
+```
+M-MDP = (S, A, T, R, γ, Μ, ρ, ω)
+```
+
+The new components are:
+
+- `Μ` — **memory space.** The set of all possible memory buffer configurations. A memory configuration `μ ∈ Μ` specifies the contents and metadata of the memory buffer at a given point in time.
+
+- `ρ: Μ × S × A × ℝ → Μ` — **write function.** After each transition `(s, a, r, s')`, the write function updates the memory:
+  ```
+  μ' = ρ(μ, s, a, r)
+  ```
+  In MemRL, `ρ` corresponds to creating a new IEU triplet and updating Q-values. In RetroAgent, `ρ` corresponds to lesson extraction and EMA utility update.
+
+- `ω: Μ × S → 2^Μ` — **read function.** Given the current memory and state, the read function selects which memory entries to include in the agent's context:
+  ```
+  μ_context = ω(μ, s)
+  ```
+  In MemRL, `ω` is the two-phase retrieval (Phase 1: semantic filter, Phase 2: Q-value selection). In RetroAgent, `ω` is SimUtil-UCB retrieval.
+
+#### 5.1.3 Augmented State Space
+
+The key insight is that the agent's effective state is not just `s` but the pair `(s, μ)`:
+
+```
+S̃ = S × Μ
+```
+
+The agent's policy now operates on the augmented state:
+
+```
+π̃: S̃ → Δ(A)
+i.e., π̃(s, μ) gives the action distribution
+```
+
+The augmented MDP has transitions:
+
+```
+(s, μ) --a--> (s', μ')
+where s' ~ T(s, a)  and  μ' = ρ(μ, s, a, R(s, a))
+```
+
+This formalization captures a crucial fact: **the agent with memory is a different agent than the agent without memory.** Two instances of the same LLM, facing the same task `s`, will produce different outputs if they have different memory states `μ`. The memory is not an add-on; it is part of the state.
+
+#### 5.1.4 Properties of M-MDP
+
+**Proposition 1 (M-MDP is a valid MDP).** The augmented tuple `(S̃, A, T̃, R, γ)` with `S̃ = S × Μ` and `T̃((s, μ), a) = (T(s, a), ρ(μ, s, a, R(s, a)))` satisfies the Markov property: the distribution over next augmented states depends only on the current augmented state and action, not on the history.
+
+*Proof sketch:* The memory write function `ρ` is deterministic given `(μ, s, a, r)`. The transition `T` is Markovian by assumption. The composition of a Markovian transition with a deterministic memory update preserves the Markov property. □
+
+**Proposition 2 (Monotone memory expansion).** If the write function `ρ` only adds entries (never deletes), then `|μ'| ≥ |μ|` for all transitions. The memory space is monotonically non-decreasing.
+
+This is a technical condition that MemRL satisfies (it never deletes entries) but RetroAgent does not (it evicts low-value entries). Proposition 2's convergence results (§5.3) apply strictly only to non-deleting memory systems, though practical violations (like RetroAgent's eviction) are typically benign.
+
+---
+
+### 5.2 Read-Write Learning Paradigm
+
+Memento-II's central theoretical contribution is showing that the read and write operations over memory correspond exactly to the two components of classical policy iteration in reinforcement learning.
+
+#### 5.2.1 Writing as Policy Evaluation
+
+When the agent writes to memory after a task, it records the outcome of its current policy:
+
+```
+Writing: (s, a, r) → μ' = ρ(μ, s, a, r)
+```
+
+This is analogous to **policy evaluation** in standard RL: observing the outcomes of the current policy to estimate its value. In MemRL, the Q-value update `Q_i ← (1 - α) · Q_i + α · r` is literally a Monte Carlo policy evaluation step. In RetroAgent, the EMA utility update serves the same function.
+
+The memory buffer `μ` accumulates a *statistical portrait* of the current policy's performance: which strategies succeed on which types of tasks. The write function `ρ` is the mechanism by which this portrait is constructed and updated.
+
+#### 5.2.2 Reading as Policy Improvement
+
+When the agent reads from memory before a task, it selects experiences that will improve its behavior:
+
+```
+Reading: μ_context = ω(μ, s) → improved action distribution
+```
+
+This is analogous to **policy improvement** in standard RL: using value estimates to select better actions. By retrieving high-utility memories, the agent's effective policy changes—it takes different actions than it would without memory.
+
+The read function `ω` acts as a **policy improvement operator**: it transforms the base LLM's policy `π_base` into an augmented policy `π̃` that incorporates learned experience:
+
+```
+π̃(a | s) = π_base(a | s, ω(μ, s))
+```
+
+The LLM conditions its output on both the current state `s` and the retrieved memory context `ω(μ, s)`. Because the memory context changes as the buffer evolves, the effective policy improves over time without any weight updates.
+
+#### 5.2.3 The Read-Write Cycle as Policy Iteration
+
+Putting the two together:
+
+```
+Cycle k:
+  1. READ: retrieve memories → π̃_k = π_base(· | s, ω(μ_k, s))     [policy improvement]
+  2. ACT: execute π̃_k → observe outcome r
+  3. WRITE: update memory → μ_{k+1} = ρ(μ_k, s, a, r)             [policy evaluation]
+```
+
+This is exactly the structure of **generalized policy iteration** (Sutton & Barto, 2018, Chapter 4). Each read-write cycle performs one step of policy evaluation (via writing) and one step of policy improvement (via reading). The standard convergence theorems for policy iteration then apply to the M-MDP.
+
+#### 5.2.4 Unification of Existing Approaches
+
+Memento-II shows that several previously distinct approaches to agent learning are special cases of the M-MDP framework:
+
+| Approach | Memory space `Μ` | Write function `ρ` | Read function `ω` |
+|----------|-------------------|--------------------|--------------------|
+| **MemRL** | IEU triplets with Q-values | Add triplet, MC Q-update | Two-phase retrieval |
+| **RAG** | Document chunks with embeddings | Add document (no quality signal) | Top-k cosine similarity |
+| **Reflexion** (Shinn et al., 2023) | Natural language self-reflections | Append reflection string | Last-k reflections |
+| **Voyager** (Wang et al., 2023) | Skill library (code functions) | Add verified skill | Retrieve by description |
+| **ExpeL** (Zhao et al., 2024) | Extracted insights | Add insight, deduplicate | Top-k by relevance |
+| **RetroAgent** | Lessons with utility + UCB | Add lesson, EMA update | SimUtil-UCB score |
+
+All of these systems implement some form of `ρ` (write/store) and `ω` (read/retrieve). They differ in what they store, how they update, and how they retrieve. Memento-II's contribution is showing that **all of them are instances of the same formal object** (M-MDP), and that the convergence properties depend on specific structural requirements of `ρ` and `ω`.
+
+---
+
+### 5.3 Convergence Guarantee
+
+#### 5.3.1 Theorem Statement
+
+**Theorem 1 (Convergence of M-MDP Policy Iteration).** Consider an M-MDP `(S, A, T, R, γ, Μ, ρ, ω)` satisfying:
+
+1. **Finite state and action spaces.** `|S|` and `|A|` are finite.
+2. **Ergodicity.** Every state is reachable from every other state under the optimal policy.
+3. **Monotone memory expansion.** The write function `ρ` only adds entries.
+4. **Coverage.** For every state `s ∈ S`, there exists a memory entry `m` in the limit buffer `μ_∞ = lim_{k→∞} μ_k` such that `ω(μ_∞, s)` retrieves a relevant experience for `s`.
+5. **Faithful policy improvement.** The LLM's in-context learning, given the retrieved memory `ω(μ, s)`, is at least as good as the action it would take without memory: `V^{π̃}(s) ≥ V^{π_base}(s)` for all `s`.
+
+Then the policy induced by the M-MDP converges to the optimal policy:
+
+```
+π̃_k → π* as k → ∞
+```
+
+in the sense that the value function converges:
+
+```
+V^{π̃_k}(s) → V^*(s) for all s ∈ S
+```
+
+#### 5.3.2 Proof Sketch
+
+The proof proceeds in three steps:
+
+**Step 1: Memory expansion ensures coverage.** By condition 3, the memory buffer grows monotonically. By condition 4, in the limit, every state has relevant memory coverage. This is analogous to the exploration condition in standard RL: every state-action pair must be visited infinitely often.
+
+**Step 2: Write updates converge.** The write function `ρ` performs policy evaluation. Under standard stochastic approximation conditions (conditions 1 and 2 ensure sufficient exploration), the utility estimates stored in memory converge to the true utilities of the current policy. For MemRL, this is the convergence of Q-values (§3.4.3). For RetroAgent, this is the convergence of EMA utilities.
+
+**Step 3: Read-write cycle is a contraction.** The read function `ω`, by retrieving high-utility memories, implements policy improvement (condition 5). The composition of policy evaluation (step 2) and policy improvement (step 3) is a contraction mapping on the value function space with modulus `γ < 1` (by the standard policy iteration convergence theorem; Bertsekas & Tsitsiklis, 1996). Therefore, the value function converges to the fixed point `V^*`.
+
+□
+
+#### 5.3.3 Interpretation
+
+Theorem 1 tells us: **If your memory grows to cover the task space, and your LLM can learn from retrieved examples in-context, then your agent will converge to optimal behavior.** This is a powerful result because it separates the question of convergence (which is guaranteed by the M-MDP structure) from the question of convergence rate (which depends on the specific write and read functions).
+
+The practical implications are:
+
+1. **MemRL's Q-value learning is not ad hoc.** It is an instance of policy evaluation within an M-MDP, and its convergence is guaranteed by Theorem 1 (assuming the LLM's in-context learning satisfies condition 5).
+
+2. **RAG can be provably suboptimal.** Standard RAG satisfies conditions 1–4 but may violate condition 5: retrieving high-similarity but low-utility memories can make the policy *worse* than the base policy. MemRL and RetroAgent fix this by adding utility signals to the read function.
+
+3. **The frozen-LLM assumption is theoretically sound.** Convergence does not require weight updates. The LLM is a fixed function; the memory is the learning substrate. This validates the "decouple stability from plasticity" principle (§3.1).
+
+#### 5.3.4 Detailed Proof of the Contraction Property
+
+We expand Step 3 of the proof sketch. Define the Bellman operator on the augmented state space:
+
+```
+(T̃^π V)(s, μ) = E_π [ R(s, a) + γ · V(s', μ') ]
+```
+
+where `s' ~ T(s, a)` and `μ' = ρ(μ, s, a, R(s, a))`.
+
+**Claim:** `T̃^π` is a `γ`-contraction in the sup-norm.
+
+*Proof:*
+```
+|T̃^π V₁(s,μ) - T̃^π V₂(s,μ)|
+= |E_π[R + γV₁(s',μ')] - E_π[R + γV₂(s',μ')]|
+= γ · |E_π[V₁(s',μ') - V₂(s',μ')]|
+≤ γ · E_π[|V₁(s',μ') - V₂(s',μ')|]
+≤ γ · ‖V₁ - V₂‖_∞
+```
+
+Since `γ < 1`, `T̃^π` is a contraction. By the Banach fixed-point theorem, iterating `T̃^π` converges to the unique fixed point `V^π`, the true value function of policy `π` on the augmented state-memory space.
+
+Now consider the policy improvement operator `I` that, given a value function `V`, selects the policy `π'` that is greedy with respect to `V`:
+
+```
+I(V)(s, μ) = argmax_a [ R(s, a) + γ · E[V(s', ρ(μ, s, a, R(s,a)))] ]
+```
+
+In the M-MDP context, `I` operates through the read function `ω`: the policy `π'` is the LLM's output *given the retrieved memories* `ω(μ, s)` selected based on the current utility estimates. Condition 5 guarantees that this policy improvement step does not decrease value.
+
+The composition of policy evaluation (`T̃^π` converging to `V^π`) and policy improvement (`I` producing a non-worse policy) is the standard generalized policy iteration (GPI) scheme. By Theorem 6.6 of Bertsekas & Tsitsiklis (1996), GPI converges to `V^*` and `π^*` for finite MDPs with discounted rewards.
+
+**The critical insight:** The memory buffer `μ` makes the M-MDP *non-stationary* in a specific way: the augmented state space `S̃ = S × Μ` grows as memory accumulates. However, because the write function `ρ` is deterministic and the memory only grows (condition 3), the sequence of M-MDPs `{M_k}` is nested: `M_{k+1}` has all the states of `M_k` plus new ones corresponding to the expanded memory. The contraction property holds for each `M_k`, and the value functions form a monotonically improving sequence, bounded above by `V^*`. By the monotone convergence theorem, the sequence converges.
+
+#### 5.3.5 Convergence Rate Bounds
+
+Memento-II also provides convergence rate bounds, though these are less tight than the asymptotic guarantee:
+
+**Corollary 1.** Under the conditions of Theorem 1, with a learning rate `α` satisfying `Σ_k α_k = ∞` and `Σ_k α_k^2 < ∞`, the expected suboptimality after `K` episodes is bounded by:
+
+```
+E[V^*(s) - V^{π̃_K}(s)] ≤ O(1 / √K)
+```
+
+This is the standard `1/√K` rate for Monte Carlo methods. For `K = 1000` tasks, the expected suboptimality is on the order of 3% of the optimal value. This matches the empirical observation (§3.5.4) that MemRL reaches near-peak performance after a few hundred to a thousand tasks.
+
+---
+
+### 5.4 Practical Implications
+
+#### 5.4.1 From Heuristic to Rigorous
+
+Before Memento-II, "reflective memory" was a design pattern—a heuristic that seemed to work well but had no theoretical backing. Systems like Reflexion (Shinn et al., 2023) stored self-reflections after failures and retrieved them in future attempts, achieving impressive empirical results. But the question "why does this work?" had no formal answer. Was it a lucky property of LLMs? Would it break with different models or tasks?
+
+Memento-II answers this question: reflective memory works because it implements policy iteration on an augmented state-memory space. The convergence is not a property of any specific LLM; it is a structural property of the read-write cycle. Any LLM that satisfies condition 5 (in-context learning improves upon base policy) will benefit from reflective memory.
+
+#### 5.4.2 Unifying Case-Based Reasoning, RAG, and Reflexion
+
+Case-based reasoning (CBR; Aamodt & Plaza, 1994) has a 30-year history in AI. RAG (Lewis et al., 2020) is a 5-year-old paradigm in LLM engineering. Reflexion (Shinn et al., 2023) is a 2-year-old technique for LLM self-improvement. Memento-II shows that all three are instances of the same formal framework:
+
+- **CBR** = M-MDP where `Μ` stores problem-solution pairs and `ω` retrieves by structural similarity.
+- **RAG** = M-MDP where `Μ` stores document chunks and `ω` retrieves by embedding similarity.
+- **Reflexion** = M-MDP where `Μ` stores self-reflection strings and `ω` retrieves the most recent reflections.
+
+The framework reveals what distinguishes effective systems from ineffective ones: **the quality of the write function `ρ` and the read function `ω`**. MemRL's innovation is in `ω` (utility-weighted retrieval). RetroAgent's is in both `ω` (UCB exploration) and `ρ` (lesson distillation with EMA updates). Standard RAG uses a trivial `ω` (cosine similarity) and `ρ` (blind insertion), which is why it underperforms.
+
+#### 5.4.3 Continual Adaptation Without Fine-Tuning is Theoretically Sound
+
+The most important practical implication of Theorem 1 is negative: **you do not need to fine-tune your LLM to achieve convergent self-improvement.** The frozen LLM serves as a fixed computational substrate. The memory buffer serves as the learning substrate. Together, they implement a provably convergent learning algorithm.
+
+This has immediate engineering consequences:
+
+1. **No catastrophic forgetting risk.** Because the LLM's weights are unchanged, its capabilities on tasks outside the current domain are preserved.
+
+2. **No training infrastructure required.** Runtime evolution requires only inference (for task execution and memory writing) and simple arithmetic (for utility updates). No GPUs, no gradient computation, no training data management.
+
+3. **Cheaper than fine-tuning.** A memory buffer with 10,000 entries occupies ~50MB of storage. Fine-tuning a 70B-parameter model requires hundreds of GBs of GPU memory and hours of compute.
+
+4. **Model-agnostic.** The memory buffer can be used with any LLM. When a new model is released, the agent's memory transfers directly—no re-training needed. This is in stark contrast to fine-tuned models, which are locked to a specific architecture and checkpoint.
+
+#### 5.4.4 Connection to Online Learning Theory
+
+Memento-II's M-MDP framework has a deep connection to online learning theory (Cesa-Bianchi & Lugosi, 2006) that the original paper acknowledges but does not fully develop. We sketch the connection here.
+
+In online learning, an agent faces a sequence of tasks `t = 1, 2, ...` and must select a strategy (hypothesis) for each task. After each task, the agent observes the loss and updates its strategy. The goal is to minimize **regret**: the difference between the agent's cumulative loss and the loss of the best fixed strategy in hindsight.
+
+The M-MDP read-write cycle maps directly to this framework:
+
+```
+Online Learning             M-MDP
+──────────────             ─────
+Hypothesis space H    ←→   Memory buffer M (set of available strategies)
+Strategy selection    ←→   Read function ω (select memories to use)
+Loss observation      ←→   Task outcome r
+Strategy update       ←→   Write function ρ (update utility scores)
+Regret               ←→   Suboptimality gap V* - V^{π̃_k}
+```
+
+**MemRL's retrieval policy is an instance of the Follow-the-Leader algorithm** (FTL; Shalev-Shwartz, 2012): it always selects the memories with the highest current utility estimate (the "leader" in terms of Q-value). FTL has well-known regret bounds for stochastic settings:
+
+```
+E[Regret_K] ≤ O(√(K · ln|M|))
+```
+
+For a buffer with `|M| = 1000` entries over `K = 1000` tasks, this gives expected regret ≤ O(√(1000 · 6.9)) ≈ O(83). Normalized by K, this is ~8% average per-task suboptimality, consistent with the empirical warm-up period observed in §3.5.7.
+
+**RetroAgent's SimUtil-UCB is an instance of UCB1** (Auer et al., 2002), which has a tighter regret bound:
+
+```
+E[Regret_K] ≤ O(√(K · |M| · ln K))
+```
+
+The UCB1 bound is optimal in a minimax sense for the multi-armed bandit setting. This provides a stronger theoretical guarantee for RetroAgent's exploration strategy compared to MemRL's exploitation-only approach.
+
+This connection also suggests practical improvements: any advance in online learning algorithms (e.g., Thompson Sampling, EXP3 for adversarial settings, contextual bandits) could be translated into a corresponding memory retrieval strategy within the M-MDP framework.
+
+#### 5.4.5 Limitations of the Theory
+
+1. **Condition 5 is strong.** The assumption that in-context learning always improves upon the base policy is not universally true. LLMs can be confused by retrieved context, especially if the context is contradictory or excessively long (Liu et al., 2024, "Lost in the Middle"). In practice, careful prompt engineering and context window management are needed to approximate condition 5.
+
+2. **Finite state space assumption.** Real agent tasks have continuous, effectively infinite state spaces. The convergence guarantee applies formally only to finite state spaces, though standard function approximation arguments (e.g., using embeddings as a finite representation of the state) provide informal extensions.
+
+3. **Convergence rate is slow.** The `O(1/√K)` bound is loose for practical purposes. With `K = 100` tasks, the bound permits ~10% suboptimality, which is too much for many applications. The theory says convergence is guaranteed but says little about how fast.
+
+4. **No guidance on memory architecture.** Theorem 1 says convergence holds for *any* write and read functions satisfying the conditions. It does not say which specific functions are best. The engineering contributions of MemRL and RetroAgent (specific retrieval algorithms, specific update rules) are not derivable from the theory alone.
+
+---
+
+## Chapter 6: Honcho — Dialectical User Modeling
+
+**System:** Honcho, developed by Plastic Labs (2025–2026). Integrated as the memory/personalization layer of the **Hermes Agent** project (Nous Research, 2026).
+
+**Papers and references:**
+- Plastic Labs. "Honcho: Dialectical User Modeling for Personalized AI." Documentation and technical blog, 2025–2026.
+- Nous Research. "Hermes Agent: Self-Improving Agent with Atropos RL and Honcho Memory." Open-source release, 2026.
+- Hegel, G. W. F. *Phenomenology of Spirit*, 1807. (The philosophical foundation of the dialectical method.)
+
+**Core contribution:** Honcho represents a different axis of runtime self-evolution. While MemRL, RetroAgent, and Memento-II evolve the agent's *task-solving capabilities* through episodic memory, Honcho evolves the agent's *model of the user* through dialectical reasoning. The system maintains a 12-layer identity representation of the user that deepens over time, enabling increasingly personalized agent behavior without fine-tuning.
+
+**Why include Honcho in a book about self-evolving agents?** Because user modeling is a form of self-evolution. An agent that learns your preferences, expertise, and communication style *changes its behavior* over time—not by modifying its weights, and not by storing task solutions, but by building an increasingly accurate internal model of the entity it serves. This is evolution along the personalization axis, and it obeys the same stability-plasticity constraints as task memory: the LLM is frozen (stable), while the user model is plastic (evolves at runtime).
+
+---
+
+### 6.1 The User Modeling Problem
+
+The three preceding chapters addressed one dimension of runtime self-evolution: how an agent improves at *solving tasks*. But tasks don't exist in a vacuum—they are given by *users*, and the same task can require radically different agent behavior depending on who the user is. A terse response that delights a senior engineer will frustrate a student learning to code. A detailed architectural explanation that educates one user will bore another who just needs a one-line command.
+
+Most agent systems treat the user as a static entity: a set of preferences specified in a system prompt or configuration file. This is adequate for single-session interactions but fails for **long-running agent relationships** where the agent should learn the user's:
+
+- Communication style preferences (terse vs. verbose, formal vs. casual)
+- Domain expertise level (novice vs. expert in each relevant field)
+- Decision-making patterns (risk-averse vs. risk-tolerant, consensus-seeking vs. decisive)
+- Implicit goals (what the user is *trying to achieve*, not just what they *said to do*)
+- Evolving context (projects change, priorities shift, knowledge grows)
+
+The challenge is that users rarely state these properties explicitly. They are **latent variables** that must be inferred from interaction patterns over time.
+
+**Existing approaches and their limitations:**
+
+| Approach | Mechanism | Limitation |
+|----------|-----------|------------|
+| Static system prompt | Manually written user preferences | Doesn't adapt; becomes stale |
+| Conversation history | Full chat logs in context | Token cost scales linearly; LLM attention degrades with length |
+| Session summaries | Compressed session notes | Loses nuance; summary quality varies |
+| User profile database | Structured key-value attributes | Rigid schema; can't capture complex identity facets |
+| Collaborative filtering | "Users like you also..." | Requires large user population; privacy concerns |
+
+Honcho takes a fundamentally different approach: **dialectical reasoning about the user's identity.**
+
+---
+
+### 6.2 The 12-Layer Identity Model
+
+Honcho represents each user through a **12-layer identity hierarchy**, inspired by Robert Dilts' Neurological Levels model (1990) and extended with insights from clinical psychology, personality theory, and organizational behavior:
+
+| Layer | Name | Description | Example |
+|-------|------|-------------|---------|
+| 1 | **Environment** | Physical and digital context | "Works remotely; uses macOS; prefers dark mode" |
+| 2 | **Behavior** | Observable interaction patterns | "Sends long messages; asks follow-up questions; iterates quickly" |
+| 3 | **Capabilities** | Skills and knowledge areas | "Expert in Python; intermediate in Rust; learning Kubernetes" |
+| 4 | **Beliefs** | Held opinions and assumptions | "Believes in test-driven development; skeptical of microservices" |
+| 5 | **Values** | Priority hierarchy | "Values code readability over performance; prioritizes user experience" |
+| 6 | **Identity** | Self-concept and roles | "Senior engineer; team lead; open-source contributor" |
+| 7 | **Purpose** | Higher-order goals | "Building a platform to democratize AI access" |
+| 8 | **Emotional patterns** | Affective tendencies | "Gets frustrated with boilerplate; energized by novel problems" |
+| 9 | **Cognitive style** | Thinking and learning patterns | "Visual learner; prefers examples over abstractions; thinks in systems" |
+| 10 | **Relational dynamics** | How the user relates to the agent | "Treats agent as junior colleague; expects proactive suggestions" |
+| 11 | **Growth trajectory** | How the user is changing | "Transitioning from IC to management; learning distributed systems" |
+| 12 | **Meta-cognition** | Self-awareness patterns | "Aware of tendency to over-engineer; actively working on scope discipline" |
+
+Each layer is represented as a **natural language paragraph** (not a structured schema), allowing the model to capture nuance and uncertainty:
+
+```
+Layer 3 (Capabilities) — as of 2026-03-15:
+"Deep expertise in Python (10+ years), particularly in the scientific
+computing stack (NumPy, Pandas, SciPy). Strong but not expert-level
+Rust skills — comfortable with ownership and lifetimes but still
+learning async patterns. Recently started exploring Kubernetes; has
+deployed simple services but struggles with custom operators and
+network policies. Prefers to see working code examples rather than
+reading documentation."
+```
+
+#### 6.2.1 Layer Initialization
+
+On first interaction, all 12 layers are initialized to **default priors**:
+
+```
+Layer k initial state:
+  "No information available yet for this user's {layer_name}.
+   Default assumptions: average {domain} user with typical
+   preferences. Update as evidence accumulates."
+```
+
+The agent operates on these defaults until enough interaction data accumulates to update the layers. This is the "cold prompt" state described in §6.5.
+
+#### 6.2.2 Layer Update Mechanism
+
+Layers are updated through **dialectical reasoning** (§6.3), not through simple extraction. The system does not just append new facts; it *synthesizes* new understanding by confronting existing beliefs about the user with new evidence.
+
+---
+
+### 6.3 Two-Layer Context Injection Architecture
+
+Honcho injects user-model information into the agent's context through a **two-layer architecture**:
+
+#### 6.3.1 Base Layer
+
+The base layer provides **factual grounding** and is injected into every agent call:
+
+```
+Base Context = SessionSummary(current_session) + UserRepresentation(user_model)
+```
+
+**SessionSummary:** A compressed summary of the current conversation session. Generated by an LLM call that takes the full conversation history and produces a 200–500 token summary preserving key decisions, open questions, and the user's current focus.
+
+**UserRepresentation:** A flattened version of the 12-layer identity model, typically 300–800 tokens. Not all layers are included in every call; the system selects the most relevant layers based on the current task context:
+
+```
+Relevance scoring for layer k:
+  rel(k) = cos(Embed(layer_k_text), Embed(current_task))
+  Include layer k if rel(k) ≥ 0.5 or k ∈ {1, 2, 3}  // always include basic layers
+```
+
+**Injection format:**
+
+```
+[USER CONTEXT]
+Session: {session_summary}
+User Profile:
+- Environment: {layer_1_text}
+- Behavior Patterns: {layer_2_text}
+- Capabilities: {layer_3_text}
+- Values: {layer_5_text}  // included because rel(5) ≥ 0.5 for this task
+[END USER CONTEXT]
+```
+
+#### 6.3.2 Dialectic Layer
+
+The dialectic layer provides **reasoned interpretation** and is injected periodically (not every call):
+
+```
+Dialectic Context = LLM_Reasoning(base_context, interaction_history, current_task)
+```
+
+This is a separate LLM call (the "dialectic pass") that takes the base context and produces a **reasoned analysis** of how the user model should influence the current interaction:
+
+```
+Dialectic Pass Prompt:
+Given the following user model and current interaction context,
+reason about:
+1. What does the user likely NEED (not just what they asked for)?
+2. How should the response be ADAPTED to this user's style?
+3. What ASSUMPTIONS should be challenged or validated?
+4. What GROWTH OPPORTUNITIES exist in this interaction?
+
+User Model: {base_context}
+Current Task: {current_task}
+Recent Messages: {last_3_messages}
+
+Dialectic Analysis:
+```
+
+The dialectic pass is computationally expensive (one additional LLM call) but produces significantly higher-quality personalization. The system controls when it runs via configuration parameters (§6.4).
+
+---
+
+### 6.4 Configuration Parameters
+
+Honcho exposes three primary configuration parameters that control the frequency and depth of dialectical reasoning:
+
+#### 6.4.1 contextCadence
+
+**Type:** Integer (number of messages between base context updates)
+**Default:** 5
+**Range:** 1–20
+
+Controls how often the base layer context is refreshed. A session summary is regenerated every `contextCadence` messages:
+
+```
+if message_count % contextCadence == 0:
+    session_summary = LLM_summarize(conversation_history)
+    base_context = session_summary + user_representation
+```
+
+**Tradeoffs:**
+- `contextCadence = 1`: Maximum freshness, maximum cost (one summary call per message).
+- `contextCadence = 5` (default): Good balance; context may be slightly stale but cost is 80% lower.
+- `contextCadence = 20`: Minimal cost but context can become significantly stale in fast-moving conversations.
+
+#### 6.4.2 dialecticCadence
+
+**Type:** Integer (number of messages between dialectic passes)
+**Default:** 10
+**Range:** 1–50
+
+Controls how often the dialectic layer runs. A full dialectic analysis is generated every `dialecticCadence` messages:
+
+```
+if message_count % dialecticCadence == 0:
+    dialectic_analysis = LLM_dialectic(base_context, history, task)
+```
+
+The dialectic pass is more expensive than the base context update, so its cadence is typically 2–5× the context cadence.
+
+**Tradeoffs:**
+- `dialecticCadence = 1`: Maximum personalization depth, very high cost.
+- `dialecticCadence = 10` (default): Dialectic reasoning runs every ~10 messages, which is sufficient for most conversational dynamics.
+- `dialecticCadence = 50`: Minimal dialectical reasoning; suitable for high-volume, low-personalization use cases.
+
+#### 6.4.3 dialecticDepth
+
+**Type:** Integer (number of dialectic passes per invocation)
+**Default:** 2
+**Range:** 1–3
+
+Controls the **depth** of dialectical reasoning when it does run. Multiple passes implement the Hegelian dialectic:
+
+```
+depth = 1 (Thesis):
+  Initial analysis of user model + current context
+  → "The user appears to be a senior engineer who prefers concise responses."
+
+depth = 2 (Thesis + Antithesis):
+  Challenge the initial analysis
+  → "However, on this topic (distributed systems), the user has asked
+     several clarifying questions suggesting less expertise. The user
+     may prefer more detailed explanations for this specific domain."
+
+depth = 3 (Thesis + Antithesis + Synthesis):
+  Synthesize the contradiction
+  → "The user is a senior engineer who generally prefers conciseness
+     but is actively learning distributed systems and benefits from
+     detailed explanations in that domain. Adapt response verbosity
+     based on topic expertise level."
+```
+
+**Computational cost:** Each depth level requires one additional LLM call. At `dialecticDepth = 3`, the dialectic pass costs 3× a single LLM inference.
+
+**Quality impact (from Honcho's internal evaluations):**
+
+| Depth | User satisfaction (1-5 scale) | Personalization accuracy (%) | Cost multiplier |
+|-------|------------------------------|------------------------------|-----------------|
+| 1 | 3.4 | 62 | 1.0× |
+| 2 | 4.1 | 78 | 2.0× |
+| 3 | 4.3 | 83 | 3.0× |
+
+Depth 2 provides the best cost/quality tradeoff. Depth 3 provides marginal improvement at 50% additional cost.
+
+---
+
+### 6.5 User Model Evolution Over Time
+
+The user model evolves through three distinct phases:
+
+#### 6.5.1 Phase 1: Cold Prompt (Sessions 1–3)
+
+**State:** All 12 layers are at default priors. The agent has no user-specific information.
+
+**Behavior:** The agent relies on generic interaction patterns. Responses are competent but not personalized. The dialectic layer (if enabled) produces generic analyses like "This appears to be a technical user; provide detailed responses."
+
+**Data collection:** Every user message is analyzed for signals that can update the identity layers:
+
+```
+Signal Extraction Prompt:
+Analyze the following user message for identity signals.
+For each signal, specify which identity layer it informs
+and the evidence strength (weak/moderate/strong).
+
+Message: {user_message}
+Context: {conversation_context}
+
+Signals:
+```
+
+**Example extraction from a single message:**
+
+```
+User: "Can you refactor this to use async/await instead of callbacks?
+       I've been meaning to modernize this codebase but keep putting
+       it off. Also, skip the explanation — I know how promises work."
+
+Extracted signals:
+- Layer 3 (Capabilities): Knows async/await and promises (STRONG)
+- Layer 2 (Behavior): Prefers action over explanation (MODERATE)
+- Layer 4 (Beliefs): Values modern code patterns (MODERATE)
+- Layer 12 (Meta-cognition): Aware of procrastination on tech debt (WEAK)
+```
+
+#### 6.5.2 Phase 2: Warm Prompt (Sessions 4–15)
+
+**State:** Layers 1–5 have been partially populated from interaction data. Deeper layers (6–12) remain sparse.
+
+**Behavior:** The agent begins to personalize. It adjusts verbosity based on the user's inferred expertise level, uses the user's preferred terminology, and anticipates common follow-up questions.
+
+**Dialectic reasoning becomes productive:** With a partial user model, the dialectic passes can identify contradictions and refine understanding:
+
+```
+Thesis: "User is an expert Python developer."
+Antithesis: "But user's last three sessions involved basic syntax
+            questions about list comprehensions."
+Synthesis: "User is expert in Python data science (NumPy, Pandas)
+           but less fluent in idiomatic Python patterns outside
+           their domain. Provide explanations for general Python
+           idioms while assuming data science competence."
+```
+
+#### 6.5.3 Phase 3: Deep Model (Sessions 15+)
+
+**State:** All 12 layers have been populated with at least moderate confidence. The model captures nuanced user identity aspects.
+
+**Behavior:** The agent operates with deep personalization:
+
+- Proactively suggests approaches aligned with the user's values (Layer 5).
+- Adapts explanations to the user's cognitive style (Layer 9).
+- Recognizes and supports the user's growth trajectory (Layer 11).
+- Manages the relational dynamics appropriately (Layer 10).
+
+**Model maintenance:** At this phase, the primary challenge is keeping the model current. The dialectic layer detects drift:
+
+```
+Dialectic drift detection:
+"The user model indicates the user 'prefers manual testing over
+automated tests' (Layer 4, updated 6 weeks ago). However, the
+last 5 sessions have involved extensive pytest usage and CI/CD
+pipeline configuration. UPDATING Layer 4: User has shifted toward
+automated testing, possibly influenced by a team process change."
+```
+
+#### 6.5.4 Layer Update Protocol
+
+When the dialectic system detects new evidence that warrants a layer update, it follows a structured protocol:
+
+```
+Layer Update Protocol:
+1. IDENTIFY: Which layer is affected?
+2. CURRENT: What does the layer currently say?
+3. EVIDENCE: What new evidence contradicts or extends it?
+4. CONFIDENCE: How strong is the evidence? (weak/moderate/strong)
+5. UPDATE: Generate new layer text incorporating both old and new information
+6. TIMESTAMP: Record when the update occurred
+
+Minimum evidence threshold: Two independent signals of at least
+MODERATE confidence, or one signal of STRONG confidence.
+```
+
+**Update frequency by layer (empirical averages from Hermes Agent deployment):**
+
+| Layer | Avg. updates per 100 sessions | Stability |
+|-------|-------------------------------|-----------|
+| 1 (Environment) | 3.2 | Very stable |
+| 2 (Behavior) | 12.7 | Moderate |
+| 3 (Capabilities) | 8.4 | Moderate |
+| 4 (Beliefs) | 4.1 | Stable |
+| 5 (Values) | 2.3 | Very stable |
+| 6 (Identity) | 1.8 | Very stable |
+| 7 (Purpose) | 1.1 | Extremely stable |
+| 8 (Emotional) | 7.6 | Moderate |
+| 9 (Cognitive style) | 3.9 | Stable |
+| 10 (Relational) | 5.2 | Moderate |
+| 11 (Growth) | 6.8 | Moderate |
+| 12 (Meta-cognition) | 2.9 | Stable |
+
+Deeper layers (purpose, identity, values) change rarely—they represent core aspects of the user that are slow-moving. Surface layers (behavior, emotional patterns) update more frequently as they reflect session-to-session variation.
+
+---
+
+### 6.6 Integration with Hermes Agent
+
+Honcho is integrated into the Hermes Agent architecture as the **personalization and long-term memory layer**. The integration points are:
+
+#### 6.6.1 Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    Hermes Agent                       │
+│                                                       │
+│  ┌─────────────┐   ┌──────────────┐   ┌───────────┐ │
+│  │  Task Loop   │──▶│  Tool Router  │──▶│  Tools    │ │
+│  └──────┬──────┘   └──────────────┘   └───────────┘ │
+│         │                                             │
+│         ▼                                             │
+│  ┌─────────────────┐                                  │
+│  │  Context Engine  │◀── Base Layer (every call)      │
+│  │                  │◀── Dialectic Layer (periodic)   │
+│  └────────┬────────┘                                  │
+│           │                                           │
+│           ▼                                           │
+│  ┌─────────────────┐                                  │
+│  │     Honcho       │                                 │
+│  │  ┌───────────┐  │                                  │
+│  │  │ 12-Layer  │  │                                  │
+│  │  │  User     │  │                                  │
+│  │  │  Model    │  │                                  │
+│  │  ┌───────────┐  │                                  │
+│  │  │ Session   │  │                                  │
+│  │  │ Store     │  │                                  │
+│  │  └───────────┘  │                                  │
+│  └─────────────────┘                                  │
+└──────────────────────────────────────────────────────┘
+```
+
+#### 6.6.2 API Surface
+
+Honcho exposes a REST API for integration:
+
+```
+POST /users/{user_id}/sessions
+  → Creates a new session, returns session_id
+
+POST /users/{user_id}/sessions/{session_id}/messages
+  → Adds a message to the session history
+  → Triggers signal extraction (async)
+
+GET /users/{user_id}/representation
+  → Returns the current 12-layer user model
+
+POST /users/{user_id}/sessions/{session_id}/dialectic
+  → Triggers a dialectic pass, returns analysis
+
+GET /users/{user_id}/sessions/{session_id}/context
+  → Returns the base layer context for the current session
+```
+
+#### 6.6.3 Hermes Agent Configuration
+
+In the Hermes Agent configuration file:
+
+```yaml
+honcho:
+  enabled: true
+  api_url: "http://localhost:8000"
+  context_cadence: 5
+  dialectic_cadence: 10
+  dialectic_depth: 2
+  min_confidence_for_update: "moderate"
+  layers_always_included: [1, 2, 3]
+  max_context_tokens: 800
+```
+
+---
+
+### 6.7 Honcho as Runtime Evolution
+
+Honcho implements runtime self-evolution along the *user modeling* dimension. The parallels to MemRL and RetroAgent are direct:
+
+| Concept | MemRL/RetroAgent | Honcho |
+|---------|-----------------|--------|
+| What evolves | Task-solving memory | User model |
+| Memory representation | IEU triplets / lessons | 12-layer identity hierarchy |
+| Write mechanism | Store experience + update utility | Extract identity signals + update layers |
+| Read mechanism | Two-phase / SimUtil-UCB retrieval | Relevance-filtered layer injection |
+| Update signal | Task outcome (binary/graded) | Dialectic reasoning (multi-pass) |
+| Convergence | Q-values → true utility | User model → true user identity |
+| Exploration | UCB bonus (RetroAgent) | Dialectic antithesis (challenges current model) |
+
+The dialectic antithesis step (§6.5.2) is functionally equivalent to UCB exploration: it forces the system to re-examine and potentially revise aspects of the user model that might be wrong, preventing the model from ossifying around early (possibly incorrect) impressions.
+
+---
+
+### 6.8 Dialectical Reasoning: The Hegelian Engine
+
+The dialectical process is the philosophical core of Honcho. It deserves detailed treatment because it is the mechanism by which the user model avoids the same ossification problem that MemRL and RetroAgent face in task memory.
+
+#### 6.8.1 The Hegelian Triad Applied to User Modeling
+
+Georg Wilhelm Friedrich Hegel's dialectical method (1807) proceeds through three moments:
+
+1. **Thesis:** An initial proposition or understanding.
+2. **Antithesis:** A contradiction or challenge to the thesis.
+3. **Synthesis:** A higher-order understanding that resolves the contradiction by incorporating insights from both thesis and antithesis.
+
+In Honcho's implementation:
+
+```
+Thesis generation prompt:
+"Based on the user model and recent interactions, state
+your current best understanding of this user's {aspect}."
+
+Antithesis generation prompt:
+"Now challenge that understanding. What evidence from
+recent interactions CONTRADICTS or COMPLICATES the thesis?
+What alternative interpretations exist?"
+
+Synthesis generation prompt:
+"Synthesize the thesis and antithesis into a more nuanced
+understanding. What is the higher-order truth that
+accommodates both the original understanding and the
+contradictory evidence?"
+```
+
+#### 6.8.2 Concrete Dialectic Trace
+
+Here is a real dialectic trace from the Hermes Agent deployment (anonymized):
+
+```
+Context: User has been working on a web application for 12 sessions.
+
+THESIS (Layer 9 — Cognitive Style):
+"The user is a systematic, top-down thinker who prefers to
+understand architecture before implementation details. They
+typically ask for the big picture first, then drill down.
+They prefer diagrams and structured documentation."
+
+ANTITHESIS:
+"However, in the last 3 sessions focused on debugging a
+WebSocket race condition, the user adopted a bottom-up
+approach: examining raw packet traces, adding console.log
+statements, and reasoning inductively from specific failures.
+The user also explicitly said 'just show me the code, skip
+the explanation' twice. This contradicts the 'top-down,
+explanation-first' characterization."
+
+SYNTHESIS:
+"The user has a PRIMARY cognitive style that is top-down and
+systematic, which dominates during design and planning phases.
+However, they switch to a SECONDARY bottom-up, empirical style
+during debugging and troubleshooting. The switch is triggered
+by problem type (debugging vs. building) rather than fatigue
+or frustration. Adapt: provide architectural overviews during
+design discussions, but switch to code-first, minimal-explanation
+mode when the user is debugging."
+```
+
+This synthesis is richer and more actionable than either the thesis or antithesis alone. It captures a *conditional* pattern (behavior depends on context) that a simple accumulation of observations would miss.
+
+#### 6.8.3 Multi-Turn Dialectic (dialecticDepth = 3)
+
+At depth 3, the synthesis from the first triad becomes the thesis for a second round:
+
+```
+Round 1:
+  Thesis: "User prefers top-down thinking"
+  Antithesis: "User uses bottom-up during debugging"
+  Synthesis₁: "User switches styles based on task type"
+
+Round 2:
+  Thesis₂ = Synthesis₁: "User switches styles based on task type"
+  Antithesis₂: "But even during debugging, the user's FIRST action
+    is often to re-read the architecture docs before diving into
+    traces. And during design, they sometimes jump to a prototype
+    before finishing the spec. The task-type trigger is too binary."
+  Synthesis₂: "The user's cognitive style is fundamentally
+    integrative: they move fluidly between abstraction levels,
+    using top-down framing to orient and bottom-up evidence to
+    validate. The apparent style switching is actually a
+    sophisticated iteration between levels, with the entry point
+    (top-down vs. bottom-up) influenced but not determined by
+    task type. Adapt: always provide both an architectural frame
+    AND specific examples, letting the user choose their entry
+    point."
+```
+
+This second-order synthesis captures the user's cognitive style at a level of nuance that neither direct observation nor single-pass analysis could achieve.
+
+#### 6.8.4 Dialectic as Exploration
+
+The antithesis step serves the same function as RetroAgent's UCB exploration bonus: it prevents the user model from converging prematurely to a simplistic or incorrect representation. Without the antithesis step, the model would accumulate evidence for its current understanding and never question it—the same ossification that MemRL's fixed Q-values can produce.
+
+The key difference is that Honcho's exploration is *reasoning-based* rather than *stochastic*. UCB adds random exploration via a mathematical bonus. The dialectic generates *directed* exploration by explicitly asking "what evidence contradicts my current belief?" This is more expensive (requires an LLM call) but more efficient (it targets the most informative contradictions rather than exploring randomly).
+
+### 6.9 Evaluation and Empirical Results
+
+#### 6.9.1 Internal A/B Testing
+
+Plastic Labs reports results from internal A/B testing on a multi-session coding assistant deployment (2026):
+
+**Table 6: Honcho A/B Test Results (Internal Deployment)**
+
+| Metric | Control (no Honcho) | Base layer only | Base + Dialectic (depth 1) | Base + Dialectic (depth 2) |
+|--------|--------------------|-----------------|-----------------------------|----------------------------|
+| User satisfaction (1-5) | 3.2 | 3.7 | 4.0 | 4.2 |
+| Task completion rate (%) | 71.4 | 74.8 | 76.2 | 77.1 |
+| Avg. messages per task | 8.3 | 7.1 | 6.8 | 6.5 |
+| Return session rate (%) | 42.1 | 51.3 | 54.7 | 56.2 |
+
+**Key findings:**
+
+1. **Base layer alone provides significant gains.** Just injecting session summaries and user representations increases satisfaction by 0.5 points and reduces messages per task by 14%. This is low-hanging fruit.
+
+2. **Dialectic reasoning adds on top.** Each depth level adds approximately 0.2–0.3 satisfaction points. The gains are statistically significant (p < 0.01 for depth 2 vs. base-only, two-sample t-test, n = 2,000 sessions per condition).
+
+3. **Messages per task decreases with personalization.** Users need fewer messages to complete tasks when the agent understands their style, expertise, and preferences. This is a direct efficiency gain.
+
+4. **Return rate increases substantially.** Users are 14 percentage points more likely to return for another session with Honcho enabled. This suggests that personalization creates a "stickiness" effect.
+
+#### 6.9.2 Longitudinal User Model Quality
+
+Honcho tracks the quality of its user model over time by measuring **prediction accuracy**: can the model predict what the user will prefer or need before they explicitly state it?
+
+```
+Session:       1    3    5   10   15   25   50
+Prediction
+accuracy (%): 28   37   45  58   64   71   76
+```
+
+The model reaches 50% prediction accuracy by session 5 and 70% by session 25. This maps roughly to the warm prompt → deep model transition described in §6.5.
+
+**Prediction examples:**
+
+- Session 3 (Cold): Agent predicts user wants verbose explanation. User actually wanted a one-liner. ✗
+- Session 10 (Warm): Agent predicts user will ask about error handling next. User asks about error handling. ✓
+- Session 25 (Deep): Agent predicts user will want a systems-level tradeoff analysis rather than a quick answer, because the question touches on a domain where the user's growth trajectory (Layer 11) indicates active learning. User: "Yes, exactly—give me the full tradeoff." ✓
+
+The prediction accuracy metric is measured by a held-out evaluator model that judges whether the agent's preemptive adaptations match what the user actually wanted, based on the user's subsequent message and explicit feedback.
+
+#### 6.9.3 Layer Contribution Analysis
+
+To understand which identity layers contribute most to personalization quality, Honcho runs an ablation where each layer is individually removed:
+
+| Layer Removed | Δ Satisfaction | Most Affected Task Type |
+|---------------|---------------|------------------------|
+| 1 (Environment) | −0.1 | Environment setup, tool config |
+| 2 (Behavior) | −0.3 | All (affects response formatting) |
+| 3 (Capabilities) | −0.4 | Technical tasks (calibrates detail level) |
+| 4 (Beliefs) | −0.2 | Architecture decisions |
+| 5 (Values) | −0.2 | Code review, design tradeoffs |
+| 6 (Identity) | −0.1 | Role-specific interactions |
+| 7 (Purpose) | −0.1 | Long-term project planning |
+| 8 (Emotional) | −0.2 | Debugging, troubleshooting |
+| 9 (Cognitive style) | −0.3 | Explanations, tutorials |
+| 10 (Relational) | −0.2 | Collaboration tone |
+| 11 (Growth) | −0.1 | Learning recommendations |
+| 12 (Meta-cognition) | −0.1 | Self-improvement suggestions |
+
+Layers 2 (Behavior), 3 (Capabilities), and 9 (Cognitive style) are the most impactful. This makes intuitive sense: knowing *how* the user communicates, *what* they already know, and *how* they think has the most direct effect on response quality.
+
+### 6.10 Limitations and Open Problems
+
+1. **Computational cost.** At `dialecticDepth = 2` and `dialecticCadence = 10`, the dialectic layer adds ~20% overhead to the total LLM inference cost. For cost-sensitive deployments, the base layer alone may be sufficient.
+
+2. **Privacy.** The 12-layer identity model stores potentially sensitive information about users. Production deployments must implement encryption at rest, user-controlled deletion, and clear data governance policies. The Honcho documentation recommends treating the user model as PII (Personally Identifiable Information).
+
+3. **Evaluation difficulty.** Unlike task-solving memory (where success/failure provides a clear signal), user modeling quality is hard to measure objectively. Honcho relies on user satisfaction surveys and A/B testing, which are noisy and slow.
+
+4. **Cross-user learning.** Honcho models each user independently. There is no mechanism for transferring insights across users ("Users who value readability also tend to prefer functional programming"). Collaborative filtering could address this but introduces significant privacy challenges.
+
+5. **Adversarial robustness.** A user who deliberately provides misleading signals can corrupt their own model. The dialectic layer provides some robustness (the antithesis step can challenge suspicious signals), but systematic adversarial manipulation is not addressed.
+
+6. **Model staleness.** Layers that are updated infrequently (Purpose, Identity, Values) may become stale if the user undergoes significant life changes between sessions. The system has no mechanism for proactive staleness detection; it relies on the dialectic layer to notice contradictions. A potential mitigation is a time-based confidence decay: layers that haven't been validated by recent evidence gradually decrease in confidence, triggering more frequent dialectic re-evaluation.
+
+7. **Cultural and linguistic bias.** The dialectical reasoning and identity layer definitions reflect Western psychological models (Dilts, Hegel). Users from different cultural backgrounds may have identity structures that map poorly onto the 12-layer hierarchy. For example, collectivist cultures may place more weight on relational and group identity dimensions that are under-represented in the current schema. Internationalization of the identity model is an acknowledged open problem.
+
+8. **Scaling to multiple users.** The current architecture maintains a completely separate 12-layer model per user. For platforms with millions of users, this creates storage and computational overhead. A hierarchical approach—shared population-level priors with user-specific deltas—could reduce costs while maintaining personalization quality, but has not been implemented.
+
+---
+
+## Cross-Cutting Analysis: The Architecture of Runtime Self-Evolution
+
+The four systems covered in this part share a common architecture:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 FROZEN LLM (Reasoning)               │
+│  - Provides in-context learning                      │
+│  - Generates actions, reflections, analyses          │
+│  - Never modified                                    │
+└─────────────┬──────────────────────┬────────────────┘
+              │ Read                 │ Write
+              ▼                     ▼
+┌─────────────────────────────────────────────────────┐
+│              EXTERNAL MEMORY (Plasticity)             │
+│  - Stores structured experience/knowledge            │
+│  - Carries learned quality signals                   │
+│  - Grows and evolves at runtime                      │
+│  - Retrieval is utility-aware                        │
+└─────────────────────────────────────────────────────┘
+```
+
+The critical design decisions are:
+
+| Decision | Options (from papers) | Best Practice |
+|----------|-----------------------|---------------|
+| Memory entry format | Full trace (MemRL) vs. distilled lesson (RetroAgent) vs. identity layer (Honcho) | Match to context budget and use case |
+| Quality signal | Q-value (MemRL) vs. EMA utility (RetroAgent) vs. dialectic confidence (Honcho) | EMA for fast adaptation, MC for stability |
+| Retrieval strategy | Two-phase (MemRL) vs. combined score (RetroAgent) | Combined score if exploration needed |
+| Exploration | None (MemRL) vs. UCB (RetroAgent) vs. dialectic antithesis (Honcho) | UCB for task memory; dialectic for user modeling |
+| Credit assignment | Uniform (MemRL, RetroAgent) | Acceptable; converges with enough data |
+| Convergence guarantee | Asymptotic (Memento-II) | Exists under standard conditions |
+
+The theoretical foundation (Memento-II) tells us that any system following this architecture—frozen LLM + external memory with read/write functions—will converge to optimal behavior if the memory covers the state space and the LLM can learn from retrieved context. The engineering systems (MemRL, RetroAgent, Honcho) provide specific, empirically validated instantiations of this architecture.
+
+### Design Decision Tree for Practitioners
+
+For engineers implementing runtime self-evolution, the following decision tree captures the key architectural choices:
+
+```
+1. Do you need the agent to improve at TASKS or at USER UNDERSTANDING?
+   ├── Tasks → Use MemRL / RetroAgent pattern
+   │   ├── Is the task distribution stationary?
+   │   │   ├── Yes → MemRL (MC updates converge cleanly)
+   │   │   └── No → RetroAgent (EMA adapts faster to drift)
+   │   ├── Is the task space narrow or broad?
+   │   │   ├── Narrow → Higher similarity threshold (MemRL's 0.7)
+   │   │   └── Broad → Lower threshold + UCB exploration (RetroAgent's 0.4 + κ=1.0)
+   │   ├── Is context window budget tight?
+   │   │   ├── Yes → Distilled lessons (RetroAgent pattern)
+   │   │   └── No → Full experiences (MemRL pattern)
+   │   └── How many tasks before performance matters?
+   │       ├── < 50 → MemRL (faster warm-up without exploration cost)
+   │       └── > 200 → RetroAgent (exploration prevents ossification at scale)
+   └── User understanding → Use Honcho pattern
+       ├── Single-session interactions? → Base layer only (contextCadence = 3)
+       ├── Multi-session relationship? → Base + Dialectic (depth 2, cadence 10)
+       └── Deep personalization needed? → Full 12-layer + Dialectic (depth 3, cadence 5)
+```
+
+### Open Research Questions
+
+1. **Combining task memory and user modeling.** No current system combines MemRL/RetroAgent-style task memory with Honcho-style user modeling. An agent that simultaneously learns which strategies work (task memory) and how to present them (user model) could be strictly more effective than either alone.
+
+2. **Multi-agent memory sharing.** When multiple agents collaborate (see Part III), should they share a memory buffer? Shared memory would allow knowledge transfer, but could also propagate errors. The M-MDP framework could be extended to multi-agent settings, but this is unexplored.
+
+3. **Memory compression and consolidation.** As buffers grow, should old memories be compressed, merged, or abstracted? Human episodic memory undergoes consolidation during sleep (Walker, 2017)—is there an analog for agent memory?
+
+4. **Adversarial robustness.** If an adversary can influence the agent's task outcomes (e.g., by manipulating the environment), they can corrupt Q-values/utility scores and degrade the memory buffer. No current system addresses adversarial memory attacks.
+
+5. **Theoretical tight bounds.** Memento-II's `O(1/√K)` convergence rate bound is likely loose. Tighter analysis that accounts for the specific structure of MemRL's two-phase retrieval or RetroAgent's UCB could yield practically useful sample complexity guarantees.
+
+6. **Dynamic learning rates.** Both MemRL (`α = 0.1`) and RetroAgent (`β_util = 0.2`) use fixed learning rates. Adaptive learning rate schedules (e.g., decreasing with retrieval count) could provide both fast initial learning and stable long-term convergence.
+
+7. **Cross-domain transfer.** A memory buffer trained on Python coding tasks: does it transfer to Rust coding? The semantic filtering (Phase 1) would retrieve cross-domain memories with lower similarity scores, but some algorithmic strategies are language-agnostic. Measuring and optimizing cross-domain transfer within the M-MDP framework is an open problem.
+
+8. **Human-in-the-loop memory curation.** All four systems treat memory as fully autonomous. Allowing humans to annotate, correct, or curate memory entries could dramatically accelerate convergence, but raises questions about the division of labor between human curation and autonomous Q-value learning.
+
+**The meta-lesson of Part II:** Runtime self-evolution is not a hack or a heuristic. It is a principled approach to continual agent improvement, grounded in reinforcement learning theory, validated on production benchmarks, and implementable with today's LLMs without any fine-tuning infrastructure. The agent of 2026 does not need gradient descent to get smarter. It needs a good memory and a utility-aware way to read from it.
+
+---
+
+*Next: [Part III: Making Agents Evolve](part3_evolution.md) — From memory-based evolution to full self-improvement through reinforcement learning, evaluation, and benchmarking.*
