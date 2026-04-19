@@ -648,6 +648,352 @@ START: What is the agent's deployment model?
 
 **The overriding principle: start with the simplest architecture that could work, and add complexity only when you have evidence that the simpler approach is insufficient.** The Markdown brain pattern handles 80% of use cases. Event sourcing is warranted when audit trails are non-negotiable. MemRL is warranted when you have enough task volume (100+ tasks/week) to generate meaningful Q-value learning signal. The three-tier Dreaming pattern is warranted when you need cross-session learning without model weight access.
 
+### 7.7 Hermes Agent: The Closed-Loop Learning System
+
+Hermes Agent (Nous Research, February 2026, MIT license, 99K+ GitHub stars) is the most complete implementation of an agent that autonomously creates, updates, and retrieves its own skill documents. It solves the key problem that all other memory systems handle only passively: Hermes *actively generates reusable knowledge* from successful task completions.
+
+#### Three-Layer Memory Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  HERMES MEMORY                       │
+├─────────────────────────────────────────────────────┤
+│ Layer 1: Working Context (standard context window)   │
+│   - Current conversation, tool outputs, reasoning    │
+│   - Size: model context limit (128K-200K tokens)     │
+│                                                      │
+│ Layer 2: Skill Documents (~/.hermes/skills/)         │
+│   - SKILL.md files following agentskills.io standard │
+│   - Created autonomously after successful tasks      │
+│   - Searched via FTS5 full-text search + LLM summary │
+│   - Progressive disclosure: metadata → full content  │
+│     Level 0: skills_list() → name+desc (~3K tokens)  │
+│     Level 1: skill_view(name) → full instructions    │
+│     Level 2: skill_view(name, path) → references     │
+│                                                      │
+│ Layer 3: Persistent Facts (Honcho integration)       │
+│   - Dialectical user modeling via 12-identity layers │
+│   - User preferences, communication style, habits    │
+│   - Two-layer context injection:                     │
+│     Base layer: session summary + user representation │
+│     Dialectic: LLM-synthesized reasoning about user  │
+│   - Config: contextCadence, dialecticCadence,        │
+│            dialecticDepth (1-3 passes)               │
+└─────────────────────────────────────────────────────┘
+```
+
+#### The Autonomous Skill Creation Loop
+
+This is the critical differentiator. Hermes doesn't wait for the user to tell it to create a skill — it does so proactively:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│           HERMES CLOSED-LOOP LEARNING                      │
+│                                                            │
+│  1. TASK EXECUTION                                         │
+│     Agent runs task using tools, code, browsing            │
+│                    │                                       │
+│                    ▼                                       │
+│  2. SELF-EVALUATION CHECKPOINT (every 15 tool calls)       │
+│     "Was this worth capturing?"                            │
+│     Triggers on:                                           │
+│       - 5+ tool calls in a sequence                        │
+│       - Error recovery (agent fixed its own mistake)       │
+│       - User corrections ("no, do it this way")            │
+│       - Non-obvious workflow (novel approach discovered)   │
+│                    │                                       │
+│                    ▼                                       │
+│  3. SKILL CREATION OR UPDATE                               │
+│     Writes/patches SKILL.md following agentskills.io spec  │
+│     Captures: procedure, pitfalls, verification steps      │
+│     Can patch mid-session via skill_manage tool             │
+│                    │                                       │
+│                    ▼                                       │
+│  4. MEMORY UPDATE                                          │
+│     Key facts → MEMORY.md (persistent across sessions)     │
+│     User patterns → USER.md (via Honcho dialectic)         │
+│     Corrections → skill patches (immediate)                │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Concrete result**: after 20-30 complex tasks over a month of regular use, tasks that initially required 25 tool calls drop to 8-10 calls. The agent has internalized the user's workflows.
+
+#### SKILL.md Format — The agentskills.io Open Standard
+
+Every auto-generated skill follows this structure:
+
+```yaml
+---
+name: deploy-staging
+description: Deploy the application to staging environment via GitHub Actions
+version: 1.0.0
+author: hermes-auto
+license: MIT
+platforms: [linux, macos]
+metadata:
+  hermes:
+    tags: [DevOps, Deployment]
+    related_skills: [docker-compose-management]
+    requires_toolsets: [shell]
+    requires_tools: [shell_exec, read_file]
+    config:
+      - key: deploy.staging_branch
+        description: "Branch to deploy from"
+        default: "staging"
+        prompt: "Which branch deploys to staging?"
+required_environment_variables:
+  - name: GITHUB_TOKEN
+    prompt: "Enter your GitHub token for Actions API"
+---
+
+# Deploy to Staging
+
+## When to Use
+User asks to deploy, push to staging, or update staging environment.
+
+## Quick Reference
+```bash
+gh workflow run deploy-staging.yml --ref staging
+gh run list --workflow=deploy-staging.yml --limit=1 --json status
+```
+
+## Procedure
+1. Verify current branch is clean: `git status --porcelain`
+2. If dirty, stash changes: `git stash push -m "pre-deploy stash"`
+3. Trigger deployment: `gh workflow run deploy-staging.yml --ref staging`
+4. Wait for completion: poll `gh run list` every 30s, max 10 minutes
+5. Verify deployment: `curl -s https://staging.example.com/health`
+6. If stashed, restore: `git stash pop`
+
+## Pitfalls
+- **Dirty working tree**: Always stash before deploy. Forgetting this caused
+  failed deploys on 2026-03-15.
+- **Rate limiting**: GitHub Actions API rate-limits at 1,000 requests/hour.
+  The polling loop must use 30s intervals, not 5s.
+- **Health check timing**: Staging takes 45-90s to become healthy after
+  workflow completion. First health check should wait 60s.
+
+## Verification
+- Health endpoint returns 200 with `{"status": "ok"}`
+- `gh run list` shows latest run with status "completed" and conclusion "success"
+```
+
+**The key design insight**: if a skill doesn't trigger, the problem is almost never the instructions — it's the `name` and `description` in the frontmatter. That's what the agent uses to decide whether to load the skill. Progressive disclosure means only ~100 tokens per skill are loaded initially (name + description), so discovery is cheap even with hundreds of skills.
+
+#### Hermes Atropos RL Pipeline — Research-Grade Training Infrastructure
+
+Hermes uniquely integrates an RL training pipeline directly into the agent framework:
+
+```
+┌──────────────────────────────────────────────────────┐
+│              ATROPOS RL PIPELINE                      │
+│                                                      │
+│  1. TRAJECTORY COLLECTION                            │
+│     Every session auto-generates structured data:    │
+│     - User message, tool calls, tool results,        │
+│       assistant responses, timestamps                │
+│     - Stored in SQLite with compression              │
+│     - Batch mode: headless parallel workers           │
+│       with checkpointing for large-scale collection  │
+│                                                      │
+│  2. TRAINING MODES                                   │
+│     RLHF: trajectories → human rating → reward       │
+│           model → PPO policy optimization            │
+│     DPO:  preferred/rejected trajectory pairs →       │
+│           direct preference optimization (offline)   │
+│     GRPO: group sampling → relative advantage →       │
+│           no value network needed                    │
+│                                                      │
+│  3. EXPORT                                           │
+│     ShareGPT format for fine-tuning any model        │
+│     Works with: local (Ollama/vLLM), cloud APIs      │
+│                                                      │
+│  4. ENVIRONMENT FRAMEWORK                            │
+│     Three-layer: BaseEnv (Atropos) →                 │
+│       HermesAgentBaseEnv → Concrete task envs        │
+│     Enables: standardized benchmarks, SFT data gen,  │
+│       RL training on multi-turn agentic tasks        │
+└──────────────────────────────────────────────────────┘
+```
+
+This makes Hermes not just an agent, but a **research platform for training tool-calling models**. Teams can collect trajectories from real usage, then use those trajectories to fine-tune smaller models for specific workflows — closing the loop between deployment and training.
+
+#### Deployment Reality
+
+Hermes runs on six terminal backends:
+
+| Backend | Use Case | Cost |
+|---------|----------|------|
+| Local | Development, personal use | Free (your hardware) |
+| Docker | Isolated deployment | Free (your hardware) |
+| SSH | Remote server | $5+ VPS |
+| Daytona | Serverless with hibernation | Pay-per-use |
+| Modal | GPU tasks, batch RL | Pay-per-use |
+| Singularity | HPC/academic clusters | Institutional |
+
+A single gateway process connects to Telegram, Discord, Slack, WhatsApp, Signal, Matrix, iMessage, WeChat, and CLI. Model-agnostic: works with 200+ models via Nous Portal, OpenRouter, OpenAI, Anthropic, and custom endpoints.
+
+### 7.8 Self-Evolving Skills: The SkillHub and ClawHub Ecosystem
+
+The most radical experiment in agent self-improvement is happening in the open-source skills ecosystem around OpenClaw, ClawHub, and SkillHub. These platforms implement a pattern where agents don't just use pre-built skills — they **autonomously create, test, and share self-improvement capabilities**.
+
+#### The Self-Improving Agent Skill — The Most Downloaded Evolution Mechanism
+
+The `self-improving-agent` skill (1,100+ stars, 90,000+ downloads on ClawHub within 2 months of release) implements a structured self-evolution cycle:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│         SELF-EVOLVING AGENT CYCLE                          │
+│                                                            │
+│  1. PERCEIVE GAP                                           │
+│     Detection signals:                                     │
+│     - Task failures and incomplete requests                │
+│     - Repeated patterns (same request failing 3+ times)    │
+│     - User feedback and explicit corrections               │
+│     - Efficiency metrics (tasks taking >2x expected time)  │
+│                    │                                       │
+│                    ▼                                       │
+│  2. SEARCH SOLUTIONS                                       │
+│     - Scan engineering blogs, GitHub trending               │
+│     - Query SkillHub/ClawHub for relevant skills           │
+│     - Check AGENTS.md and TOOLS.md for existing knowledge  │
+│                    │                                       │
+│                    ▼                                       │
+│  3. DESIGN EXPERIMENT                                      │
+│     - Formulate hypothesis: "If I change X, metric Y       │
+│       should improve by Z%"                                │
+│     - Create test case from the failure that triggered gap │
+│                    │                                       │
+│                    ▼                                       │
+│  4. RUN EXPERIMENT                                         │
+│     - Execute the proposed improvement                     │
+│     - Measure before/after on the test case                │
+│                    │                                       │
+│                    ▼                                       │
+│  5. SELECT WINNER                                          │
+│     - Compare old vs new approach on metrics               │
+│     - If improvement > threshold, proceed to solidify      │
+│     - If not, log failure and try alternative              │
+│                    │                                       │
+│                    ▼                                       │
+│  6. SOLIDIFY                                               │
+│     - Promote learning to permanent workspace files:       │
+│       Workflow improvements → AGENTS.md                    │
+│       Tool gotchas → TOOLS.md                              │
+│       Behavioral patterns → SOUL.md                        │
+│       Broadly applicable → CLAUDE.md /                     │
+│         .github/copilot-instructions.md                    │
+│     - Changes persist across ALL future sessions           │
+│                    │                                       │
+│                    ▼                                       │
+│  7. NEXT ITERATION (repeat)                                │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### The Solidification Mechanism — Where Learnings Become Permanent
+
+The four-component promotion system is the key engineering contribution:
+
+```
+Component 1: CAPTURE
+─────────────────────
+.learnings/
+├── LEARNINGS.md      # Insights from successful tasks
+├── ERRORS.md         # Catalogued failure modes with fixes
+└── FEATURE_REQUESTS.md  # Capability gaps identified
+
+Component 2: PROMOTION TARGETS
+──────────────────────────────
+Workflow improvements    → AGENTS.md    (loaded every session)
+Tool-specific gotchas    → TOOLS.md     (loaded when tool is used)
+Behavioral patterns      → SOUL.md      (identity-level changes)
+Universal learnings      → CLAUDE.md    (system-level context)
+                         → .github/copilot-instructions.md
+
+Component 3: PERSISTENCE
+─────────────────────────
+Once promoted, learnings are injected into every subsequent
+session via the standard CLAUDE.md / AGENTS.md loading mechanism.
+No model retraining needed. The agent's behavior changes because
+its context changes.
+
+Component 4: AUTOMATED REVIEW
+──────────────────────────────
+Heartbeat-driven promotion: a cron job runs the promotion
+process, scanning .learnings/ for items that have accumulated
+enough related issues to warrant promotion. This closes the
+loop without human intervention.
+```
+
+**Practical example**: A research agent runs on cron at 8:30 AM weekdays. It scans engineering blogs and GitHub trending, compares findings against its AGENTS.md, TOOLS.md, and LESSONS.md files, logs results to a structured JSON experiment tracking file, and promotes verified improvements.
+
+#### SkillHub.cn — The Chinese AI Skills Community
+
+SkillHub (skillhub.cn / skillhub.mobi) is Tencent's localized AI skills platform for the Chinese OpenClaw ecosystem:
+
+| Metric | Value |
+|--------|-------|
+| Total skills available | 13,000+ (mirrored from ClawHub) |
+| Curated Top 50 | Safety-audited, professionally selected |
+| Language | Full Chinese interface with optimized search |
+| Categories | 8 major skill categories |
+| Infrastructure | Tencent Cloud acceleration nodes |
+| Cost | Free |
+
+**Most downloaded skills (as of Q1 2026):**
+
+| Rank | Skill | Downloads | Category |
+|------|-------|-----------|----------|
+| 1 | Xiaohongshu Automation | 59K | Social Media |
+| 2 | GitHub Collaboration | 48K | Development |
+| 3 | Summarize (PDF/video/web) | 44K | Productivity |
+| 4 | Tavily Web Search | 39K | Research |
+| 5 | HaS Anonymizer | 31K | Privacy |
+| 6 | Tencent Docs Skill | 27K | Office |
+
+The installation is one-line:
+```bash
+# Install from SkillHub (with Tencent Cloud acceleration)
+npx skillhub install summarize
+
+# Install from ClawHub directly
+npx agent-skills-hub install self-improving-agent
+```
+
+#### Security Concerns with Self-Evolving Skills
+
+Both ClawHub and SkillHub flag self-evolution skills as **suspicious** due to their broad permissions:
+
+- Execute arbitrary shell commands
+- Modify agent configuration files (CLAUDE.md, AGENTS.md, SOUL.md)
+- Access system files and environment variables
+- Make network requests to arbitrary endpoints
+- Modify their own skill definitions
+
+The `self-evolve-agent` skill on ClawHub carries an explicit security warning. The risk is real: a compromised or malicious self-evolving skill could gradually modify an agent's behavior in ways that are difficult to detect because the changes are "legitimate" — they look like normal learning.
+
+**Mitigation patterns**:
+1. Run self-evolving agents in sandboxed containers (NanoClaw's approach)
+2. Git-track all config files so changes are auditable via `git diff`
+3. Require human approval for promotions to SOUL.md and CLAUDE.md
+4. Rate-limit the promotion mechanism (max 3 promotions/day)
+5. Maintain a "constitution" file that self-evolution cannot modify
+
+#### The Hermes vs OpenClaw/SkillHub Approach: A Comparison
+
+| Dimension | Hermes Agent | OpenClaw + SkillHub |
+|-----------|-------------|-------------------|
+| Skill creation | Autonomous (agent writes SKILL.md after tasks) | Community-driven (humans write, agent installs) |
+| Self-improvement | Built-in via Atropos RL + skill patches | Via self-improving-agent skill (optional add-on) |
+| Skill format | agentskills.io standard (YAML frontmatter + MD) | Same standard (interoperable) |
+| Discovery | FTS5 search + LLM summary (progressive disclosure) | ClawHub/SkillHub marketplace search |
+| Training | RLHF/DPO/GRPO via Atropos pipeline | No built-in training (relies on skill-level improvements) |
+| User modeling | Honcho 12-identity dialectical modeling | Simple MEMORY.md + daily notes |
+| Security model | Per-skill permissions, platform-enforced | Community flagging, user responsibility |
+| Scale | 99K+ GitHub stars | 350K+ stars (OpenClaw) + 13K+ skills |
+
+The key takeaway: **Hermes represents the "agent creates its own skills" paradigm, while OpenClaw/SkillHub represents the "community creates skills, agent evolves via curated ecosystem" paradigm**. Both are valid. Hermes is better for power users who want deep personalization. OpenClaw/SkillHub is better for breadth of capability via community network effects.
+
 ---
 
 ## Chapter 8: Training Agents to Improve — RL in Practice

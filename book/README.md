@@ -65,7 +65,9 @@ But building agents that *evolve* — that improve over time, handle long-horizo
 
 **Industry Leaders:** OpenAI (Agents SDK, Codex), Anthropic (Claude Agent SDK, Claude Code), Google (Gemini, ADK, A2A), Cursor (Composer, Cloud Agents), Manus AI, Cognition (Devin)
 
-**Open Source:** OpenHands, SWE-agent, OpenClaw, NanoClaw, Hermes Agent, MemRL, RetroAgent
+**Open Source:** OpenHands, SWE-agent, OpenClaw, NanoClaw, Hermes Agent (Nous Research — self-improving skills, Atropos RL), MemRL, RetroAgent
+
+**Skills Ecosystems:** ClawHub (13K+ skills), SkillHub.cn (Tencent, Chinese community), agentskills.io open standard
 
 **Research Labs:** Stanford (ReCAP, ALAS), UC Berkeley (PLAN-AND-ACT), CMU, Princeton (SWE-bench, SWE-agent), Meta (GAIA), Sierra Research (TAU-bench)
 
