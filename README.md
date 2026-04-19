@@ -1,26 +1,35 @@
-# AgentEnvolveBook
+# The Self-Evolving Agent
 
-## The Self-Evolving Agent: How AI Agents Get Better Through Use
+**How top-tier production agents actually get better through use.**
 
-A deeply technical book (15 chapters, ~8,200 lines) on **runtime self-evolution** — how AI agents improve through use without model retraining. Every chapter covers mechanisms that operate on a frozen LLM backbone: the model never changes, but external memory, skills, heuristics, and knowledge evolve with experience.
+Extracted from shipped products, leaked source code, open repos, and the ClawHub skill ecosystem — not academic papers.
 
-### Read the Book
+## Products Covered
 
-Start here: **[book/README.md](book/README.md)**
+| Product | Self-Evolution Mechanism | Evidence Source |
+|---------|------------------------|----------------|
+| Claude Code | CLAUDE.md + auto memory + skills | Leaked 512K-line source (March 2026) |
+| Cursor | Continual-learning plugin + Bugbot learned rules (52% → 78%) | Official blog + open-source plugin |
+| Hermes Agent | Autonomous SKILL.md creation + Honcho user modeling | Open source (99K+ stars) |
+| OpenClaw | proactive-agent (145K downloads) + capability-evolver + self-improving-agent | ClawHub marketplace data |
+| Codex | AGENTS.md + memory preview + compaction | Official docs + open-source CLI |
+| Gemini CLI | GEMINI.md + experimental memory manager subagent | Open source + PRs |
+| Windsurf | Auto-generated memories + rules system | Official docs |
+| Copilot | Agentic memory with code citations | GitHub Docs |
+| Devin | Self-verification + auto-fix (2.2) + DeepWiki | Official blog |
+| Manus | Context engineering iteration ("Stochastic Graduate Descent") | Published blog posts |
 
-### Structure
+## Read the Book
 
-| Part | Chapters | What Evolves |
-|------|----------|-------------|
-| **I. Foundations** | 1-2 | Taxonomy of 20+ mechanisms, Reflexion/ExpeL/ERL/AutoGuide |
-| **II. Memory** | 3-6 | MemRL Q-values, RetroAgent SimUtil-UCB, Memento-II theory, Honcho user modeling |
-| **III. Skills** | 7-11 | Voyager code skills, SkillWeaver APIs, Hermes SKILL.md, AgentFactory subagents, ASG-SI graphs |
-| **IV. Crystallization** | 12-15 | OpenClaw self-improving-agent, OPRO/ADAS/HyEvo, LATS planning, open problems |
+This is an [mdBook](https://rust-lang.github.io/mdBook/). To build locally:
 
-### Key Papers Covered (with full algorithms)
+```bash
+cargo install mdbook
+mdbook serve
+```
 
-Reflexion (NeurIPS 2023), ExpeL (AAAI 2024), Voyager (TMLR 2024), CoALA (TMLR 2024), AutoGuide (NeurIPS 2024), LATS (ICML 2024), ASG-SI (arXiv 2025), Memento-II (arXiv 2025), MemRL (arXiv 2026), SkillWeaver (arXiv 2025), ERL (ICLR 2026), RetroAgent (arXiv 2026), AgentFactory (arXiv 2026), ADAS (ICLR 2025), Hermes Agent (2026), RKC (2026)
+Or browse the source directly in [`src/`](src/SUMMARY.md).
 
-### Who This Is For
+## Format
 
-Engineers designing agents for long-running, hard tasks that must get measurably better over time — without ever retraining the model.
+Matches the format of [AgentMemoryBook](https://github.com/A7um/AgentMemoryBook) and [SkillDesignBook](https://github.com/A7um/SkillDesignBook).

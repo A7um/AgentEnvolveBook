@@ -1,0 +1,29 @@
+[book]
+title = "The Self-Evolving Agent"
+authors = ["Atum <https://atum.li>"]
+description = "How top-tier production agents — Claude Code, Cursor, Hermes, OpenClaw, Manus, Codex — actually get better through use. Extracted from leaked source, open repos, and shipped products."
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "_book"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/A7um/AgentEnvolveBook"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/{path}"
+site-url = "/AgentEnvolveBook/"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
