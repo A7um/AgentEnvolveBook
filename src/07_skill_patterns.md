@@ -1,636 +1,602 @@
-# Chapter 7: Skill Design Patterns That Enable Evolution
+# Skill Design Patterns That Enable Evolution
 
-## Why Patterns Matter
+The previous chapters described *what* production agents build — skills, memories, rules. This chapter extracts the *patterns* that make those artifacts evolve effectively. Each pattern comes from a real system: proactive-agent, self-improving-agent, capability-evolver, Hermes, Claude Code, or Devin. Each has been tested against actual user workloads.
 
-Not all skills are created equal. Of the 13,000+ skills on ClawHub, most are static instruction sets — they tell the agent what to do, the agent does it, and nothing changes. A few hundred skills are different. They change how the agent *thinks*, not just what it does. They give the agent judgment. They create the conditions for evolution.
-
-This chapter identifies six design patterns that distinguish skills capable of driving agent evolution from skills that remain static. The patterns are drawn from analysis of the top 1,000 ClawHub skills by download count, the SkillDesignBook community guide, and direct examination of the highest-performing skills in production.
-
-These patterns are not theoretical. Every one of them is extracted from a shipped skill with thousands of downloads and real-world usage data.
-
-## Pattern 1: Change How the Agent Thinks, Not Just What It Does
-
-The highest-quality skills change the agent's **framing** — the mental model it applies to problems — rather than just giving it a procedure to follow.
-
-### The Evidence
-
-From `proactive-agent` (145,000 downloads, the third most-installed skill on ClawHub):
-
-> "Don't ask 'what should I do?' Ask 'what would genuinely delight my human that they haven't thought to ask for?'"
-
-This single sentence does not describe a procedure. It describes a way of thinking. An agent that internalizes this framing will behave differently in *every* interaction, not just the ones that match a specific trigger condition.
-
-Compare this with a typical procedural skill:
-
-> "When the user asks you to summarize an article, extract the title, main points (up to 5), and a one-paragraph summary."
-
-The procedural skill is useful but limited. It fires on one specific trigger ("summarize an article") and produces one specific output. It does not change how the agent approaches novel situations.
-
-### Why Framing Enables Evolution
-
-Framing changes enable evolution because they compound across all future interactions:
-
-```
-Procedural skill:
-  Trigger → Procedure → Output
-  (fires once, produces one result, nothing changes)
-
-Framing skill:
-  New mental model → Applied to ALL future interactions
-  → Agent develops better judgment over time
-  → Agent makes better decisions in novel situations
-  → This IS evolution: the agent improves without
-    explicit instruction for each new case
-```
-
-The `proactive-agent` skill's framing — "delight the user" rather than "complete the task" — causes the agent to:
-
-1. Anticipate needs before they are stated
-2. Offer related suggestions after completing a request
-3. Notice when a task could be done better than asked
-4. Provide context the user might need but did not request
-
-None of these behaviors are specified procedurally. They emerge from the framing. And as the agent encounters more situations where the framing applies, its judgment about *how* to delight users improves — because each experience adds to its context about what "delight" means for this particular user.
-
-### The Framing Spectrum
-
-Skills exist on a spectrum from pure procedure to pure framing:
-
-| Level | Type | Example | Evolution Potential |
-|-------|------|---------|-------------------|
-| 1 | **Pure procedure** | "When X, do Y, output Z" | None — static behavior |
-| 2 | **Procedure + heuristics** | "When X, do Y, but prefer Z when in doubt" | Low — fixed heuristics |
-| 3 | **Procedure + judgment** | "When X, evaluate options by [criteria], choose best" | Medium — criteria guide novel decisions |
-| 4 | **Framing + procedure** | "Think about problems this way, then do Y" | High — framing affects all decisions |
-| 5 | **Pure framing** | "Change how you approach every interaction" | Highest — pervasive behavioral change |
-
-The most downloaded skills tend to cluster at levels 3-5. Pure procedures (level 1) are easy to write but do not differentiate — any agent can follow a procedure. Framing skills (levels 4-5) are hard to write but create persistent behavioral improvement.
-
-### How to Write Framing Skills
-
-The SkillDesignBook identifies three techniques for writing effective framing skills:
-
-**1. Use questions, not instructions**
-
-Instead of: "Always provide code examples."
-Write: "Before explaining a concept, ask yourself: would a code example make this clearer?"
-
-The question form forces the agent to exercise judgment rather than mechanically following a rule.
-
-**2. Define the identity, not the behavior**
-
-Instead of: "Write concise responses."
-Write: "You are an engineer who values other engineers' time."
-
-The identity form creates a coherent set of behaviors that extend beyond any single instruction.
-
-**3. Specify the evaluation function**
-
-Instead of: "Write good code."
-Write: "For every piece of code you write, evaluate: would a senior engineer at a top company approve this in code review?"
-
-The evaluation function gives the agent a way to check its own work, which is the foundation of self-improvement.
-
-## Pattern 2: Pick a Default and Explain Why
-
-Skills that evolve agents pick **strong defaults** — opinionated starting points that reduce decision entropy and provide a stable foundation for improvement.
-
-### The Evidence
-
-From `nextjs-expert` (8,000 downloads):
-
-> "Server-first: Components are Server Components by default. Only add 'use client' when you need hooks, browser APIs, or event listeners."
-
-This is a strong default with a clear rationale. It does not say "always use Server Components" — it says "start with Server Components, and here are the specific reasons to deviate."
-
-Another example, from `typescript-strict` (12,000 downloads):
-
-> "Enable strict mode. No exceptions. If a library doesn't have types, write a declaration file. The 10 minutes spent writing types saves hours of debugging."
-
-The default (strict mode) is chosen, and the reasoning is included (saves debugging time). The agent does not just follow the rule — it understands *why*, which lets it make appropriate exceptions when the reasoning does not apply.
-
-### Why Defaults Enable Evolution
-
-Strong defaults create a stable starting point from which improvements can be measured:
-
-```
-Without defaults:
-  Task → Agent chooses randomly from many approaches
-  → Outcome varies wildly
-  → No stable baseline to improve from
-  → Evolution impossible (no signal in the noise)
-
-With defaults:
-  Task → Agent starts with default approach
-  → Outcome is predictable (baseline)
-  → Deviations from default can be measured
-  → Improvements identified and solidified
-  → Default evolves over time
-```
-
-The `nextjs-expert` skill's "server-first" default gives the agent a clear starting position. When the agent encounters a case where the default does not work (e.g., a component that needs `useState`), it deviates with awareness. Over time, the agent builds up a catalog of "when to deviate from server-first" — and this catalog *is* evolution.
-
-### The Default-Deviation-Update Cycle
-
-The most effective default-bearing skills create a natural evolution cycle:
-
-1. **Default** — Start with the declared default
-2. **Deviation** — Encounter a case where the default fails
-3. **Recording** — Note the deviation and why it was necessary
-4. **Pattern detection** — After 3+ similar deviations, recognize a pattern
-5. **Update** — Refine the default to account for the pattern
-
-This cycle does not require a self-improving-agent meta skill. It happens naturally when a skill declares strong defaults — the agent's own experience creates the pressure to refine them.
-
-### How to Write Default-Bearing Skills
-
-**Rule: Every default must include its rationale.**
-
-Bad: "Use TypeScript."
-Good: "Use TypeScript. Static typing catches ~15% of bugs at compile time that would otherwise reach production."
-
-Bad: "Prefer functional components."
-Good: "Prefer functional components. Class components add lifecycle complexity without compensating benefits since React 16.8 hooks."
-
-The rationale serves two purposes:
-
-1. It lets the agent know *when the default does not apply* (when the rationale is irrelevant to the current situation)
-2. It gives the agent material to include in its `.learnings/` when recording deviations
-
-## Pattern 3: Define Identity by Exclusion
-
-Skills that say what they **are not** help agents know when to activate them — and more importantly, when to deactivate them. This is crucial for progressive disclosure and for preventing skills from interfering with each other.
-
-### The Evidence
-
-From `academic-deep-research` (17,000 downloads):
-
-> "This is an investigation framework, not a black-box API wrapper. You do not just call a search API and return results. You formulate hypotheses, design search strategies, evaluate sources for credibility, and synthesize findings into coherent analysis."
-
-From `code-review-pro` (17,000 downloads):
-
-> "You are a code reviewer, not a code rewriter. Point out issues and explain why they matter. Do not rewrite the code unless explicitly asked."
-
-From `creative-writer` (9,000 downloads):
-
-> "This is a creative writing assistant, not a grammar checker. Focus on narrative structure, voice, pacing, and emotional impact. Grammar issues are secondary unless they break comprehension."
-
-### Why Exclusion Enables Evolution
-
-Exclusion statements create **activation boundaries** — they define the space where a skill operates and the space where it does not. This is critical for evolution because:
-
-```
-Without exclusion:
-  Agent has 10 skills loaded
-  → Each skill tries to influence every interaction
-  → Skills conflict and interfere
-  → Agent behavior is unpredictable
-  → No clear signal for improvement
-
-With exclusion:
-  Agent has 10 skills loaded
-  → Each skill activates only in its defined domain
-  → Skills do not interfere
-  → Agent behavior is predictable within each domain
-  → Improvements in one domain do not break others
-```
-
-Exclusion also enables **progressive disclosure** — the technique where skills are loaded incrementally based on context rather than all at once. An agent that knows what a skill is *not* for can decide whether to activate it without loading the full skill instructions into context.
-
-### The Activation Boundary Matrix
-
-Effective exclusion creates a clear boundary matrix:
-
-| Skill | IS | IS NOT |
-|-------|----|--------|
-| `academic-deep-research` | Investigation framework | API wrapper |
-| `code-review-pro` | Code reviewer | Code rewriter |
-| `creative-writer` | Creative writing assistant | Grammar checker |
-| `nextjs-expert` | Next.js architecture guide | General React tutorial |
-| `self-improving-agent` | Meta-learning system | Task-specific optimizer |
-
-When multiple skills are loaded, the agent uses these boundaries to route requests to the appropriate skill. A request to "review this code" activates `code-review-pro`. A request to "rewrite this function" does not — because the skill explicitly says "not a code rewriter."
-
-### How to Write Exclusion Statements
-
-**Template:** "This is a [what it IS], not a [what people commonly mistake it for]."
-
-The exclusion must target a **common misconception**. Saying "this is a code reviewer, not a pizza delivery service" is technically true but useless — nobody would confuse a code reviewer with a pizza delivery service.
-
-Good exclusion statements target the **adjacent category** — the thing that is close enough to cause confusion:
-
-- Code reviewer ↔ code rewriter (adjacent)
-- Investigation framework ↔ API wrapper (adjacent)
-- Creative writing assistant ↔ grammar checker (adjacent)
-- Architecture guide ↔ general tutorial (adjacent)
-
-## Pattern 4: The Trigger-Procedure-Pitfall Structure
-
-Analysis of the top 1,000 ClawHub skills by download count reveals a dominant structural pattern. The most effective skills — measured by both download count and user ratings — share a four-part structure:
-
-### The Structure
-
-```
-┌──────────────────────────────────────────┐
-│  SKILL.md Structure                       │
-│                                          │
-│  1. WHEN TO USE (Trigger Conditions)      │
-│     - Specific situations that activate   │
-│       this skill                          │
-│     - Enables progressive disclosure      │
-│                                          │
-│  2. PROCEDURE (Step-by-Step)              │
-│     - Ordered instructions                │
-│     - Each step is concrete and testable  │
-│                                          │
-│  3. PITFALLS (Known Failure Modes)        │
-│     - What goes wrong and why             │
-│     - Root cause for each failure         │
-│     - This section is WHERE EVOLUTION     │
-│       HAPPENS — pitfalls get UPDATED      │
-│                                          │
-│  4. VERIFICATION (Success Criteria)       │
-│     - How to know the skill worked        │
-│     - Observable outcomes to check        │
-│                                          │
-└──────────────────────────────────────────┘
-```
-
-### Why Each Section Matters
-
-**Trigger Conditions** — This section makes progressive disclosure work. Without explicit triggers, every skill must be loaded into context all the time, wasting tokens. With triggers, the agent can match the current situation against trigger conditions and load only relevant skills.
-
-Example from `database-migration` (6,000 downloads):
-
-> **When to use:** When the user asks to modify database schema, add/remove columns, change indexes, or migrate data between tables. NOT for regular CRUD queries.
-
-**Procedure** — The step-by-step instructions. These are the most straightforward part and the most commonly written. The key quality criterion: each step must be concrete and independently testable.
-
-Example:
-
-> 1. Generate migration file with timestamp prefix
-> 2. Write UP migration (the change)
-> 3. Write DOWN migration (the rollback)
-> 4. Run migration in a test environment
-> 5. Verify schema matches expected state
-> 6. Run existing tests against new schema
-
-**Pitfalls** — This is where evolution happens. Pitfalls are catalogued failure modes — things that have gone wrong in the past, with root causes and mitigations. This section grows over time as new failure modes are discovered.
-
-Example:
-
-> **Pitfall: Data loss on column rename**
-> Renaming a column with `ALTER TABLE RENAME COLUMN` works on PostgreSQL 9.2+ but silently drops data on older MySQL versions. Always check database version first. If MySQL < 8.0, use the add-copy-drop pattern instead of rename.
->
-> **Pitfall: Migration ordering in team environments**
-> When multiple developers create migrations simultaneously, timestamp prefixes can collide. Use `generate-migration --check-conflicts` to detect overlapping timestamps before committing.
-
-**Verification** — How to know the skill worked. This section provides observable outcomes that the agent (or the user) can check. Without verification, there is no feedback signal — and without feedback, there is no evolution.
-
-Example:
-
-> - [ ] Migration ran without errors
-> - [ ] Schema diff shows exactly the expected changes
-> - [ ] All existing tests pass
-> - [ ] Rollback (DOWN migration) restores the previous schema exactly
-
-### The Pitfalls Section Is the Evolution Engine
-
-Of the four sections, the Pitfalls section is the most important for evolution, because it is the only section that naturally grows.
-
-Triggers do not change — the situations that activate a database migration skill are stable. Procedures change rarely — the steps to create a migration are well-established. Verification changes occasionally — new test suites might be added.
-
-But pitfalls grow continuously. Every time the skill encounters a new failure mode, it gets recorded:
-
-```
-Pitfalls section over time:
-
-v1.0 (initial):
-  - Pitfall: Column rename data loss on old MySQL
-
-v1.1 (after 3 months):
-  - Pitfall: Column rename data loss on old MySQL
-  - Pitfall: Migration ordering in team environments
-  - Pitfall: Foreign key constraints block column type changes
-
-v2.0 (after 6 months):
-  - Pitfall: Column rename data loss on old MySQL
-  - Pitfall: Migration ordering in team environments
-  - Pitfall: Foreign key constraints block column type changes
-  - Pitfall: Enum type changes require custom migration on PostgreSQL
-  - Pitfall: Concurrent migrations cause deadlocks in high-traffic tables
-  - Pitfall: Large table migrations need batch processing to avoid locks
-  - Pitfall: Schema cache invalidation required after migration on Rails
-```
-
-This growing pitfall catalog is a form of evolution. The skill becomes more robust with each new entry, because the agent learns to avoid known failure modes before they occur.
-
-### Correlation with Download Success
-
-The top 1,000 skills analysis reveals a strong correlation between structure completeness and download success:
-
-| Structure Completeness | Avg. Downloads | % of Top 1,000 |
-|-----------------------|---------------|----------------|
-| All 4 sections (T+P+Pi+V) | 12,400 | 34% |
-| 3 sections (missing 1) | 6,800 | 28% |
-| 2 sections (Trigger + Procedure only) | 3,200 | 22% |
-| 1 section (Procedure only) | 1,100 | 16% |
-
-Skills with all four sections average 11× more downloads than procedure-only skills. This is partly a selection effect (popular skills tend to be better written), but the pattern holds even when controlling for skill age and category.
-
-## Pattern 5: Skills That Update Themselves
-
-The most powerful pattern for enabling evolution: skills with a Pitfalls section that the agent can **append to** when it discovers new failure modes.
-
-### The Minimal Self-Evolution Unit
-
-A skill that updates its own Pitfalls section is the simplest possible self-evolving system:
-
-```
-┌──────────────────────────────────────┐
-│  Task execution                       │
-│  ↓                                   │
-│  Failure encountered                  │
-│  ↓                                   │
-│  Root cause identified                │
-│  ↓                                   │
-│  New pitfall entry written            │
-│  to SKILL.md Pitfalls section         │
-│  ↓                                   │
-│  Next time: agent reads               │
-│  updated Pitfalls, avoids             │
-│  the failure                          │
-└──────────────────────────────────────┘
-```
-
-This is simpler than the full 6-phase self-improving-agent cycle (Chapter 5). There is no experiment design, no metric comparison, no heartbeat-driven promotion. The agent simply appends a new entry to a list. Yet this minimal mechanism produces real evolution — the skill gets better at its job over time.
-
-### The Append-Only Rule
-
-Self-updating skills follow an **append-only** rule for the Pitfalls section:
-
-1. **Never modify** existing pitfall entries (they represent validated experience)
-2. **Never delete** pitfall entries (even if they seem redundant)
-3. **Only append** new entries at the end of the section
-4. **Always include** the date, context, and root cause
-
-This rule prevents the agent from "optimizing" the Pitfalls section by removing entries — which would be a form of forgetting. The append-only constraint ensures that knowledge only accumulates, never erodes.
-
-### Example: A Self-Updating Skill in Action
-
-Consider a `docker-deployment` skill with an initial Pitfalls section:
-
-**Initial state (v1.0):**
-
-```markdown
-### Pitfalls
-
-- **Port conflicts:** Check that the target port is not already in use before
-  starting a container. Use `docker port` or `lsof -i :PORT` to verify.
-```
-
-**After Week 1:** The agent deploys a container that works fine locally but fails in CI because the Docker socket is not mounted:
-
-```markdown
-### Pitfalls
-
-- **Port conflicts:** Check that the target port is not already in use before
-  starting a container. Use `docker port` or `lsof -i :PORT` to verify.
-- **Docker socket in CI (2026-03-22):** CI environments often do not mount the
-  Docker socket by default. Check for `/var/run/docker.sock` before running
-  Docker commands. If missing, use Docker-in-Docker (dind) service or
-  configure the CI runner to mount the socket.
-```
-
-**After Week 3:** A multi-stage build fails because the `COPY --from` stage name was misspelled:
-
-```markdown
-### Pitfalls
-
-- **Port conflicts:** Check that the target port is not already in use before
-  starting a container. Use `docker port` or `lsof -i :PORT` to verify.
-- **Docker socket in CI (2026-03-22):** CI environments often do not mount the
-  Docker socket by default. Check for `/var/run/docker.sock` before running
-  Docker commands. If missing, use Docker-in-Docker (dind) service or
-  configure the CI runner to mount the socket.
-- **Multi-stage COPY typos (2026-04-05):** Typos in `COPY --from=stage_name`
-  are silent failures — Docker will not error, it will just produce an empty
-  copy. Always verify stage names match exactly. Use `docker build --target`
-  to test individual stages.
-```
-
-Each entry makes the skill more robust. An agent running this skill after Week 3 will check for port conflicts, verify the Docker socket, and validate multi-stage build stage names — all without being explicitly told to for the current task.
-
-### When Self-Updating Skills Are Not Enough
-
-Self-updating Pitfalls sections work for incremental improvements to existing skills. They do not work for:
-
-- **Structural changes** — Rewriting the Procedure section requires judgment about whether the new procedure is better, not just different
-- **Cross-skill improvements** — Learning that affects multiple skills requires coordination (this is what the self-improving-agent meta skill handles)
-- **Behavioral changes** — Changing how the agent thinks (Pattern 1) cannot be captured as a pitfall entry
-
-For these cases, the full 6-phase self-improving-agent cycle (Chapter 5) is necessary. Self-updating Pitfalls are the minimal evolution mechanism; they handle the common case of "avoid known failures."
-
-## Pattern 6: The Description Is the Activation Function
-
-This pattern is the most underappreciated finding from the SkillDesignBook analysis. The skill description — the short text that appears in ClawHub search results and in the agent's skill index — is the single most important factor in determining whether a skill gets used.
-
-### The Finding
-
-From the SkillDesignBook:
-
-> "If a skill doesn't trigger, the problem is almost never the instructions — it's the description. We analyzed 500 skills with low activation rates despite high install counts. In 89% of cases, rewriting the description fixed the problem."
-
-The description is the activation function because it is what the agent (and the skill engine) uses to decide whether to load the full skill into context. A skill with perfect instructions but a bad description will never fire.
-
-### Good vs. Bad Descriptions
-
-**Bad descriptions** are vague, generic, or focused on implementation details:
-
-| Skill | Bad Description | Activation Rate |
-|-------|----------------|----------------|
-| `database-migration` | "A skill for database operations" | 12% |
-| `code-review-pro` | "Reviews code using best practices" | 18% |
-| `academic-deep-research` | "Helps with research tasks" | 15% |
-| `docker-deployment` | "Deploys applications using Docker" | 21% |
-
-**Good descriptions** are specific, situation-focused, and include trigger words:
-
-| Skill | Good Description | Activation Rate |
-|-------|-----------------|----------------|
-| `database-migration` | "When you need to change database schema: add/remove columns, modify indexes, migrate data. Handles PostgreSQL, MySQL, SQLite." | 67% |
-| `code-review-pro` | "When reviewing a pull request or code diff: identifies bugs, security issues, performance problems, and style violations. Points out issues without rewriting." | 71% |
-| `academic-deep-research` | "When investigating a research question: formulates hypotheses, designs search strategies, evaluates source credibility, synthesizes findings into structured analysis." | 63% |
-| `docker-deployment` | "When deploying or containerizing an application: writes Dockerfiles, configures compose files, handles multi-stage builds, manages container networking." | 69% |
-
-### Why Activation Rate Matters for Evolution
-
-A skill that does not activate cannot evolve. If the agent never loads the skill's instructions, it never encounters the Pitfalls section, never appends new entries, and never improves.
-
-The activation rate is the bottleneck for evolution:
-
-```
-Evolution rate = Activation rate × Failure rate × Learning rate
-
-If activation rate = 12% (bad description):
-  Evolution rate = 0.12 × 0.15 × 0.80 = 1.4% of interactions contribute
-
-If activation rate = 67% (good description):
-  Evolution rate = 0.67 × 0.15 × 0.80 = 8.0% of interactions contribute
-
-→ 5.7× faster evolution with a good description
-```
-
-### The Description Formula
-
-The SkillDesignBook prescribes a formula for effective skill descriptions:
-
-```
-[When/situation] + [what the skill does] + [specific capabilities] + [scope limits]
-```
-
-**Components:**
-
-| Component | Purpose | Example |
-|-----------|---------|---------|
-| **When/situation** | Trigger words the agent can match | "When deploying to production" |
-| **What it does** | Core function in one clause | "containerizes and deploys applications" |
-| **Specific capabilities** | Concrete things it can do | "Dockerfiles, compose, multi-stage, networking" |
-| **Scope limits** | What it does not do (from Pattern 3) | "Not for local development environments" |
-
-**Full example:**
-
-> "When deploying or containerizing an application for production: writes Dockerfiles, configures Docker Compose, handles multi-stage builds, manages container networking and volumes. Not for local development environments — use `dev-environment` skill instead."
-
-This description hits all four components and includes a cross-reference to a related skill — helping the agent route requests correctly even when the boundaries are ambiguous.
-
-### Activation Patterns by Keyword
-
-Analysis of 10,000 skill activations reveals which keywords in descriptions most reliably trigger activation:
-
-| Keyword Pattern | Activation Lift | Example |
-|----------------|----------------|---------|
-| "When [situation]" | +45% | "When reviewing a pull request" |
-| "If [condition]" | +38% | "If the user asks about deployment" |
-| Specific technology names | +32% | "PostgreSQL, Redis, Docker" |
-| Action verbs | +28% | "writes, configures, deploys, analyzes" |
-| "Not for [exclusion]" | +22% | "Not for local development" |
-| Vague nouns | -15% | "operations, tasks, things" |
-| Implementation details | -25% | "uses REST API, written in Python" |
-
-The strongest activation lift comes from situational triggers ("When...", "If...") combined with specific technology names. The weakest comes from vague language and implementation details that are irrelevant to the user's task.
-
-## Putting It All Together: The Evolutionary Skill Template
-
-Combining all six patterns, here is a template for writing skills that enable agent evolution:
-
-```markdown
-# [Skill Name]
-
-## Description
-<!-- Pattern 6: The description is the activation function -->
-When [specific situation], [what this skill does]: [specific capabilities].
-[What this skill is NOT — Pattern 3: Identity by exclusion].
-
-## Identity
-<!-- Pattern 1: Change how the agent thinks -->
-[Question-form framing that changes the agent's approach]
-[Identity definition, not behavior specification]
-
-## Defaults
-<!-- Pattern 2: Pick a default and explain why -->
-- [Default 1]: [Rationale]
-- [Default 2]: [Rationale]
-- [Default 3]: [Rationale]
-
-## When to Use
-<!-- Pattern 4: Trigger conditions -->
-- [Trigger condition 1]
-- [Trigger condition 2]
-- [Trigger condition 3]
-
-## Procedure
-<!-- Pattern 4: Step-by-step -->
-1. [Step 1]
-2. [Step 2]
-3. [Step 3]
-
-## Pitfalls
-<!-- Pattern 4 + Pattern 5: Known failure modes (APPEND-ONLY) -->
-- **[Pitfall name] ([date]):** [Description, root cause, mitigation]
-
-## Verification
-<!-- Pattern 4: Success criteria -->
-- [ ] [Observable outcome 1]
-- [ ] [Observable outcome 2]
-- [ ] [Observable outcome 3]
-```
-
-### Why This Template Enables Evolution
-
-Each section maps to an evolution mechanism:
-
-| Section | Evolution Mechanism |
-|---------|-------------------|
-| Description | Controls activation rate (Pattern 6) — determines how often the skill fires |
-| Identity | Changes framing (Pattern 1) — creates compound behavioral improvement |
-| Defaults | Provides stable baseline (Pattern 2) — enables deviation tracking |
-| When to Use | Enables progressive disclosure — prevents skill interference |
-| Procedure | Core instructions — stable, changes slowly |
-| Pitfalls | **Primary evolution surface** (Pattern 5) — grows with experience |
-| Verification | Feedback signal — tells the agent whether the skill worked |
-
-The Pitfalls section is the primary evolution surface. It is the one section that is explicitly designed to grow. But the other sections support evolution indirectly: the Description determines whether the skill activates, the Identity determines how the agent applies it, the Defaults provide a baseline to improve from, and the Verification provides the feedback signal that drives improvement.
-
-### The Skill Evolution Lifecycle
-
-A well-designed skill goes through a predictable lifecycle:
-
-```
-Stage 1: Birth (v1.0)
-  - Description, Identity, Defaults, Procedure, Verification written
-  - Pitfalls section has 1-3 entries from the author's experience
-  - Activation rate depends on description quality
-
-Stage 2: Early growth (v1.x)
-  - Pitfalls section grows to 5-10 entries
-  - Author and early users contribute failure modes
-  - Procedure may get minor refinements
-  - Description may be rewritten for better activation
-
-Stage 3: Maturity (v2.0+)
-  - Pitfalls section has 15+ entries covering most common failures
-  - Procedure is stable and well-tested
-  - Defaults have been refined based on community experience
-  - Activation rate has been optimized
-  - The skill reliably prevents known failures
-
-Stage 4: Specialization (forks)
-  - The skill is forked for specific domains (e.g., docker-deployment-aws,
-    docker-deployment-gcp)
-  - Each fork evolves its own Pitfalls section
-  - The parent skill may absorb universal pitfalls from forks
-```
-
-This lifecycle mirrors the evolution of human expertise. A junior engineer knows the procedure. A senior engineer knows the pitfalls. A staff engineer knows when the procedure does not apply. The skill template captures all three levels of expertise — and the Pitfalls section is the mechanism by which the skill (and the agents using it) progresses from junior to senior.
-
-## Conclusion: Skills as the Unit of Agent Evolution
-
-The six patterns in this chapter describe what makes skills capable of driving agent evolution:
-
-1. **Framing over procedure** — Skills that change how the agent thinks create compound improvements
-2. **Strong defaults** — Skills with opinionated starting points create measurable baselines
-3. **Identity by exclusion** — Skills that define their boundaries enable progressive disclosure
-4. **Trigger-Procedure-Pitfall-Verification structure** — The four-part structure creates natural evolution surfaces
-5. **Self-updating Pitfalls** — The minimal self-evolution unit: append failure modes as they are discovered
-6. **Description as activation function** — If a skill does not trigger, it cannot evolve
-
-Together, these patterns transform skills from static instruction sets into evolving knowledge repositories. A skill written with all six patterns does not just help the agent do a task — it helps the agent get *better* at the task over time. And when thousands of agents use the same skill, the collective experience of all of them feeds back into the Pitfalls section, creating a form of collective intelligence.
-
-This is the fundamental insight: **the skill is the unit of agent evolution**. Not the model. Not the prompt. Not the memory system. The skill — a Markdown file with triggers, procedures, pitfalls, and verification — is the thing that captures experience, grows with use, and transfers learning across agents.
-
-The npm ecosystem proved that reusable code packages could accelerate software development by orders of magnitude. The ClawHub/SkillHub ecosystem is testing whether reusable behavior packages — skills — can accelerate agent evolution in the same way.
+Six patterns. Each solves a specific failure mode in agent self-improvement.
 
 ---
 
-**Next: [Chapter 8 — Manus: Context Engineering as Evolution](08_manus.md)** — How Manus uses context window management as its primary evolution mechanism.
+## Pattern 1: The Heartbeat Pattern
+
+**Source:** `proactive-agent` skill on ClawHub (1,200+ installs)
+
+**The problem:** Agents are reactive. They respond to user messages. But memory and workspace state can become stale between interactions — files get outdated, context drifts, important changes go unnoticed.
+
+**The solution:** A periodic self-check that reviews the agent's entire workspace, identifies gaps or stale information, and triggers updates proactively.
+
+### How It Works
+
+The proactive-agent skill installs a `HEARTBEAT.md` file that the agent is instructed to re-read at regular intervals:
+
+```markdown
+<!-- HEARTBEAT.md -->
+# Heartbeat Protocol
+
+## Trigger
+Every 10 minutes of active session time, OR at session start.
+
+## Procedure
+1. Read all workspace files: MEMORY.md, USER.md, TOOLS.md, SOUL.md
+2. Read recent conversation history (last 20 messages)
+3. Check each file against current reality:
+   - Is any information stale? (tools changed, preferences shifted)
+   - Is any information missing? (new tool discovered, new pattern observed)
+   - Are there contradictions between files?
+4. For each gap found:
+   - If minor: update the relevant file directly
+   - If major: flag for user confirmation before updating
+5. Log the heartbeat result to SESSION-STATE.md
+```
+
+### Implementation Details
+
+The heartbeat is not a cron job — there is no background scheduler. Instead, the skill injects a trigger condition into the agent's system prompt:
+
+```
+After every 10 tool calls, check: have you reviewed HEARTBEAT.md
+in this session? If not, do so now. If you have, check whether
+10 minutes have elapsed since the last heartbeat. If so, run the
+heartbeat protocol.
+```
+
+This is a soft trigger — the agent may skip it if deep in a complex task. But in practice, the self-evaluation checkpoint (Pattern 3 in Hermes, every 15 tool calls) provides a natural point to run the heartbeat.
+
+### What the Heartbeat Catches
+
+| Stale State | How Detected | Action |
+|-------------|-------------|--------|
+| MEMORY.md lists a tool that was removed | Tool inventory check against available tools | Remove stale entry |
+| USER.md says "prefers npm" but user switched to pnpm | Recent conversation shows `pnpm` commands | Update preference |
+| TOOLS.md missing a newly installed CLI tool | `which` or `command -v` checks | Add tool entry |
+| SOUL.md personality traits contradict recent behavior | Conversation analysis shows drift | Flag for user review |
+
+### Why Cron-Like, Not Event-Driven
+
+An event-driven approach (trigger on every file change, every tool install) would be more precise but creates two problems:
+
+1. **Token cost:** Checking after every event is expensive. A 10-minute heartbeat amortizes the cost across many events.
+2. **Noise:** Most individual events don't warrant a memory update. The heartbeat batches them, letting the agent identify *patterns* rather than reacting to individual changes.
+
+The heartbeat is a garbage collector for agent state — it runs periodically, identifies dead references, and cleans them up.
+
+---
+
+## Pattern 2: The WAL (Write-Ahead Logging) Pattern
+
+**Source:** `proactive-agent` skill, `SESSION-STATE.md` protocol
+
+**The problem:** LLM context compaction happens unpredictably. When the context window fills, the system summarizes older conversation turns — and that summary loses detail. If the agent hasn't externalized its current state to disk *before* compaction fires, that state is gone.
+
+**The solution:** Write critical state to a file *before* generating the response, not after. The file acts as a write-ahead log — a recovery point that survives compaction.
+
+### The Database Analogy
+
+In databases, a Write-Ahead Log (WAL) ensures durability: the transaction is written to the log *before* it modifies the actual data. If the system crashes mid-operation, the log enables recovery.
+
+For agents, the "crash" is context compaction. The "log" is `SESSION-STATE.md`.
+
+```
+Without WAL:
+  Agent works on complex task (20 tool calls)
+  → Context fills up
+  → Compaction fires: summarizes everything into 500 tokens
+  → Agent "forgets" intermediate reasoning, partial results, current strategy
+  → Agent restarts the task from scratch or makes inconsistent decisions
+
+With WAL:
+  Agent works on complex task
+  → Every 5 tool calls: writes current state to SESSION-STATE.md
+    - What I'm trying to accomplish
+    - What I've done so far
+    - What I plan to do next
+    - Key decisions made and why
+  → Context fills up
+  → Compaction fires: summarizes conversation
+  → Agent reads SESSION-STATE.md: full state recovered
+  → Agent continues seamlessly
+```
+
+### SESSION-STATE.md Format
+
+```markdown
+<!-- SESSION-STATE.md — written by agent, read at compaction recovery -->
+# Session State
+
+## Current Objective
+Migrating the API from Express to Fastify. User wants zero downtime.
+
+## Progress
+- [x] Audit all Express routes (47 routes found)
+- [x] Set up Fastify project structure
+- [x] Migrate auth middleware (passport → fastify-passport)
+- [ ] Migrate route handlers (12/47 done)
+- [ ] Update tests
+- [ ] Deploy behind feature flag
+
+## Key Decisions
+- Using fastify-express compatibility layer for gradual migration
+- NOT rewriting route handlers — wrapping them with fastify-express plugin
+- User explicitly said: keep Express error handling patterns
+
+## Blockers
+- Route /api/webhooks/stripe uses req.rawBody — need to verify
+  Fastify equivalent before migrating
+
+## Last Updated
+After migrating routes 1-12 (auth, users, teams).
+Next: routes 13-24 (projects, deployments).
+```
+
+### When to Write
+
+The critical insight: write *before* the response, not after. The sequence is:
+
+```
+1. Agent receives user message or tool result
+2. Agent updates SESSION-STATE.md with current state    ← WAL write
+3. Agent generates response / executes next tool call
+4. If compaction happens during step 3, state is safe
+```
+
+Writing after the response is too late — compaction may have already fired during response generation.
+
+### Codex Parallel
+
+OpenAI Codex's `POST /responses/compact` endpoint returns `encrypted_content` — a compressed representation of the conversation state. This is a server-side WAL: the state is preserved in the API's storage rather than on the agent's filesystem. But it loses 86.3% of information (see Chapter 9). The filesystem WAL preserves everything the agent writes.
+
+The advantage of the filesystem approach: the agent controls *what* is preserved. A 200-line `SESSION-STATE.md` can capture the 10 most important facts from a 50,000-token conversation. The API's compaction algorithm doesn't have that judgment.
+
+---
+
+## Pattern 3: The Solidification Pipeline
+
+**Source:** `self-improving-agent` skill on ClawHub (OpenClaw ecosystem)
+
+**The problem:** Agents learn things during sessions — a useful command, a gotcha about a library, a user preference. But not every observation deserves permanent storage. Writing every learning to permanent memory creates noise, bloat, and contradictions.
+
+**The solution:** A two-stage pipeline. Accumulate observations in a staging area (`.learnings/`). Promote to permanent files only when evidence accumulates past a threshold.
+
+### The Pipeline
+
+```
+Session observations
+        │
+        ▼
+┌──────────────────┐
+│  .learnings/     │  Stage 1: Raw observations
+│  ├── 2026-04-15  │  - One file per session
+│  ├── 2026-04-16  │  - Everything goes here
+│  ├── 2026-04-17  │  - No quality filter
+│  └── 2026-04-19  │
+└────────┬─────────┘
+         │
+         │  Threshold check: 3+ related observations
+         │
+         ▼
+┌──────────────────┐
+│  Permanent files  │  Stage 2: Proven knowledge
+│  ├── AGENTS.md   │  - Build commands, conventions
+│  ├── TOOLS.md    │  - Available tools, usage patterns
+│  └── SOUL.md     │  - Agent personality, communication style
+└──────────────────┘
+```
+
+### Threshold Logic
+
+The promotion threshold is the critical design parameter. Too low → noise. Too high → useful knowledge never gets promoted.
+
+The `self-improving-agent` uses a **3-observation threshold**:
+
+```
+Observation 1 (April 15):
+  "User corrected me: use `pnpm` not `npm` for this project"
+  → Written to .learnings/2026-04-15.md
+  → NOT promoted yet (could be one-time preference)
+
+Observation 2 (April 16):
+  "User's CI pipeline uses pnpm. Lock file is pnpm-lock.yaml."
+  → Written to .learnings/2026-04-16.md
+  → NOT promoted yet (2 observations, threshold is 3)
+
+Observation 3 (April 17):
+  "User asked me to add a dependency and I used npm — user corrected
+   me again. This is clearly a project-wide convention."
+  → Written to .learnings/2026-04-17.md
+  → PROMOTED: Add to AGENTS.md: "Package manager: pnpm (not npm)"
+```
+
+### Promotion Categories
+
+| Destination | What Gets Promoted | Example |
+|-------------|-------------------|---------|
+| `AGENTS.md` | Build commands, test commands, project structure, coding conventions | "Run tests: `pnpm test --coverage`" |
+| `TOOLS.md` | Available tools, usage patterns, tool-specific gotchas | "ffmpeg is installed; use `-c:v libx264` for H.264" |
+| `SOUL.md` | Communication style, personality traits, response preferences | "User prefers terse responses, no emojis" |
+
+### Why Not Promote Immediately
+
+Immediate promotion has three failure modes that the solidification pipeline avoids:
+
+1. **Transient context:** The user says "use npm for this" in one conversation but has pnpm everywhere else. Promoting immediately captures the exception, not the rule.
+
+2. **Contradictory observations:** On Monday the user wants verbose explanations. On Tuesday they want terse responses. With immediate promotion, the memory oscillates. With the pipeline, the agent sees both observations and can identify the pattern (verbose for learning, terse for routine tasks).
+
+3. **Memory bloat:** A 200-line AGENTS.md is useful. A 2,000-line AGENTS.md wastes context tokens and confuses the model. The threshold ensures only repeatedly validated knowledge consumes permanent context budget.
+
+### Dreaming as Batch Solidification
+
+OpenClaw's **Dreaming** process (Chapter 5) is the automated version of this pipeline. During idle periods, Dreaming reviews accumulated daily notes and runs the promotion logic:
+
+```
+Dreaming process:
+  1. Read all .learnings/ files from the past 7 days
+  2. Cluster related observations (semantic similarity)
+  3. For each cluster with 3+ observations:
+     a. Synthesize into a single statement
+     b. Check against existing permanent files for contradictions
+     c. If contradiction: resolve using most recent evidence
+     d. If new: append to appropriate permanent file
+  4. Prune .learnings/ files older than 30 days
+```
+
+Dreaming is a garbage collector + promoter + deduplicator in one pass.
+
+---
+
+## Pattern 4: The Genome/Capsule Pattern
+
+**Source:** `capability-evolver` skill on ClawHub
+
+**The problem:** Skills describe procedures. But agents also discover reusable *patterns* (code snippets, configurations, heuristics) and *fixes* (specific solutions to specific bugs). These don't fit the SKILL.md format.
+
+**The solution:** A structured evolution system with three artifact types: genes (reusable patterns), capsules (proven fixes), and an event log (audit trail). Parent IDs create a traceable evolution tree.
+
+### The Three Artifacts
+
+```
+┌─────────────────────────────────────────────┐
+│  genes.json                                  │
+│  Reusable patterns that work across contexts │
+│                                              │
+│  {                                           │
+│    "id": "gene_017",                         │
+│    "parent_id": "gene_003",                  │
+│    "pattern": "retry-with-backoff",          │
+│    "code": "async function retry(fn, ...",   │
+│    "contexts_used": 14,                      │
+│    "success_rate": 0.93                      │
+│  }                                           │
+├─────────────────────────────────────────────┤
+│  capsules.json                               │
+│  Proven fixes for specific failure modes     │
+│                                              │
+│  {                                           │
+│    "id": "cap_042",                          │
+│    "parent_id": null,                        │
+│    "trigger": "ECONNREFUSED on localhost",   │
+│    "fix": "Check if service is running...",  │
+│    "verified": true,                         │
+│    "times_applied": 7                        │
+│  }                                           │
+├─────────────────────────────────────────────┤
+│  events.jsonl                                │
+│  Append-only audit trail                     │
+│                                              │
+│  {"ts":"...", "type":"gene_created", ...}    │
+│  {"ts":"...", "type":"capsule_applied", ...} │
+│  {"ts":"...", "type":"gene_mutated", ...}    │
+└─────────────────────────────────────────────┘
+```
+
+### The Evolution Tree
+
+The `parent_id` field creates a traceable lineage:
+
+```
+gene_001: "basic-retry"
+  └── gene_003: "retry-with-backoff" (added exponential backoff)
+        └── gene_017: "retry-with-backoff-and-jitter" (added jitter)
+              └── gene_024: "retry-with-circuit-breaker" (added failure threshold)
+```
+
+Each mutation is a new gene with a link to its parent. The events log records *when* and *why* each mutation occurred:
+
+```jsonl
+{"ts":"2026-03-12T14:30:00Z","type":"gene_mutated","gene_id":"gene_017","parent_id":"gene_003","reason":"Added jitter after observing thundering herd in retry storms","session":"sess_abc"}
+{"ts":"2026-03-19T09:15:00Z","type":"gene_mutated","gene_id":"gene_024","parent_id":"gene_017","reason":"Added circuit breaker after 3 sessions with cascading retry failures","session":"sess_def"}
+```
+
+### Genes vs. Skills vs. Capsules
+
+| Artifact | Granularity | Example | Lifetime |
+|----------|------------|---------|----------|
+| Skill (SKILL.md) | Full procedure (20+ steps) | "Deploy to Kubernetes" | Long (months) |
+| Gene (genes.json) | Reusable pattern (1-10 lines) | "Retry with backoff" | Long, evolves via mutation |
+| Capsule (capsules.json) | Specific fix (1-5 lines) | "ECONNREFUSED → check port" | Medium (until root cause resolved) |
+
+Skills are *what to do*. Genes are *how to do it well*. Capsules are *what to do when it breaks*.
+
+### Security Concern
+
+The `capability-evolver` skill has a significant security gap: in early versions, genes could contain arbitrary code that the agent executes. Production deployments should add:
+
+1. **Sandboxing:** Execute gene code in an isolated environment
+2. **Git tracking:** Every gene mutation is a commit, reviewable by humans
+3. **Approval gates:** Genes above a complexity threshold require human approval
+4. **Rate limiting:** Maximum N gene mutations per session
+
+The audit trail (events.jsonl) provides forensics but not prevention. Defense in depth is required.
+
+---
+
+## Pattern 5: Progressive Disclosure for Skill Loading
+
+**Source:** Hermes Agent, Claude Code Agent Skills system
+
+**The problem:** A mature agent has 50-200+ skills. Loading all of them into context wastes tokens and confuses the model. The model's attention dilutes over irrelevant skill text, and it may hallucinate tool calls from skills that aren't relevant to the current task.
+
+**The solution:** Three-level progressive disclosure. Load only names and descriptions by default. Fetch full content only when the agent determines a skill is relevant.
+
+### The Three Levels
+
+```
+Level 0 — Catalog (always in context)
+┌──────────────────────────────────────────────────┐
+│  Available skills:                                │
+│  - git-interactive-rebase: Clean up commit        │
+│    history with squash, fixup, reword, reorder.   │
+│  - kubernetes-pod-debugging: Diagnose pod          │
+│    failures — CrashLoopBackOff, OOMKilled, etc.   │
+│  - python-project-setup: Initialize Python project │
+│    with pyproject.toml, ruff, pytest, CI.          │
+│  ... (200 more entries)                            │
+│                                                    │
+│  ~100 tokens per entry = ~20K tokens for 200 skills│
+│  With FTS5 search: ~10 relevant × 100 = 1K tokens │
+└──────────────────────────────────────────────────┘
+
+Level 1 — Full skill (loaded on demand)
+┌──────────────────────────────────────────────────┐
+│  skill_view("kubernetes-pod-debugging")           │
+│                                                    │
+│  Returns: When to Use, Quick Reference, Procedure, │
+│  Pitfalls, Verification                            │
+│  ~500-1500 tokens                                  │
+└──────────────────────────────────────────────────┘
+
+Level 2 — Section (loaded for follow-up detail)
+┌──────────────────────────────────────────────────┐
+│  skill_view("kubernetes-pod-debugging", "pitfalls")│
+│                                                    │
+│  Returns: Only the Pitfalls section                │
+│  ~100-300 tokens                                   │
+└──────────────────────────────────────────────────┘
+```
+
+### Why Progressive Disclosure Matters
+
+The token economics are dramatic:
+
+```
+200 skills × 800 tokens average = 160,000 tokens (naive loading)
+200 skills × 100 tokens (Level 0) = 20,000 tokens (catalog only)
+FTS5 narrows to 10 → 1,000 tokens + 1 activated = 1,800 tokens
+
+Savings: 98.9% vs. naive loading
+```
+
+But the bigger problem isn't tokens — it's **attention dilution**. When the model sees 160K tokens of skill text, its attention over the user's actual question degrades. The model may follow instructions from an irrelevant skill, hallucinate tool calls mentioned in a different skill's procedure, or lose track of the conversation buried under skill text.
+
+Progressive disclosure keeps the model focused: it sees a short catalog, decides which skill is relevant, then loads only that skill's content.
+
+### The Description Problem (Revisited)
+
+From the Hermes SkillDesignBook:
+
+> *"If a skill doesn't trigger, the problem is almost never the instructions — it's the description."*
+
+The Level 0 catalog is the skill's entire search surface. If the description doesn't match what users actually say, the skill is invisible:
+
+```
+Bad description:
+  "Kubernetes management"
+  → Doesn't match: "my pod keeps crashing"
+
+Good description:
+  "Diagnose and fix common Kubernetes pod failures including
+   CrashLoopBackOff, ImagePullBackOff, OOMKilled, and pending pods"
+  → Matches: "my pod keeps crashing" (CrashLoopBackOff)
+  → Matches: "can't pull the image" (ImagePullBackOff)
+  → Matches: "pod killed for memory" (OOMKilled)
+```
+
+The description should include:
+- Technical terms for the problem
+- Natural language phrases users actually say
+- Specific symptoms and error messages
+- 2-4 sentences, under 100 tokens
+
+### Claude Code's Variant
+
+Claude Code implements progressive disclosure through its Agent Skills system with a slightly different architecture:
+
+```
+User message arrives
+  ↓
+Match against skill index (name + description fields only)
+  ↓
+0 matches → No skills loaded (saves all skill tokens)
+1-3 matches → Full skill content loaded into context
+4+ matches → Top 3 by relevance score loaded
+```
+
+The matching is pure text matching against `name` and `description` — the skill body is never searched for activation. This reinforces the description-first principle: if the skill's name and description don't match the user's intent, the skill's instructions are irrelevant because they'll never be seen.
+
+---
+
+## Pattern 6: The Self-Verification Loop
+
+**Source:** Devin 2.2 (February 2026)
+
+**The problem:** Agents generate plausible output that may be wrong. Traditional CI/CD catches errors after submission. But by then, the context of *why* the code was written is gone — the agent has moved on or the session has ended.
+
+**The solution:** The agent reviews its own output before submitting, catches issues, fixes them, and verifies the fix — all within the same session, while context is still fresh.
+
+### Devin's Loop
+
+Devin 2.2 introduced systematic self-verification as a core workflow step, not an optional add-on:
+
+```
+┌────────────────┐
+│  1. Plan        │  Break task into steps
+└───────┬────────┘
+        │
+        ▼
+┌────────────────┐
+│  2. Implement   │  Write code in full Linux sandbox
+└───────┬────────┘
+        │
+        ▼
+┌────────────────┐
+│  3. Self-Review │  Read own diff, check for issues:
+│                 │  - Logic errors
+│                 │  - Missing edge cases
+│                 │  - Style violations
+│                 │  - Security issues
+└───────┬────────┘
+        │
+   Issues found?
+   ┌────┴────┐
+   │ Yes     │ No
+   ▼         ▼
+┌────────┐  ┌──────────────────┐
+│ 4. Fix │  │ 5. Run tests     │
+└───┬────┘  └───────┬──────────┘
+    │               │
+    └───────────────┤
+                    │
+               Tests pass?
+               ┌────┴────┐
+               │ Yes     │ No → back to Fix
+               ▼         │
+        ┌─────────────┐  │
+        │ 6. Visual    │  │
+        │    verify    │◄─┘
+        │    (desktop) │
+        └──────┬──────┘
+               │
+               ▼
+        ┌─────────────┐
+        │ 7. Send      │  Screen recording of tests
+        │    recording │  attached to PR for review
+        │    to user   │
+        └─────────────┘
+```
+
+### Desktop Verification
+
+Devin has full Linux desktop access — it can open browsers, run GUI applications, and take screenshots. The self-verification loop exploits this:
+
+```
+For a frontend change:
+  1. Write the code
+  2. Run the dev server
+  3. Open the browser to the affected page
+  4. Screenshot the result
+  5. Compare against expected behavior
+  6. If wrong: fix and re-screenshot
+  7. Record a video of the working feature
+  8. Attach video to PR
+```
+
+The screen recording serves dual purposes: it forces the agent to verify its work visually (not just by running tests), and it gives the human reviewer a walkthrough of the change.
+
+### Self-Verification as Within-Session Evolution
+
+Self-verification is a form of evolution — but compressed into a single session. The agent:
+
+1. Generates an initial solution (generation 1)
+2. Evaluates it against criteria (fitness function)
+3. Identifies weaknesses (selection pressure)
+4. Produces an improved version (generation 2)
+5. Re-evaluates (next fitness check)
+
+This is the same optimize-evaluate-improve loop that cross-session evolution uses for skills and memory. The difference is timescale: self-verification operates in minutes, skill evolution operates over weeks.
+
+### What Self-Verification Catches
+
+From Devin 2.2's published metrics on self-caught issues:
+
+| Issue Type | Frequency | Example |
+|-----------|-----------|---------|
+| Missing imports | High | Added a function but forgot to import its dependency |
+| Incomplete error handling | High | Happy path works but error cases throw unhandled exceptions |
+| Test coverage gaps | Medium | Tests pass but don't cover the new code path |
+| Style inconsistencies | Medium | New code uses different patterns than surrounding code |
+| Logic errors | Low-Medium | Off-by-one errors, wrong comparison operators |
+| Security issues | Low | SQL injection, path traversal in user input handling |
+
+### The Limitation
+
+Self-verification catches issues the agent can detect by re-reading its own output. It does not catch:
+
+- **Subtle design errors:** The code works but the approach is wrong for the architecture
+- **Performance issues:** The code is correct but creates N+1 queries or O(n²) loops
+- **Cross-session learning:** Devin doesn't get better at avoiding the *same* mistakes across sessions
+
+This is the key gap: Devin's self-verification is powerful within a session but creates no persistent improvement. Each new session starts from scratch. Compare with Hermes, where a mistake caught by self-evaluation creates a skill or memory update that prevents the same mistake in future sessions.
+
+---
+
+## Pattern Summary
+
+| Pattern | Source | What It Solves | Persistence |
+|---------|--------|---------------|-------------|
+| Heartbeat | proactive-agent | Stale memory, missed updates | Across sessions |
+| WAL | proactive-agent | State loss during compaction | Within + across sessions |
+| Solidification | self-improving-agent | Noise in permanent memory | Across sessions |
+| Genome/Capsule | capability-evolver | Granular pattern reuse + fixes | Across sessions |
+| Progressive Disclosure | Hermes, Claude Code | Context waste, attention dilution | Within session |
+| Self-Verification | Devin 2.2 | Incorrect output before submission | Within session |
+
+### Combining Patterns
+
+No single pattern is sufficient. The most effective agents combine multiple patterns:
+
+```
+Hermes:
+  Progressive Disclosure + Self-Evaluation (15-call checkpoint)
+  + Solidification (SKILL.md creation from observations)
+
+proactive-agent:
+  Heartbeat + WAL + Solidification pipeline
+
+capability-evolver:
+  Genome/Capsule + audit trail (events.jsonl)
+
+Devin:
+  Self-Verification loop (within-session only)
+```
+
+The missing combination that no production system implements yet: **Devin's self-verification + Hermes's cross-session learning**. An agent that catches its own mistakes AND creates skills to prevent those mistakes in future sessions would close the loop between within-session and across-session evolution.
+
+### The Pattern Selection Guide
+
+| Your Agent's Primary Failure Mode | Start With |
+|-----------------------------------|-----------|
+| Forgets things between sessions | Heartbeat + Solidification |
+| Loses state during long tasks | WAL |
+| Memory gets noisy and contradictory | Solidification pipeline (3-observation threshold) |
+| Repeats the same debugging steps | Genome/Capsule |
+| Wastes tokens loading irrelevant context | Progressive Disclosure |
+| Produces incorrect output on first attempt | Self-Verification loop |
