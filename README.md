@@ -1,38 +1,26 @@
 # AgentEnvolveBook
 
-**The Evolving Agent: SOTA Philosophy, Methodology and Practice for Long-Running AI Agents**
+## The Self-Evolving Agent: How AI Agents Get Better Through Use
 
-A comprehensive book investigating how top-tier AI companies (OpenAI, Anthropic, Google, Cursor, Manus) and leading open-source projects (OpenHands, SWE-agent, OpenClaw, MemRL) design agents that keep evolving to handle hard, long-horizon tasks.
+A deeply technical book (15 chapters, ~8,200 lines) on **runtime self-evolution** — how AI agents improve through use without model retraining. Every chapter covers mechanisms that operate on a frozen LLM backbone: the model never changes, but external memory, skills, heuristics, and knowledge evolve with experience.
 
-## 📖 Read the Book
+### Read the Book
 
 Start here: **[book/README.md](book/README.md)**
 
-### Contents
+### Structure
 
-| Part | Chapters | Topics |
-|------|----------|--------|
-| **I. Foundations** | 1–3 | Agent paradigm shift, the agent loop, context engineering |
-| **II. Architecture** | 4–6 | Tool design & MCP, multi-agent orchestration, long-horizon harnesses |
-| **III. Evolution** | 7–9 | Memory systems, RL-based self-improvement, evaluation & benchmarks |
-| **IV. Practice** | 10–12 | Safety & guardrails, open-source ecosystem, production case studies |
-| **V. Future** | 13 | What comes next for evolving agents |
-| **Appendices** | A–B | Framework comparison matrix, key research papers |
+| Part | Chapters | What Evolves |
+|------|----------|-------------|
+| **I. Foundations** | 1-2 | Taxonomy of 20+ mechanisms, Reflexion/ExpeL/ERL/AutoGuide |
+| **II. Memory** | 3-6 | MemRL Q-values, RetroAgent SimUtil-UCB, Memento-II theory, Honcho user modeling |
+| **III. Skills** | 7-11 | Voyager code skills, SkillWeaver APIs, Hermes SKILL.md, AgentFactory subagents, ASG-SI graphs |
+| **IV. Crystallization** | 12-15 | OpenClaw self-improving-agent, OPRO/ADAS/HyEvo, LATS planning, open problems |
 
-### Key Coverage
+### Key Papers Covered (with full algorithms)
 
-- **OpenAI:** Agents SDK, Codex Subagents, GRPO/DeepSeek-R1 RL training
-- **Anthropic:** Claude Agent SDK, Claude Code, MCP, multi-agent coordination, context engineering
-- **Google:** Agent Development Kit (ADK), A2A protocol, Gemini agents
-- **Cursor:** Composer model, cloud agents, parallel worktree execution
-- **Manus AI:** Context engineering, KV-cache optimization, CodeAct, multi-agent architecture
-- **Open Source:** OpenHands, SWE-agent, OpenClaw, NanoClaw, MemRL, RetroAgent
-- **Research:** Stanford ReCAP, Berkeley PLAN-AND-ACT, Memento-II, RetroAgent
+Reflexion (NeurIPS 2023), ExpeL (AAAI 2024), Voyager (TMLR 2024), CoALA (TMLR 2024), AutoGuide (NeurIPS 2024), LATS (ICML 2024), ASG-SI (arXiv 2025), Memento-II (arXiv 2025), MemRL (arXiv 2026), SkillWeaver (arXiv 2025), ERL (ICLR 2026), RetroAgent (arXiv 2026), AgentFactory (arXiv 2026), ADAS (ICLR 2025), Hermes Agent (2026), RKC (2026)
 
-## Who This Is For
+### Who This Is For
 
-Engineers and researchers who want to design agents for long-running, hard tasks — the kind that require planning over hundreds of steps, learning from experience, and evolving over time.
-
-## License
-
-Content in this repository is provided for educational and research purposes.
+Engineers designing agents for long-running, hard tasks that must get measurably better over time — without ever retraining the model.

@@ -1,93 +1,69 @@
-# The Evolving Agent
+# The Self-Evolving Agent
 
-**SOTA Philosophy, Methodology and Practice for Long-Running AI Agents**
+**How AI Agents Get Better Through Use**
 
-*A comprehensive guide for those who want to design agents that keep evolving to tackle hard, long-horizon tasks.*
+*For practitioners designing agents that improve at runtime — no fine-tuning, no retraining, just frozen models that learn from experience.*
 
 ---
 
-## About This Book
+## What This Book Covers
 
-The AI agent landscape underwent a fundamental transformation in 2025–2026. Every major AI company — OpenAI, Anthropic, Google, and a wave of startups like Manus and Cognition — shipped production agent frameworks. Open-source projects like OpenHands, SWE-agent, and OpenClaw reached millions of users. Benchmarks that seemed impossible in 2023 were saturated by early 2026.
+One question, explored in paper-level depth across 15 chapters: **how do you build agents that get better every time they run, without ever updating model weights?**
 
-But building agents that *evolve* — that improve over time, handle long-horizon tasks reliably, and operate safely at scale — remains the frontier. This book distills the state-of-the-art philosophy, methodology, and practice from the teams pushing that frontier.
-
-**Who this book is for:**
-- Engineers designing agents for long-running, hard tasks
-- Technical leaders evaluating agent architectures for production
-- Researchers working on agent evolution, memory, and self-improvement
-- Anyone who wants to understand how the best agent systems in the world are built
+Every mechanism in this book operates on a frozen LLM backbone. The model never changes. What changes is external memory, skill libraries, heuristic pools, filesystem knowledge, and retrieval strategies. The agent evolves; the model doesn't.
 
 ## Table of Contents
 
-### Part I: Foundations of Agent Intelligence
-- [Chapter 1: The Agent Paradigm Shift](part1_foundations.md#chapter-1-the-agent-paradigm-shift)
-- [Chapter 2: The Agent Loop — Anatomy of Autonomy](part1_foundations.md#chapter-2-the-agent-loop--anatomy-of-autonomy)
-- [Chapter 3: The Rise of Context Engineering](part1_foundations.md#chapter-3-the-rise-of-context-engineering)
+### Part I: Foundations of Runtime Self-Evolution
+- [Chapter 1: The Self-Evolution Problem](part1_foundations.md#chapter-1-the-self-evolution-problem) — Statelessness, CoALA framework, formal taxonomy of 20+ mechanisms, problem formalization
+- [Chapter 2: Reflection-Based Self-Evolution](part1_foundations.md#chapter-2-reflection-based-self-evolution) — Reflexion, ExpeL, ERL, AutoGuide with full algorithms and results
 
-### Part II: Architecture Patterns for Production Agents
-- [Chapter 4: Tool Design — The Agent's Hands](part2_architecture.md#chapter-4-tool-design--the-agents-hands)
-- [Chapter 5: Multi-Agent Orchestration](part2_architecture.md#chapter-5-multi-agent-orchestration)
-- [Chapter 6: Long-Horizon Agent Harnesses](part2_architecture.md#chapter-6-long-horizon-agent-harnesses)
+### Part II: Memory-Based Self-Evolution
+- [Chapter 3: MemRL — Utility-Learned Memory](part2_architecture.md#chapter-3-utility-learned-memory--memrl) — IEU triplets, Two-Phase Retrieval, Q-value Monte Carlo updates
+- [Chapter 4: RetroAgent — SimUtil-UCB Memory](part2_architecture.md#chapter-4-retroagents-simutil-ucb-memory) — Full SimUtil-UCB formula, utility EMA, exploration bonus
+- [Chapter 5: Memento-II — Formal Theory](part2_architecture.md#chapter-5-memento-ii--formal-theory-of-memory-based-learning) — M-MDP framework, read-write learning, convergence guarantees
+- [Chapter 6: Honcho — Dialectical User Modeling](part2_architecture.md#chapter-6-honcho--dialectical-user-modeling) — 12-identity layers, Hegelian dialectic engine, cold→warm→deep evolution
 
-### Part III: Making Agents Evolve
-- [Chapter 7: Memory Systems — The Agent's Experience](part3_evolution.md#chapter-7-memory-systems--the-agents-experience)
-- [Chapter 8: Self-Improvement Through Reinforcement Learning](part3_evolution.md#chapter-8-self-improvement-through-reinforcement-learning)
-- [Chapter 9: Evaluation and Benchmarking](part3_evolution.md#chapter-9-evaluation-and-benchmarking)
+### Part III: Skill-Based Self-Evolution
+- [Chapter 7: Voyager — Code Skill Accumulation](part3_evolution.md#chapter-7-code-skill-accumulation--voyager) — JS skill library, automatic curriculum, composable skills
+- [Chapter 8: SkillWeaver — Web API Synthesis](part3_evolution.md#chapter-8-skillweaver--web-agent-self-improvement-through-api-synthesis) — Playwright APIs, cross-agent transfer (+54.3%)
+- [Chapter 9: Hermes Agent — Autonomous Skill Documents](part3_evolution.md#chapter-9-hermes-agent--autonomous-skill-document-creation) — SKILL.md format, closed-loop learning, agentskills.io
+- [Chapter 10: AgentFactory — Executable Subagents](part3_evolution.md#chapter-10-agentfactory--executable-subagent-accumulation) — Python module accumulation, 57% cost reduction
+- [Chapter 11: ASG-SI — Audited Skill Graphs](part3_evolution.md#chapter-11-asg-si--audited-skill-graphs) — Verifiable rewards, governance, continual memory control
 
 ### Part IV: Knowledge Crystallization and Self-Optimizing Systems
-- [Chapter 12: Knowledge Crystallization — Filesystem-Based Evolution](part4_5_practice_future.md#chapter-12-knowledge-crystallization--filesystem-based-evolution)
-- [Chapter 13: Prompt and Architecture Self-Optimization](part4_5_practice_future.md#chapter-13-prompt-and-architecture-self-optimization)
-- [Chapter 14: LATS — Planning-Time Self-Improvement](part4_5_practice_future.md#chapter-14-lats--planning-time-self-improvement)
-- [Chapter 15: Open Problems and the Future of Self-Evolving Agents](part4_5_practice_future.md#chapter-15-open-problems-and-the-future-of-self-evolving-agents)
+- [Chapter 12: Knowledge Crystallization](part4_5_practice_future.md#chapter-12-knowledge-crystallization--filesystem-based-evolution) — RKC, OpenClaw self-improving-agent, SkillHub/ClawHub, Koda case study
+- [Chapter 13: Prompt and Architecture Self-Optimization](part4_5_practice_future.md#chapter-13-prompt-and-architecture-self-optimization) — OPRO, EvoTool, ADAS, HyEvo
+- [Chapter 14: LATS — Planning-Time Self-Improvement](part4_5_practice_future.md#chapter-14-lats--planning-time-self-improvement) — MCTS for agents, UCB selection
+- [Chapter 15: Open Problems](part4_5_practice_future.md#chapter-15-open-problems-and-the-future-of-self-evolving-agents) — Forgetting, adversarial poisoning, quality metrics, mechanism composition
 
 ### Appendices
 - [Appendix A: Paper Reference Table](part4_5_practice_future.md#appendix-a-paper-reference-table)
 - [Appendix B: Implementation Decision Guide](part4_5_practice_future.md#appendix-b-implementation-decision-guide)
 
-## Key Themes
+## Papers Covered (with full algorithm detail)
 
-| Theme | Core Insight | Key Source |
-|-------|-------------|------------|
-| **Agent Loop** | Agents are LLMs autonomously using tools in a loop | OpenAI, Anthropic, Cursor |
-| **Context Engineering** | "The art of filling the context window usefully" | Karpathy, Manus AI, Anthropic |
-| **Tool Design** | "Give agents a computer" — match tools to model capabilities | Anthropic (Claude Code) |
-| **Multi-Agent** | Start with orchestrator-subagent, add complexity only when needed | Anthropic, OpenAI Codex |
-| **Long-Horizon** | Initializer + incremental progress + structured state handoff | Anthropic, Stanford ReCAP |
-| **Memory** | Decouple stable reasoning from plastic memory | MemRL, Memento-II |
-| **Self-Improvement** | Pure RL can induce reasoning; runtime evolution without fine-tuning | DeepSeek-R1, RetroAgent |
-| **Safety** | Constitutional AI + 7-layer guardrails + sandboxing | Anthropic, CSG Framework |
-| **Evaluation** | Benchmarks are near-saturated; eval-driven development is the discipline | SWE-bench, TAU-bench |
+| Paper | Venue | Mechanism | Chapter |
+|-------|-------|-----------|---------|
+| Reflexion (Shinn et al.) | NeurIPS 2023 | Verbal self-reflection | 2 |
+| ExpeL (Zhao et al.) | AAAI 2024 | Cross-task heuristic extraction | 2 |
+| Voyager (Wang et al.) | TMLR 2024 | Code skill accumulation | 7 |
+| CoALA (Sumers et al.) | TMLR 2024 | Cognitive architecture framework | 1 |
+| AutoGuide (Gao et al.) | NeurIPS 2024 | State-aware guidelines | 2 |
+| LATS (Zhou et al.) | ICML 2024 | Monte Carlo tree search for agents | 14 |
+| OPRO (Yang et al.) | 2023 | Prompt optimization by LLM | 13 |
+| ASG-SI (Huang & Huang) | arXiv Dec 2025 | Audited skill graph | 11 |
+| Memento-II (Guo et al.) | arXiv Dec 2025 | M-MDP convergence theory | 5 |
+| MemRL (Zhang et al.) | arXiv Jan 2026 | Q-value learned memory | 3 |
+| ADAS (Hu et al.) | ICLR 2025 | Meta agent architecture search | 13 |
+| SkillWeaver (Pan et al.) | arXiv Apr 2025 | Web API skill synthesis | 8 |
+| ERL (Allard et al.) | ICLR 2026 | Single-attempt heuristics | 2 |
+| RetroAgent (Zhang et al.) | arXiv Mar 2026 | SimUtil-UCB memory | 4 |
+| AgentFactory (Zhang et al.) | arXiv Mar 2026 | Executable subagent reuse | 10 |
+| Hermes Agent (Nous Research) | 2026 | Autonomous skill documents | 9 |
+| RKC (Tanaike) | Feb 2026 | Filesystem knowledge persistence | 12 |
+| HyEvo | 2026 | Hybrid workflow evolution | 13 |
 
-## Companies and Projects Covered
+## Who This Is For
 
-**Industry Leaders:** OpenAI (Agents SDK, Codex), Anthropic (Claude Agent SDK, Claude Code), Google (Gemini, ADK, A2A), Cursor (Composer, Cloud Agents), Manus AI, Cognition (Devin)
-
-**Open Source:** OpenHands, SWE-agent, OpenClaw, NanoClaw, Hermes Agent (Nous Research — self-improving skills, Atropos RL), MemRL, RetroAgent
-
-**Skills Ecosystems:** ClawHub (13K+ skills), SkillHub.cn (Tencent, Chinese community), agentskills.io open standard
-
-**Research Labs:** Stanford (ReCAP, ALAS), UC Berkeley (PLAN-AND-ACT), CMU, Princeton (SWE-bench, SWE-agent), Meta (GAIA), Sierra Research (TAU-bench)
-
-## How to Read This Book
-
-- **For practitioners building agents now:** Start with Part II (Chapters 4-6) for architecture patterns, then Chapter 12 for case studies.
-- **For researchers interested in agent evolution:** Start with Part III (Chapters 7-9) on memory, RL, and evaluation.
-- **For technical leaders evaluating the landscape:** Read Chapter 1 for framing, then Appendix A for the comparison matrix.
-- **For a complete understanding:** Read sequentially — each part builds on the previous one.
-
-## Research Methodology
-
-This book synthesizes findings from:
-- Official documentation and blog posts from OpenAI, Anthropic, Google, Cursor, Manus, and Cognition
-- Peer-reviewed papers from NeurIPS 2025, ICML 2025, ICLR 2026, and arXiv preprints
-- Open-source codebases including OpenHands, SWE-agent, OpenClaw, and MemRL
-- Production benchmark results from SWE-bench, GAIA, WebArena, and TAU-bench
-- Industry analyses and technical deep-dives from the agent development community
-
-*Last updated: April 2026*
-
----
-
-*"The agentic future will be built one context at a time. Engineer them well."*
-— Yichao 'Peak' Ji, Co-founder of Manus AI
+Engineers and researchers designing agents for long-running, hard tasks that must improve over time without model retraining. If you want to build agents that get measurably better after 20, 50, 100 deployments — with the same frozen model — this book is for you.
