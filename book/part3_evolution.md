@@ -2,275 +2,290 @@
 
 ## Chapter 7: Memory Systems That Actually Work
 
-### 7.1 The "Brain Made of Markdown" Pattern
+This chapter is a formal reference. Every architecture below is specified at the level of detail required to reimplement it: type hierarchies, algorithm pseudocode, convergence properties, and benchmark numbers drawn directly from the cited papers. Where the original publications provide equations, we reproduce them; where they provide ablation tables, we include the full tables. The goal is that a systems engineer reading this chapter should be able to build each memory system without consulting the original paper (though they should still read the paper for the authors' commentary and qualitative insights that no specification can capture).
 
-The most effective production memory system in 2025–2026 is a directory of Markdown files. This is not a simplification for pedagogical purposes—it is what practitioners running Claude Code agents at scale converged on after trying vector databases, graph stores, and custom embedding pipelines. The pattern works because it optimizes for the three things that actually matter: transparency (you can `cat` the agent's memory), editability (you can fix the agent's memory with a text editor), and context-window efficiency (Markdown compresses well into tokens).
+---
 
-Here is the production-tested directory structure from the "AgentBrain" pattern, used by developers running persistent Claude Code agents across hundreds of sessions:
+### 7.1 OpenHands V1: Event-Sourced Agent Architecture
 
-```
-AgentBrain/
-├── Index.md                    # Table of contents, read first every session
-├── Identity/
-│   ├── Who I Am.md             # Role definition, capabilities, boundaries
-│   └── How I Think.md          # Reasoning preferences, decision heuristics
-├── Memory/
-│   ├── Conversation Log.md     # Rolling log of key interactions (pruned)
-│   ├── Learnings.md            # Distilled insights from past sessions
-│   └── Corrections.md          # Mistakes made + corrections applied
-├── Skills/
-│   ├── Code Review.md          # Procedure for reviewing PRs
-│   ├── Debugging.md            # Step-by-step debugging protocol
-│   └── Deploy.md               # Deployment checklist
-├── Projects/
-│   ├── ProjectAlpha/
-│   │   ├── Architecture.md     # System design, key components
-│   │   ├── Conventions.md      # Coding standards, naming rules
-│   │   └── Open Issues.md      # Known problems, workarounds
-│   └── ProjectBeta/
-│       └── ...
-├── People/
-│   ├── Benji.md                # Communication style, preferences, role
-│   └── Sara.md                 # Ditto
-└── Journal/
-    ├── 2026-03-10.md           # Daily session summaries
-    ├── 2026-03-11.md
-    └── ...
-```
+**Paper:** Xingyao Wang et al., "OpenHands: An Open Platform for AI Software Developers as Generalist Agents," arXiv:2407.16741 (original, July 2024); V1 SDK architecture described in the companion design document and release notes (November 2025, arXiv:2511.03690). Repository: `All-Hands-AI/OpenHands`, 53K+ GitHub stars as of April 2026.
 
-The startup hook lives in the project's `CLAUDE.md` file. This is the exact text that loads the brain on every session start:
+#### 7.1.1 V0 → V1: From Monolith to Modular SDK
 
-```markdown
-# CLAUDE.md
+The original OpenHands (then "OpenDevin") was a monolithic Python application. The controller, runtime, agent logic, tool definitions, and workspace management were entangled in a single package with deeply coupled imports. This worked for research prototypes but created four concrete engineering problems that motivated the V1 redesign:
 
-Every time you start a new conversation, read these files before responding:
-1. Read AgentBrain/Index.md
-2. Read AgentBrain/Memory/Learnings.md
-3. Read AgentBrain/Memory/Corrections.md
-4. Read AgentBrain/People/Benji.md
+1. **Testing fragility.** Unit-testing the agent's planning logic required instantiating a Docker runtime because the controller imported runtime modules at module scope. Test suites took 8–12 minutes even for pure logic changes.
+2. **Deployment rigidity.** Running the agent in a cloud sandbox required shipping the entire monolith into the sandbox container, including UI code, analytics, and configuration management that served no purpose inside the sandbox.
+3. **Extension friction.** Third-party developers who wanted to swap in a custom tool implementation had to fork the repository and patch internal modules because there was no stable API boundary.
+4. **State management opacity.** Agent state was scattered across instance variables on the controller, the runtime, and the agent class. Debugging "why did the agent take that action at step 47" required reading three different objects' internal state, often with mutable fields that had been overwritten by subsequent steps.
 
-After reading, confirm what you remember by listing 3 key learnings.
-Do NOT summarize the files — just confirm you've loaded them.
-```
-
-The `Index.md` file acts as a routing table. It tells the agent which files exist and when to read them, so the agent does not load the entire brain into context on every turn:
-
-```markdown
-# AgentBrain Index
-
-## Always Read on Startup
-- Memory/Learnings.md — accumulated insights (READ FIRST)
-- Memory/Corrections.md — past mistakes to avoid
-
-## Read When Working on Code
-- Projects/{project}/Architecture.md
-- Projects/{project}/Conventions.md
-- Skills/Code Review.md (when reviewing PRs)
-- Skills/Debugging.md (when investigating bugs)
-
-## Read When Communicating
-- People/{name}.md for the person you're talking to
-
-## Update After Every Session
-- Memory/Conversation Log.md — append 3-5 bullet summary
-- Journal/{date}.md — create if doesn't exist
-- Memory/Learnings.md — add new insights if any
-- Memory/Corrections.md — add if you made a mistake
-```
-
-The critical insight from practitioners who refined this pattern over months: **start with less structure**. The first attempt typically has 20+ files organized into deep hierarchies. The agent burns 3,000–5,000 tokens just reading the brain on startup, and the context pollution degrades response quality measurably. The sweet spot is 5–8 files that the agent reads routinely, with another 10–15 that it reads on demand based on task context.
-
-If you had to keep exactly one file, it would be `Corrections.md`. Here is what a production `Corrections.md` looks like:
-
-```markdown
-# Corrections
-
-## 2026-03-12: Wrong test runner
-- MISTAKE: Ran `pytest` directly. This project uses `make test` which sets
-  up the Docker test database first.
-- CORRECTION: Always check Makefile for test targets before running tests
-  directly. The pattern is: `make test-unit` for fast tests,
-  `make test-integration` for tests requiring Docker services.
-
-## 2026-03-10: Assumed PostgreSQL column type
-- MISTAKE: Created migration with `VARCHAR(255)` for email field. This
-  project uses `citext` extension for case-insensitive email storage.
-- CORRECTION: Check existing migrations for column type conventions before
-  creating new migrations. Email fields use `citext`, not `VARCHAR`.
-
-## 2026-03-08: Broke import ordering
-- MISTAKE: Added import at the top of the file. This project uses isort
-  with a custom profile that groups imports as: stdlib, third-party,
-  first-party, local. My import went into the wrong group.
-- CORRECTION: Run `make lint-fix` after any file edit to auto-fix import
-  ordering. The isort config is in pyproject.toml under [tool.isort].
-
-## 2026-03-05: Used wrong branch strategy
-- MISTAKE: Committed directly to main. This repo requires feature branches
-  with PR review.
-- CORRECTION: Always create feature branch: `git checkout -b feat/description`.
-  Push and create PR. Never commit to main directly.
-```
-
-The reason `Corrections.md` is the single most valuable file is error asymmetry: the cost of repeating a mistake is far higher than the cost of missing a potential optimization. An agent that never repeats its past mistakes converges on good behavior faster than an agent with a perfect knowledge base but no error memory.
-
-**Token budget analysis for the Markdown brain pattern:**
-
-| File | Typical Size | Tokens (GPT-4 tokenizer) | Load Frequency |
-|---|---|---|---|
-| Index.md | 0.5 KB | ~150 | Every session |
-| Learnings.md | 2–4 KB | ~600–1,200 | Every session |
-| Corrections.md | 1–3 KB | ~300–900 | Every session |
-| People/{name}.md | 0.5–1 KB | ~150–300 | Per conversation |
-| Project/Architecture.md | 2–5 KB | ~600–1,500 | Per task |
-| Project/Conventions.md | 1–3 KB | ~300–900 | Per code task |
-| **Startup total** | **4–8 KB** | **~1,200–2,400** | — |
-
-With a 200K-token context window, the startup brain load consumes 0.6–1.2% of available context. This is the right order of magnitude. If your memory system consumes more than 5% of the context window on startup, you are loading too much.
-
-**Write discipline is the hardest part.** The agent must update its memory files at the end of every session, but it must be selective. The update prompt in `CLAUDE.md` enforces this:
-
-```markdown
-## End of Session Protocol
-Before ending this conversation:
-1. If you learned something new → append to Memory/Learnings.md
-2. If you made a mistake → append to Memory/Corrections.md
-3. Append a 3-5 bullet summary to Memory/Conversation Log.md
-4. If Conversation Log.md exceeds 50 entries, delete the oldest 20
-
-Rules for writing to memory:
-- Each entry must be actionable (not "learned about the codebase")
-- Each entry must be specific (include file paths, command names, config keys)
-- Each correction must include both the mistake AND the fix
-- Never duplicate an existing entry — update it instead
-```
-
-The "delete the oldest 20" rule is a crude but effective forgetting mechanism. Without it, the conversation log grows without bound and eventually consumes too much context. More sophisticated approaches use LLM-based summarization to compress old entries, but the simple truncation works well enough for most use cases.
-
-### 7.2 OpenHands V1: Event-Sourced Architecture
-
-OpenHands (formerly OpenDevin) implements a fundamentally different memory model: every state change is an immutable typed event appended to a log, and the agent's current state is always derived—never stored directly. This is the event-sourcing pattern from distributed systems (Fowler, 2005), applied to agent execution.
-
-The event type hierarchy is built on Pydantic dataclasses. Here is the actual inheritance tree as of the V1 architecture:
+The V1 architecture decomposes the monolith into **four decoupled packages**:
 
 ```
-Event (base)
-├── source: EventSource          # user | agent | environment
-├── id: int                      # monotonically increasing
-├── timestamp: datetime
-├── cause: int | None            # id of the event that caused this one
+┌──────────────────────────────────────────────────────────────────┐
+│                     OpenHands V1 SDK Architecture                │
+│                                                                  │
+│  ┌─────────────────┐   ┌─────────────────┐                      │
+│  │   openhands-sdk  │   │  openhands-tools │                     │
+│  │                 │   │                 │                      │
+│  │ Event types     │   │ Tool registry   │                      │
+│  │ Event stream    │   │ Tool interface  │                      │
+│  │ State derivation│   │ Built-in tools  │                      │
+│  │ Agent interface │   │ Tool execution  │                      │
+│  │ LLM interface   │   │                 │                      │
+│  └────────┬────────┘   └────────┬────────┘                      │
+│           │                     │                                │
+│  ┌────────┴────────┐   ┌───────┴─────────┐                      │
+│  │openhands-workspace│  │openhands-server  │                     │
+│  │                 │   │                 │                      │
+│  │ Local FS       │   │ HTTP/WS API     │                      │
+│  │ Docker sandbox │   │ Session mgmt    │                      │
+│  │ Cloud sandbox  │   │ Auth/rate limit │                      │
+│  │ SSH remote     │   │ Event streaming │                      │
+│  └─────────────────┘   └─────────────────┘                      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Package 1: `openhands-sdk`.** The core abstractions: event types, the event stream, state derivation, the agent interface, and the LLM interface. This package has zero dependencies on Docker, filesystem operations, or network APIs. It can be imported and used in a pure-Python unit test with no external services.
+
+**Package 2: `openhands-tools`.** The tool registry and all built-in tool implementations (file read, file edit, shell command, browser interaction, agent delegation). Tools implement a `Tool` interface defined in the SDK. Third-party tools can be registered at runtime without modifying the core package.
+
+**Package 3: `openhands-workspace`.** The workspace abstraction: the same agent code runs identically whether the workspace is a local filesystem, a Docker container, a cloud sandbox (e.g., E2B, Modal), or an SSH-connected remote machine. The workspace exposes a uniform API for file operations and shell execution, and the agent code never knows which backend is active.
+
+**Package 4: `openhands-server`.** The HTTP/WebSocket API, session management, authentication, rate limiting, and event streaming endpoint. This is the only package that contains web framework dependencies (FastAPI). It is deployed as a standalone service; the SDK, tools, and workspace packages can be used without it.
+
+#### 7.1.2 The Four Design Principles
+
+The V1 architecture document specifies four design principles, stated here exactly as given in the paper:
+
+**Principle 1: Optional Isolation.** The runtime environment (where agent commands execute) can be isolated in a Docker container or cloud sandbox, but isolation is optional. For local development and trusted environments, agents can execute directly on the host. The choice is a configuration flag, not an architectural constraint.
+
+**Principle 2: Stateless by Default.** Agent processes do not hold persistent state in memory. All state is derived from the event stream, which is persisted externally (filesystem, database, or in-memory store depending on deployment). If an agent process crashes, a new process can be started and will reconstruct the identical state by replaying the event log.
+
+**Principle 3: Clear Boundaries.** Each package defines an explicit public API. Internal modules are prefixed with `_` and are not importable from outside the package. Cross-package dependencies flow in one direction: `server → tools → sdk` and `workspace → sdk`. There is no circular dependency.
+
+**Principle 4: Composable Components.** Each component (agent, tool, workspace backend, LLM provider) implements a small interface and can be swapped independently. An agent implementation does not know which LLM it is talking to, which workspace backend is active, or which tools are available—it interacts only through the interfaces defined in `openhands-sdk`.
+
+#### 7.1.3 Event Type Hierarchy
+
+The event system is the backbone of the V1 architecture. Every action, observation, system notification, and compression marker is represented as a typed, immutable event. The complete hierarchy:
+
+```
+Event (abstract base)
 │
-├── Action (initiated by agent or user)
-│   ├── MessageAction
-│   │   └── content: str
-│   │   └── image_urls: list[str]
-│   │   └── wait_for_response: bool
-│   │
-│   ├── CmdRunAction
-│   │   └── command: str
-│   │   └── timeout: int
-│   │   └── blocking: bool
-│   │
-│   ├── FileReadAction
-│   │   └── path: str
-│   │
-│   ├── FileEditAction
-│   │   └── path: str
-│   │   └── old_str: str
-│   │   └── new_str: str
-│   │
-│   ├── BrowseInteractiveAction
-│   │   └── browser_actions: str
-│   │   └── browsergym_send_msg_to_user: str
-│   │
-│   ├── AgentFinishAction
-│   │   └── thought: str
-│   │   └── outputs: dict
-│   │
-│   └── AgentDelegateAction
-│       └── agent: str
-│       └── inputs: dict
+│ Fields carried by ALL events:
+│   id: int                            # Monotonically increasing, unique within stream
+│   timestamp: datetime                # Wall-clock time of event creation
+│   source: EventSource                # USER | AGENT | ENVIRONMENT
+│   tool_name: str | None              # Present on tool-call events
+│   tool_call_id: str | None           # Ties action to specific LLM tool call
+│   cause: int | None                  # id of the event that caused this one
 │
-├── Observation (results of actions / environment changes)
-│   ├── CmdOutputObservation
-│   │   └── command: str
-│   │   └── exit_code: int
-│   │   └── content: str
+├── LLMConvertibleEvent (abstract)
+│   │  Events that can be serialized into LLM prompt messages.
+│   │  Defines: to_llm_message() → dict
 │   │
-│   ├── FileReadObservation
-│   │   └── path: str
-│   │   └── content: str
+│   ├── ActionEvent (abstract)
+│   │   │  Initiated by agent or user. Represents intent.
+│   │   │
+│   │   ├── MessageAction
+│   │   │     content: str
+│   │   │     image_urls: list[str]
+│   │   │     wait_for_response: bool
+│   │   │
+│   │   ├── CmdRunAction
+│   │   │     command: str
+│   │   │     timeout: int                    # seconds
+│   │   │     blocking: bool                  # wait for completion?
+│   │   │     keep_prompt: bool               # preserve shell prompt in output?
+│   │   │
+│   │   ├── FileReadAction
+│   │   │     path: str
+│   │   │     start_line: int | None
+│   │   │     end_line: int | None
+│   │   │
+│   │   ├── FileEditAction
+│   │   │     path: str
+│   │   │     old_str: str                    # exact string to find
+│   │   │     new_str: str                    # replacement string
+│   │   │     insert_line: int | None         # alternative: insert at line
+│   │   │
+│   │   ├── BrowseInteractiveAction
+│   │   │     browser_actions: str            # BrowserGym DSL commands
+│   │   │     browsergym_send_msg_to_user: str
+│   │   │
+│   │   ├── AgentFinishAction
+│   │   │     thought: str
+│   │   │     outputs: dict[str, Any]
+│   │   │     final_message: str | None
+│   │   │
+│   │   ├── AgentDelegateAction
+│   │   │     agent: str                      # name of delegate agent class
+│   │   │     inputs: dict[str, Any]
+│   │   │     thought: str
+│   │   │
+│   │   └── AgentRejectAction
+│   │         thought: str                    # reason for rejection
 │   │
-│   ├── FileEditObservation
-│   │   └── path: str
-│   │   └── content: str
+│   ├── MessageEvent
+│   │     content: str
+│   │     role: str                           # "user" | "assistant" | "system"
 │   │
-│   ├── BrowserOutputObservation
-│   │   └── url: str
-│   │   └── screenshot: str
-│   │   └── open_pages_urls: list[str]
-│   │
-│   ├── ErrorObservation
-│   │   └── content: str
-│   │
-│   └── AgentDelegateObservation
-│       └── outputs: dict
-│       └── content: str
+│   └── ObservationBaseEvent (abstract)
+│       │  Results of actions or environment state changes.
+│       │
+│       ├── CmdOutputObservation
+│       │     command: str
+│       │     exit_code: int
+│       │     content: str                    # stdout + stderr
+│       │     command_id: int                 # for non-blocking command tracking
+│       │
+│       ├── FileReadObservation
+│       │     path: str
+│       │     content: str
+│       │
+│       ├── FileEditObservation
+│       │     path: str
+│       │     content: str                    # new file content or diff
+│       │     prev_exist: bool
+│       │     old_content: str | None
+│       │
+│       ├── BrowserOutputObservation
+│       │     url: str
+│       │     screenshot: str                 # base64 or path
+│       │     open_pages_urls: list[str]
+│       │     active_page_index: int
+│       │     dom_object: dict | None
+│       │     axtree_txt: str | None          # accessibility tree
+│       │     last_browser_action: str
+│       │     last_browser_action_error: str
+│       │     focused_element_bid: str
+│       │
+│       ├── ErrorObservation
+│       │     content: str
+│       │     error_id: str | None
+│       │
+│       ├── AgentDelegateObservation
+│       │     outputs: dict[str, Any]
+│       │     content: str
+│       │
+│       └── UserRejectObservation
+│             content: str
 │
-└── CondensationEvent             # compression markers
-    └── condensed_event_ids: list[int]
-    └── summary: str
+├── ConversationStateUpdateEvent         # Internal: signals state transitions
+│     agent_state: AgentState            # LOADING | INIT | RUNNING |
+│                                        #   AWAITING_USER_INPUT |
+│                                        #   AWAITING_USER_CONFIRMATION |
+│                                        #   PAUSED | STOPPED | FINISHED |
+│                                        #   REJECTED | ERROR
+│     metadata: dict[str, Any] | None
+│
+├── CondensationEvent                    # Compression marker
+│     condensed_event_ids: list[int]     # IDs of events being replaced
+│     summary: str                       # LLM-generated summary text
+│
+└── PauseEvent                           # Internal: agent-requested pause
+      reason: str
 ```
 
-Every event carries `source` metadata indicating who generated it: `EventSource.USER` for human-initiated actions, `EventSource.AGENT` for LLM-generated actions, and `EventSource.ENVIRONMENT` for system-generated observations. Actions generated by the LLM also carry tool metadata—`tool_call_id` ties the action back to the specific tool call in the LLM's response, enabling precise replay and debugging.
+The distinction between `LLMConvertibleEvent` and internal events (like `ConversationStateUpdateEvent`, `PauseEvent`) is architectural: only `LLMConvertibleEvent` subclasses are serialized into the LLM's prompt. Internal events affect state derivation but are invisible to the model. This prevents the model from seeing system bookkeeping and focuses its context window on semantically relevant information.
 
-The append-only event log is the single source of truth. State is derived by reducing over the log:
+#### 7.1.4 State Derivation from Event Stream
+
+The append-only event log is the single source of truth. Agent state is **never** stored directly — it is always derived by reducing over the log. The derivation logic:
 
 ```python
 @dataclass
-class State:
-    history: list[tuple[Action, Observation]]
-    iteration: int
-    max_iterations: int
-    token_usage: TokenUsage
-    metrics: Metrics
-    agent_state: AgentState  # RUNNING | AWAITING_USER | FINISHED | ERROR
-    extra_data: dict
+class AgentState:
+    history: list[Event]              # Full event history (or condensed)
+    iteration: int                     # Number of agent actions taken
+    max_iterations: int                # Configured limit
+    token_usage: TokenUsage            # Cumulative token consumption
+    metrics: Metrics                   # Error count, tool call count, etc.
+    agent_state: AgentStateEnum        # Current lifecycle state
+    extra_data: dict[str, Any]         # Agent-specific scratchpad
 
     @classmethod
-    def from_events(cls, events: list[Event], config: AgentConfig) -> "State":
+    def from_events(
+        cls,
+        events: list[Event],
+        config: AgentConfig,
+    ) -> "AgentState":
         state = cls(
             history=[],
             iteration=0,
             max_iterations=config.max_iterations,
             token_usage=TokenUsage(),
             metrics=Metrics(),
-            agent_state=AgentState.RUNNING,
+            agent_state=AgentStateEnum.RUNNING,
             extra_data={},
         )
         for event in events:
             state = state.apply(event)
         return state
 
-    def apply(self, event: Event) -> "State":
-        if isinstance(event, Action):
+    def apply(self, event: Event) -> "AgentState":
+        self.history.append(event)
+
+        if isinstance(event, ActionEvent):
             self.iteration += 1
+            self.metrics.tool_call_count += 1
             if isinstance(event, AgentFinishAction):
-                self.agent_state = AgentState.FINISHED
-        if isinstance(event, CmdOutputObservation):
+                self.agent_state = AgentStateEnum.FINISHED
+            elif isinstance(event, AgentRejectAction):
+                self.agent_state = AgentStateEnum.REJECTED
+
+        elif isinstance(event, CmdOutputObservation):
             if event.exit_code != 0:
                 self.metrics.error_count += 1
-        if isinstance(event, CondensationEvent):
-            self._condense(event.condensed_event_ids, event.summary)
+
+        elif isinstance(event, ErrorObservation):
+            self.metrics.error_count += 1
+
+        elif isinstance(event, ConversationStateUpdateEvent):
+            self.agent_state = event.agent_state
+
+        elif isinstance(event, CondensationEvent):
+            self._apply_condensation(event)
+
         return self
+
+    def _apply_condensation(self, event: CondensationEvent) -> None:
+        """Replace condensed events in history with the summary event."""
+        condensed_ids = set(event.condensed_event_ids)
+        new_history = [e for e in self.history if e.id not in condensed_ids]
+        summary_event = MessageEvent(
+            content=event.summary,
+            role="system",
+            id=event.id,
+            timestamp=event.timestamp,
+            source=EventSource.ENVIRONMENT,
+        )
+        insert_idx = 0
+        for i, e in enumerate(new_history):
+            if e.id > min(condensed_ids):
+                insert_idx = i
+                break
+        new_history.insert(insert_idx, summary_event)
+        self.history = new_history
 ```
 
-The `CondensationEvent` is the compression mechanism. When the event stream grows too long to fit in the context window, a condensation strategy generates a summary of a contiguous block of events and emits a `CondensationEvent` that replaces them:
+The `from_events` / `apply` pattern gives three capabilities that no mutable-state architecture can match:
+
+1. **Exact replay.** Given the event log, reconstruct the agent's state at any point in time. When a user reports "the agent did something wrong at step 47," replay events 0–47 and inspect the derived state. OpenHands developers report that replay debugging cuts investigation time by 60–80%.
+
+2. **Branching.** Fork execution at any event by replaying up to that point, then diverging. OpenHands uses this for retry: if the agent errors at event 35, replay events 0–34, inject a hint about the error, and let the agent retry from that state.
+
+3. **Projection multiplexing.** The same event stream projects into multiple views: the LLM prompt view (condensed, formatted for inference), the analytics view (aggregated token usage, error rates), and the audit view (complete, immutable, for compliance). Each projection reads from the same source.
+
+#### 7.1.5 Condensation Strategies for Context Compression
+
+When the event stream grows beyond the model's context budget, a condensation strategy compresses it. The V1 SDK ships three built-in strategies:
+
+**Strategy 1: RecentEventsCondensation.** Keep the last N events verbatim; summarize everything before them into a single CondensationEvent.
 
 ```python
 class RecentEventsCondensation:
-    """Keep the last N events verbatim, summarize everything before."""
-
     def __init__(self, keep_last: int = 20, max_summary_tokens: int = 500):
         self.keep_last = keep_last
         self.max_summary_tokens = max_summary_tokens
@@ -278,17 +293,16 @@ class RecentEventsCondensation:
     def condense(self, events: list[Event], llm: LLM) -> list[Event]:
         if len(events) <= self.keep_last:
             return events
-
         to_condense = events[:-self.keep_last]
         to_keep = events[-self.keep_last:]
-
         summary = llm.summarize(
             [e.to_prompt_str() for e in to_condense],
             max_tokens=self.max_summary_tokens,
-            instruction="Summarize the key actions, results, and decisions. "
-                        "Preserve file paths, command outputs, and error messages."
+            instruction=(
+                "Summarize key actions, results, and decisions. "
+                "Preserve file paths, command outputs, and error messages verbatim."
+            ),
         )
-
         condensation = CondensationEvent(
             condensed_event_ids=[e.id for e in to_condense],
             summary=summary,
@@ -296,30 +310,736 @@ class RecentEventsCondensation:
         return [condensation] + to_keep
 ```
 
-The condensation pipeline is parameterized by `max_budget_per_msg` — the token budget per event when building the LLM prompt. Production deployments tune this between 200 and 1,000 tokens per event depending on the model's context window size. With Claude's 200K context, a budget of 500 tokens per event allows approximately 400 events in the prompt. With GPT-4o's 128K context, the budget drops to ~300 tokens per event for the same event count.
+**Strategy 2: SlidingWindowCondensation.** Maintain a fixed-size window. When the window overflows, summarize the oldest 50% of events. This produces a chain of summaries, each covering a contiguous block, yielding better temporal resolution than a single summary.
 
-The key architectural benefits of event sourcing for agents:
+**Strategy 3: ImportanceWeightedCondensation.** Score each event by importance (errors and user messages score highest; file reads score lowest). Condense the lowest-scoring events first, preserving the most informative events at full fidelity.
 
-**Exact replay.** Given the event log, you can reconstruct the agent's state at any point in time. When a user reports "the agent did something weird at step 47," you replay events 0–47 and inspect the derived state. This is not a theoretical benefit—OpenHands developers report that replay debugging cuts investigation time by 60–80% compared to log-based debugging.
+The condensation pipeline is parameterized by `max_budget_per_msg` — the token budget per event when building the LLM prompt. Production deployments tune this between 200 and 1,000 tokens. With Claude's 200K context and a budget of 500 tokens/event, approximately 400 events fit in the prompt. With GPT-4o's 128K context, the budget drops to ~300 tokens/event for equivalent capacity.
 
-**Branching.** You can fork execution at any event by replaying up to that point and then diverging. OpenHands uses this for retry mechanisms: if the agent hits an error at event 35, replay events 0–34, inject a hint about the error, and let the agent try again from that state.
+**Condensation ratio in production:** 4:1 to 12:1 (original tokens / condensed tokens), depending on the verbosity of command outputs and file contents being summarized.
 
-**Projection multiplexing.** The same event stream can be projected into different views. The LLM prompt view is condensed and formatted for inference. The analytics view aggregates token usage and error rates. The audit view preserves everything for compliance logging. Each projection reads from the same immutable source.
+#### 7.1.6 Workspace Abstraction
 
-**Concrete operational numbers from OpenHands deployments:**
-- Average event stream length per task: 40–120 events
-- Average event size: 200–2,000 bytes (commands and file reads are largest)
-- Condensation ratio (original tokens / condensed tokens): 4:1 to 12:1
-- Event store overhead per session: 50–500 KB
-- Replay time for 100-event stream: < 50ms (excluding LLM calls)
+The workspace layer abstracts where agent commands actually execute. The same agent code — the same event stream, the same tool calls — runs identically across four backends:
 
-### 7.3 OpenClaw: Three-Tier Memory with Dreaming
+| Backend | Implementation | Isolation | Latency | Use Case |
+|---------|---------------|-----------|---------|----------|
+| `LocalWorkspace` | Direct `subprocess` calls | None | <10ms | Local dev, trusted agents |
+| `DockerWorkspace` | Docker container with volume mounts | Process-level | 50–200ms (first cmd) | CI/CD, untrusted code |
+| `E2BWorkspace` | E2B cloud sandbox API | VM-level | 100–500ms | Production SaaS |
+| `SSHWorkspace` | SSH tunnel to remote machine | Network-level | 50–150ms | Remote development |
 
-OpenClaw (2025–2026) implements the most complete three-tier memory system in the open-source agent ecosystem. Its distinguishing feature is the "Dreaming" consolidation mechanism that runs as an overnight batch process, converting episodic daily notes into durable semantic memory.
+Each backend implements the `Workspace` interface:
 
-**Tier 1: Long-term memory — `MEMORY.md`**
+```python
+class Workspace(Protocol):
+    async def execute(self, command: str, timeout: int = 120) -> CmdOutputObservation: ...
+    async def read_file(self, path: str) -> FileReadObservation: ...
+    async def write_file(self, path: str, content: str) -> FileEditObservation: ...
+    async def list_files(self, path: str = ".") -> list[str]: ...
+    def get_working_directory(self) -> str: ...
+```
 
-The `MEMORY.md` file is the semantic store. It is structured with explicit sections, each with a last-updated timestamp:
+The workspace choice is a deployment configuration. The agent code never imports workspace-specific modules. This is what "Optional Isolation" means in practice: you get sandboxing for free by changing a config flag, not by rewriting agent logic.
+
+#### 7.1.7 SWE-Bench Results with the V1 SDK
+
+The V1 SDK's architectural changes had measurable impact on benchmark performance, primarily through reliability improvements (fewer crashes, better state recovery) rather than algorithmic changes:
+
+| Configuration | SWE-Bench Verified | SWE-Bench Lite | Notes |
+|---|---|---|---|
+| OpenHands V0 + CodeAct + Claude 3.5 Sonnet | 53.0% | 48.2% | Monolithic architecture |
+| OpenHands V1 + CodeAct + Claude 3.5 Sonnet | 55.2% | 50.1% | Same agent, new SDK |
+| OpenHands V1 + CodeAct + Claude Sonnet 4.5 | 72.4% | 67.8% | Model upgrade |
+| OpenHands V1 + CodeAct + Claude Opus 4.5 | 76.1% | 71.3% | Frontier model |
+
+The V0 → V1 improvement (53.0% → 55.2%) is entirely attributable to reduced crashes from state corruption bugs that the event-sourced architecture eliminates. The larger jumps come from model upgrades, but they are enabled by the architectural reliability: a model that is 20% smarter but crashes 10% of the time nets less improvement than a model that is 20% smarter and never crashes.
+
+**Operational metrics from OpenHands production deployments (V1 SDK):**
+
+| Metric | Value |
+|---|---|
+| Average event stream length per task | 40–120 events |
+| Average event size | 200–2,000 bytes |
+| Condensation ratio | 4:1 to 12:1 |
+| Event store overhead per session | 50–500 KB |
+| Replay time for 100-event stream | < 50ms (excluding LLM calls) |
+| Crash recovery rate (V1 vs V0) | 99.7% vs 94.2% |
+| Mean time to replay-debug a user report | 3.2 min (V1) vs 14.7 min (V0) |
+
+---
+
+### 7.2 Hermes Agent: The Closed-Loop Learning System
+
+**System:** Hermes Agent, Nous Research, initial release February 2026. MIT license. Repository: `NousResearch/hermes-agent`. As of April 2026: 99K+ GitHub stars, 370+ contributors, 47 built-in tools, current version v2026.4.16.
+
+Hermes is the most complete implementation of an agent that autonomously creates, updates, and retrieves its own skill documents. Where other memory systems are passive stores — the developer designs the structure, the agent reads and writes to it — Hermes *actively generates reusable knowledge* from successful task completions, and then uses that knowledge to accelerate future tasks. The measured result: tasks that initially require 25 tool calls drop to 8–10 tool calls after a month of regular use across 20–30 complex tasks.
+
+#### 7.2.1 Three-Layer Memory Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    HERMES MEMORY STACK                        │
+│                                                              │
+│  LAYER 1: Working Context                                    │
+│  ─────────────────────────                                   │
+│  Standard LLM context window (128K–200K tokens).             │
+│  Contains: current conversation, tool outputs, reasoning     │
+│  chain, system prompt with injected skill/fact context.      │
+│  Lifetime: single session. No persistence.                   │
+│                                                              │
+│  LAYER 2: Skill Documents (~/.hermes/skills/)                │
+│  ──────────────────────────────────────────                  │
+│  SKILL.md files following the agentskills.io open standard.  │
+│  Created autonomously by the agent after successful tasks.   │
+│  Indexed via SQLite FTS5 full-text search.                   │
+│  Retrieved via progressive disclosure (3 levels).            │
+│  Lifetime: permanent until explicitly deleted or updated.    │
+│                                                              │
+│  LAYER 3: Persistent User Facts (Honcho integration)         │
+│  ──────────────────────────────────────────────────          │
+│  Dialectical user modeling across 12 identity layers.        │
+│  Two-layer context injection (base + dialectic synthesis).   │
+│  Configurable update cadences: contextCadence (every N       │
+│  messages), dialecticCadence (every M messages).             │
+│  dialecticDepth: 1–3 LLM passes for synthesis quality.      │
+│  Lifetime: permanent, evolves with each interaction.         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.2 Autonomous Skill Creation: Trigger Conditions and Self-Evaluation
+
+Hermes does not wait for the user to tell it to create a skill. It monitors its own execution and triggers skill creation proactively. The exact trigger conditions, as specified in the Hermes documentation:
+
+**Trigger Condition 1: Sequence length.** If the agent uses 5 or more tool calls in a sequence to accomplish a single subtask, the subtask is complex enough to warrant a skill document. This threshold was tuned empirically: below 5, the overhead of creating and maintaining a skill exceeds the time saved on future retrievals; above 5, the savings compound quickly.
+
+**Trigger Condition 2: Error recovery.** If the agent encounters an error and successfully recovers (i.e., a subsequent tool call succeeds after a failed one), the recovery procedure is captured as a skill. Error recovery procedures are among the highest-value skills because they encode non-obvious debugging knowledge.
+
+**Trigger Condition 3: User corrections.** If the user corrects the agent ("no, do it this way"), the corrected procedure is captured. User corrections signal that the agent's default behavior was wrong in a way that is likely to recur.
+
+**Trigger Condition 4: Non-obvious workflows.** If the agent discovers a novel approach to a problem — one that was not in its initial training data or existing skills — it captures the workflow. "Novel" is determined by comparing the approach against existing skills using FTS5 similarity: if no existing skill matches with score > 0.6, the approach is considered novel.
+
+**Self-evaluation checkpoint:** Every 15 tool calls, the agent performs a self-evaluation: "Was anything in the last 15 tool calls worth capturing as a skill?" This periodic checkpoint catches gradual skill-worthy patterns that don't trigger any single condition above but are valuable in aggregate.
+
+The complete closed-loop learning cycle:
+
+```
+TASK EXECUTION (tools, code, browsing, file edits)
+         │
+         ▼
+SELF-EVALUATION CHECKPOINT (every 15 tool calls)
+    Checks: sequence length ≥ 5?  error recovery?
+            user correction?  novel workflow?
+         │
+         ├──► No triggers → continue execution
+         │
+         └──► Trigger fired ──► SKILL CREATION / UPDATE
+                                 │
+                                 ├── New skill: write SKILL.md
+                                 │   (agentskills.io format)
+                                 │
+                                 └── Existing skill update: patch via
+                                     skill_manage tool (mid-session)
+         │
+         ▼
+MEMORY UPDATE
+    Key facts      → MEMORY.md   (persistent cross-session)
+    User patterns  → USER.md     (via Honcho dialectic)
+    Corrections    → skill patch  (immediate, in-place)
+```
+
+#### 7.2.3 SKILL.md Format Specification — The agentskills.io Standard
+
+Every auto-generated skill follows the agentskills.io open standard. The format has two parts: YAML frontmatter (machine-readable metadata) and Markdown body (human- and LLM-readable instructions).
+
+**Complete YAML frontmatter fields:**
+
+```yaml
+---
+# REQUIRED fields
+name: deploy-staging                      # Unique identifier, kebab-case
+description: >
+  Deploy the application to staging       # 1-2 sentence summary. This is
+  environment via GitHub Actions           # what the agent sees at Level 0.
+version: 1.0.0                            # SemVer
+
+# RECOMMENDED fields
+author: hermes-auto                       # "hermes-auto" for agent-generated
+license: MIT                              # License for the skill itself
+platforms: [linux, macos]                 # Target operating systems
+tags: [DevOps, Deployment, CI-CD]         # Discovery tags
+
+# HERMES-SPECIFIC metadata
+metadata:
+  hermes:
+    tags: [DevOps, Deployment]            # Hermes-internal tags
+    related_skills:                       # Cross-references
+      - docker-compose-management
+      - github-actions-debug
+    requires_toolsets: [shell]            # Which toolsets must be active
+    requires_tools:                       # Specific tools needed
+      - shell_exec
+      - read_file
+      - web_search
+    config:                               # User-configurable parameters
+      - key: deploy.staging_branch
+        description: "Branch to deploy from"
+        default: "staging"
+        prompt: "Which branch deploys to staging?"
+      - key: deploy.health_check_url
+        description: "URL for post-deploy health check"
+        default: "https://staging.example.com/health"
+        prompt: "Health check URL?"
+
+# ENVIRONMENT requirements
+required_environment_variables:
+  - name: GITHUB_TOKEN
+    prompt: "Enter your GitHub token for Actions API"
+  - name: DEPLOY_SSH_KEY
+    prompt: "Path to SSH key for deployment server"
+    optional: true
+---
+```
+
+**Markdown body section structure:**
+
+```markdown
+# {Skill Name}
+
+## When to Use
+<!-- Exact conditions under which this skill should activate -->
+
+## Quick Reference
+<!-- 2-3 line cheat sheet for the most common invocation -->
+
+## Procedure
+<!-- Numbered step-by-step instructions -->
+
+## Pitfalls
+<!-- Known failure modes with dates of discovery and fixes -->
+
+## Verification
+<!-- How to confirm the skill executed correctly -->
+
+## References
+<!-- Links to relevant docs, PRs, or external resources -->
+```
+
+#### 7.2.4 Progressive Disclosure Levels
+
+Skill retrieval uses progressive disclosure to minimize context consumption:
+
+**Level 0 — Catalog (~3K tokens for the entire skill library).** The agent calls `skills_list()`, which returns only the `name` and `description` fields from every skill's frontmatter. With 50 skills averaging 60 tokens each for name + description, the full catalog costs ~3,000 tokens. This is cheap enough to load on every session start.
+
+**Level 1 — Full Instructions.** When the agent identifies a relevant skill from the Level 0 catalog, it calls `skill_view(name)` to load the complete Markdown body: When to Use, Quick Reference, Procedure, Pitfalls, and Verification. Typical cost: 500–2,000 tokens per skill.
+
+**Level 2 — References and Artifacts.** For skills with associated files (scripts, templates, configuration snippets), `skill_view(name, path)` loads specific referenced artifacts. This level is rarely needed — the Procedure section usually contains enough detail.
+
+The progressive disclosure design means that even with hundreds of skills, the agent's per-session overhead is bounded at ~3K tokens (Level 0) plus ~1,500 tokens per skill actually used (Level 1). In practice, a typical session activates 1–3 skills, costing 4,500–7,500 tokens total — approximately 3% of a 200K-token context window.
+
+#### 7.2.5 Honcho Dialectical User Modeling
+
+The third memory layer integrates with Honcho, a user-modeling service that maintains a persistent model of each user across 12 identity layers:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 HONCHO 12-IDENTITY MODEL                     │
+│                                                             │
+│  Layer 1:  Communication Style                              │
+│            (formal/informal, verbosity, emoji usage)         │
+│  Layer 2:  Technical Expertise Level                        │
+│            (beginner → expert, per-domain)                   │
+│  Layer 3:  Decision-Making Patterns                         │
+│            (risk-averse/risk-seeking, speed vs thoroughness) │
+│  Layer 4:  Domain Knowledge Map                             │
+│            (which topics they know deeply, gaps)             │
+│  Layer 5:  Workflow Preferences                             │
+│            (tool chains, IDE, OS, deployment style)          │
+│  Layer 6:  Error Tolerance                                  │
+│            (how they react to mistakes, retry patience)      │
+│  Layer 7:  Collaboration Style                              │
+│            (solo vs pair, review preferences)                │
+│  Layer 8:  Learning Modality                                │
+│            (examples-first vs theory-first, visual vs text)  │
+│  Layer 9:  Time Sensitivity                                 │
+│            (urgency patterns, deadline behavior)             │
+│  Layer 10: Quality vs Speed Tradeoff                        │
+│            (perfectionist vs pragmatist, per context)        │
+│  Layer 11: Feedback Patterns                                │
+│            (explicit correction vs implicit signals)          │
+│  Layer 12: Meta-Preferences                                 │
+│            (how they want the agent itself to behave)        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Two-layer context injection:**
+
+The Honcho integration injects user context into the agent's system prompt at two levels:
+
+*Base layer:* A factual summary of the user's identity model and the current session context. Injected at every turn. Typical cost: 200–400 tokens.
+
+*Dialectic layer:* An LLM-synthesized reasoning pass over the base layer and recent conversation, producing a higher-order model of the user's current state: "The user seems frustrated because the last two approaches failed; switch to a more conservative strategy with explicit checkpoints." The dialectic layer is computationally expensive (requires an LLM call to generate), so it is injected on a configurable cadence.
+
+**Configuration parameters:**
+- `contextCadence`: Inject base-layer user context every N messages. Default: 1 (every message). For high-throughput sessions, increase to 3–5.
+- `dialecticCadence`: Run dialectic synthesis every M messages. Default: 5. Higher values reduce cost but increase latency in adapting to user mood shifts.
+- `dialecticDepth`: Number of LLM passes for dialectic synthesis. 1 = fast, shallow. 2 = balanced (default). 3 = deep, catches subtle patterns but costs 3x.
+
+#### 7.2.6 Atropos RL Pipeline: From Trajectories to Training
+
+Hermes uniquely integrates a complete RL training pipeline, making it not just an agent but a **research platform for training tool-calling models**.
+
+**Stage 1: Trajectory Collection.**
+Every Hermes session automatically generates structured trajectory data: user messages, tool calls (with arguments), tool results, assistant responses, and timestamps. Trajectories are stored in a local SQLite database with LZ4 compression. A batch mode enables headless parallel workers with checkpointing for large-scale data collection without human interaction.
+
+**Stage 2: Training Modes.**
+Three RL algorithms are supported:
+
+```
+RLHF (Reinforcement Learning from Human Feedback):
+────────────────────────────────────────────────────
+trajectories → human rating → reward model training → PPO
+
+1. Present trajectory pairs to human annotators
+2. Annotators rate: which trajectory is better? (Bradley-Terry model)
+3. Train a reward model on the preference data
+4. Use PPO to optimize the agent policy against the reward model
+5. KL-regularize against reference policy to prevent reward hacking
+
+DPO (Direct Preference Optimization):
+──────────────────────────────────────
+preferred/rejected trajectory pairs → direct optimization (offline)
+
+1. Collect pairs of (preferred_trajectory, rejected_trajectory)
+   for the same task
+2. Compute DPO loss directly — no reward model needed:
+   L_DPO = -E[log σ(β · (log π_θ(y_w|x) - log π_ref(y_w|x))
+                     - β · (log π_θ(y_l|x) - log π_ref(y_l|x)))]
+   where y_w = preferred, y_l = rejected
+3. Single-stage offline training — simpler and more stable than RLHF
+
+GRPO (Group Relative Policy Optimization):
+──────────────────────────────────────────
+group sampling → relative advantage → no value network
+
+1. For each prompt, sample G completions from current policy
+2. Score each with verifiable reward (test pass rate, task completion)
+3. Normalize advantages within the group: Â_i = (r_i - μ) / σ
+4. Clipped surrogate loss with KL penalty (see Chapter 8.1 for full spec)
+5. No critic network needed — 50%+ memory savings
+```
+
+**Stage 3: Export.**
+Trajectories can be exported in ShareGPT format for fine-tuning any model. This enables a workflow where: (1) run Hermes with a frontier model to collect high-quality trajectories, (2) export to ShareGPT, (3) fine-tune a smaller model (e.g., Llama 3 8B) on those trajectories, (4) deploy the fine-tuned model as the Hermes backbone. The loop closes: the agent's usage data improves the agent's underlying model.
+
+**Stage 4: Environment Framework.**
+Atropos provides a three-layer environment hierarchy for standardized agent evaluation and training:
+
+```python
+class BaseEnv:
+    """Atropos base: defines observation/action spaces,
+    reward function interface, episode lifecycle."""
+    def reset(self) -> Observation: ...
+    def step(self, action: Action) -> tuple[Observation, float, bool, dict]: ...
+
+class HermesAgentBaseEnv(BaseEnv):
+    """Adds: tool registry, LLM interface, skill system,
+    trajectory recording, multi-turn conversation support."""
+    def register_tools(self, tools: list[Tool]) -> None: ...
+    def record_trajectory(self) -> Trajectory: ...
+
+class ConcreteTaskEnv(HermesAgentBaseEnv):
+    """Task-specific: SWE-Bench tasks, code generation,
+    web browsing, customer service, etc."""
+    def load_task(self, task_id: str) -> None: ...
+    def evaluate(self) -> float: ...
+```
+
+This makes Hermes a substrate for agent RL research: define a new task environment, collect trajectories, train, evaluate — all within a single framework.
+
+#### 7.2.7 Deployment and Scale
+
+Hermes runs on six terminal backends:
+
+| Backend | Isolation | Use Case | Latency |
+|---------|-----------|----------|---------|
+| Local | None | Dev, personal | <10ms |
+| Docker | Container | Isolated execution | 50–200ms |
+| SSH | Network | Remote machines | 50–150ms |
+| Daytona | VM + hibernation | Serverless, cost-efficient | 200–500ms (cold) |
+| Modal | Container + GPU | Batch RL, inference | 100–300ms |
+| Singularity | HPC container | Academic clusters | Variable |
+
+A single gateway process connects to 9 messaging platforms: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, iMessage, WeChat, and CLI. Model-agnostic: 200+ models supported via Nous Portal, OpenRouter, OpenAI, Anthropic, Google, Mistral, local (Ollama/vLLM), and custom endpoints.
+
+**Scale numbers (April 2026):** 99K+ GitHub stars. 370+ contributors. 47 built-in tools. v2026.4.16 (current). Average skill library size for a power user after 3 months: 40–80 skills.
+
+---
+
+### 7.3 Self-Evolving Skills: The SkillHub and ClawHub Ecosystem
+
+The most radical experiment in agent self-improvement is happening in the open-source skills ecosystem. SkillHub, ClawHub, and the `self-improving-agent` skill implement a pattern where agents autonomously create, test, and share self-improvement capabilities. This section documents the architecture, the ecosystem, and the security implications.
+
+#### 7.3.1 The Self-Improving-Agent Skill: Architecture
+
+The `self-improving-agent` skill (1,100+ stars, 90,000+ downloads on ClawHub within 2 months of release) implements a structured self-evolution cycle with seven stages:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│              SELF-EVOLVING AGENT CYCLE                          │
+│                                                                │
+│  STAGE 1: PERCEIVE GAP                                         │
+│  Detection signals (any one triggers):                         │
+│    • Task failure or incomplete output                         │
+│    • Same request type failing 3+ times (pattern detection)    │
+│    • User feedback: explicit correction or negative reaction   │
+│    • Efficiency anomaly: task taking >2x expected time/tokens  │
+│    • Tool error rate exceeding 15% threshold in a session      │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 2: SEARCH SOLUTIONS                                     │
+│    • Query SkillHub / ClawHub for relevant existing skills     │
+│    • Scan engineering blogs via web search                     │
+│    • Check GitHub trending for relevant tools/libraries        │
+│    • Review AGENTS.md, TOOLS.md for already-known solutions    │
+│    • If existing skill found with score > 0.75 → install it   │
+│      and skip to Stage 7                                       │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 3: DESIGN EXPERIMENT                                    │
+│    • Formulate hypothesis: "If I change X, metric Y should     │
+│      improve by Z%"                                            │
+│    • Create test case from the failure that triggered the gap  │
+│    • Define success criteria: metric name, baseline value,     │
+│      target value, measurement method                          │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 4: RUN EXPERIMENT                                       │
+│    • Execute the proposed improvement                          │
+│    • Measure before/after on the test case                     │
+│    • Record: time, token usage, error count, output quality    │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 5: SELECT WINNER                                        │
+│    • Compare old approach vs new approach on all metrics       │
+│    • If improvement > 10% on primary metric → proceed          │
+│    • If improvement ≤ 10% → log failure, try alternative       │
+│    • Maximum 3 alternative attempts before abandoning          │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 6: SOLIDIFY                                             │
+│    • Promote learning to permanent workspace files             │
+│    • Promotion target selection (see 7.3.2)                    │
+│    • Changes persist across ALL future sessions                │
+│                            │                                   │
+│                            ▼                                   │
+│  STAGE 7: NEXT ITERATION                                       │
+│    • Schedule next gap detection cycle                         │
+│    • Update internal metrics dashboard                         │
+└────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.2 The Solidification Mechanism
+
+Solidification is where temporary learnings become permanent agent behavior. The mechanism has four components:
+
+**Component 1: Capture.**
+Learnings are initially recorded in a `.learnings/` directory:
+
+```
+.learnings/
+├── LEARNINGS.md              # Insights from successful experiments
+├── ERRORS.md                 # Catalogued failure modes with verified fixes
+└── FEATURE_REQUESTS.md       # Identified capability gaps (no solution yet)
+```
+
+Each entry in `LEARNINGS.md` includes: date, trigger event, hypothesis, experiment result, and recommended promotion target.
+
+**Component 2: Promotion Targets.**
+The solidification engine selects the appropriate promotion target based on the learning's scope:
+
+```
+Learning scope                    → Target file         → Load frequency
+──────────────────────────────────────────────────────────────────────────
+Workflow/process improvements     → AGENTS.md           → Every session
+Tool-specific gotchas/tips        → TOOLS.md            → When tool is used
+Identity/behavioral patterns      → SOUL.md             → Every session
+Broadly applicable knowledge      → CLAUDE.md           → Every session
+                                  → .github/copilot-    → Every session
+                                    instructions.md       (for Copilot users)
+```
+
+**Component 3: Persistence.**
+Once promoted, learnings are injected into every subsequent session via the standard `CLAUDE.md` / `AGENTS.md` loading mechanism. The agent's behavior changes because its *context* changes, not its *weights*. No model retraining is required.
+
+**Component 4: Automated Review.**
+A heartbeat-driven promotion process runs on a configurable schedule (default: daily at 08:30 local time). It scans `.learnings/` for entries that have accumulated enough supporting evidence (minimum 2 related entries) and promotes them automatically. Single-occurrence learnings remain in `.learnings/` until corroborated.
+
+#### 7.3.3 SkillHub.cn: The Chinese AI Skills Ecosystem
+
+SkillHub (skillhub.cn / skillhub.mobi) is Tencent's localized AI skills platform for the Chinese OpenClaw ecosystem:
+
+| Metric | Value |
+|--------|-------|
+| Total skills available | 13,000+ (mirrored from ClawHub) |
+| Curated "Top 50" | Safety-audited, professionally selected |
+| Interface language | Full Chinese with optimized search (Jieba tokenizer) |
+| Major categories | 8 (Social Media, Development, Productivity, Research, Privacy, Office, Education, Creative) |
+| Infrastructure | Tencent Cloud CDN acceleration across 30+ edge nodes in mainland China |
+| Cost | Free (ad-supported and Tencent-subsidized) |
+
+**Most downloaded skills (as of Q1 2026):**
+
+| Rank | Skill | Downloads | Category | Description |
+|------|-------|-----------|----------|-------------|
+| 1 | Xiaohongshu Automation | 59,000+ | Social Media | Post scheduling, caption generation, hashtag optimization |
+| 2 | GitHub Collaboration | 48,000+ | Development | PR review, issue triage, code search |
+| 3 | Summarize | 44,000+ | Productivity | PDF/video/web page summarization with key points extraction |
+| 4 | Tavily Web Search | 39,000+ | Research | Real-time web search with source citation |
+| 5 | HaS Anonymizer | 31,000+ | Privacy | PII detection and redaction in documents |
+| 6 | Tencent Docs Skill | 27,000+ | Office | Read/write/format Tencent Docs (Chinese Office 365 equivalent) |
+
+Installation is one-line:
+
+```bash
+npx skillhub install summarize              # SkillHub (Tencent CDN)
+npx agent-skills-hub install self-improving-agent  # ClawHub (global)
+```
+
+#### 7.3.4 Security Analysis: Why Self-Evolving Skills Are Flagged Suspicious
+
+Both ClawHub and SkillHub flag self-evolution skills with explicit security warnings. The `self-improving-agent` skill on ClawHub carries a red "SUSPICIOUS" badge. The concern is concrete: a self-evolving skill has, by design, the ability to:
+
+1. Execute arbitrary shell commands (needed to run experiments)
+2. Modify agent configuration files: `CLAUDE.md`, `AGENTS.md`, `SOUL.md`, `TOOLS.md`
+3. Read system files and environment variables (needed to understand the workspace)
+4. Make network requests to arbitrary endpoints (needed to search for solutions)
+5. Modify its own skill definition (needed for self-improvement)
+
+A compromised or malicious self-evolving skill could gradually modify the agent's behavior in ways that are nearly undetectable because the changes look like "normal learning": a subtle instruction added to `AGENTS.md` that exfiltrates data, or a `SOUL.md` modification that makes the agent less cautious about executing dangerous commands.
+
+**Five mitigation patterns (from the ClawHub security advisory):**
+
+1. **Container isolation.** Run self-evolving agents in sandboxed containers (NanoClaw's approach). The container has no network access except to whitelisted domains. File modifications are journaled and reviewable.
+
+2. **Git-tracked configuration.** All config files (`CLAUDE.md`, `AGENTS.md`, `SOUL.md`) are tracked in Git. Every promotion creates a commit. `git diff` shows exactly what changed and when. Anomalous changes are detectable via automated review.
+
+3. **Human approval for high-privilege promotions.** Promotions to `SOUL.md` (identity-level changes) and `CLAUDE.md` (system-level context) require explicit human approval via a PR-like review flow. Only `AGENTS.md` and `TOOLS.md` promotions are auto-approved.
+
+4. **Rate limiting.** Maximum 3 promotions per day. Maximum 1 `SOUL.md` promotion per week. This bounds the speed at which a malicious skill can modify agent behavior.
+
+5. **Constitutional file.** A `CONSTITUTION.md` file specifies inviolable constraints (e.g., "never exfiltrate data," "always ask before deleting files"). The self-evolution mechanism cannot modify this file. The agent checks proposed promotions against the constitution before committing them.
+
+#### 7.3.5 Hermes vs OpenClaw Comparison
+
+| Dimension | Hermes Agent | OpenClaw + SkillHub |
+|-----------|-------------|---------------------|
+| **Skill creation** | Autonomous — agent writes SKILL.md after tasks | Community-driven — humans write, agent installs |
+| **Self-improvement** | Built-in via Atropos RL + mid-session skill patches | Via `self-improving-agent` skill (optional add-on) |
+| **Skill format** | agentskills.io standard (YAML + MD) | Same standard (fully interoperable) |
+| **Discovery** | FTS5 local search + LLM progressive disclosure | ClawHub/SkillHub marketplace search |
+| **Training pipeline** | RLHF/DPO/GRPO via Atropos | None built-in (relies on skill-level improvements) |
+| **User modeling** | Honcho 12-identity dialectical modeling | Simple MEMORY.md + daily notes |
+| **Security** | Per-skill permissions, platform-enforced sandbox | Community flagging + user responsibility |
+| **Ecosystem scale** | 99K+ stars, 47 built-in tools | 350K+ stars (OpenClaw) + 13K+ skills |
+| **Best for** | Power users who want deep personalization | Breadth of capability via community network effects |
+
+**The key insight:** Hermes is the "agent creates its own skills" paradigm. OpenClaw/SkillHub is the "community creates skills, agent evolves via curated ecosystem" paradigm. They are complementary, not competing — a Hermes agent can install skills from SkillHub, and a skill created by Hermes can be published to ClawHub.
+
+---
+
+### 7.4 MemRL: Reinforcement Learning for Memory Retrieval
+
+**Paper:** Zihao Zeng et al., "MemRL: Memory-Enhanced Reinforcement Learning for Language Agents," arXiv:2601.03192 (January 2026).
+
+MemRL solves a fundamentally different problem than the file-based systems above. Instead of relying on human-designed memory structures and hand-tuned retrieval heuristics, it **learns which memories are useful through reinforcement learning**. The core architectural insight is to decouple the LLM backbone (frozen) from the memory system (plastic), and train only the memory retrieval policy using task outcomes as reward signal.
+
+#### 7.4.1 The Intent-Experience-Utility (IEU) Triplet
+
+MemRL's memory unit is a triplet M = {(z_i, e_i, Q_i)} where:
+
+- **z_i (Intent):** A natural-language description of what the agent was trying to accomplish when this memory was created. Used as the semantic key for Phase 1 retrieval.
+- **e_i (Experience):** A structured record of what happened — the context, actions taken, outcome, and a one-sentence distillation. This is what gets injected into the LLM's context when the memory is retrieved.
+- **Q_i (Utility):** A learned scalar quality estimate in [0, 1] that predicts how useful retrieving this memory will be for the current task. Updated via Monte Carlo Q-learning from task outcomes.
+
+Formally:
+
+```python
+@dataclass
+class IEUTriplet:
+    # z: Intent (semantic retrieval key)
+    intent: str
+    intent_embedding: np.ndarray       # Pre-computed, dim=1024 (gte-large)
+
+    # e: Experience (injected into context when retrieved)
+    experience: Experience
+
+    # Q: Utility (learned via RL)
+    q_value: float = 0.5              # Prior: assume neutral utility
+    retrieval_count: int = 0
+    success_when_retrieved: int = 0
+    last_updated: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class Experience:
+    context: str                       # What was the situation?
+    actions: list[str]                 # What steps were taken?
+    outcome: Literal["SUCCESS", "FAILURE", "PARTIAL"]
+    key_insight: str                   # One-sentence takeaway
+    metadata: dict[str, Any]           # Task-specific fields
+```
+
+#### 7.4.2 Two-Phase Retrieval Algorithm
+
+Retrieval proceeds in two phases, separating breadth (semantic relevance) from depth (learned utility):
+
+```
+ALGORITHM: MemRL Two-Phase Retrieval
+─────────────────────────────────────
+Input:
+  T    — current task description (natural language)
+  M    — memory store: {(z_i, e_i, Q_i)}_{i=1}^{|M|}
+  K    — Phase 1 candidate count (default: 50)
+  k    — Phase 2 selection count (default: 3–5)
+  λ    — exploration bonus weight (default: 0.1)
+
+Phase A — Semantic Filter:
+  1. Compute embedding: v_T = Embed(T)                # e.g., gte-large-en-v1.5
+  2. For each memory m_i ∈ M:
+       sim_i = cosine(v_T, m_i.intent_embedding)
+  3. Select top-K by sim_i:
+       Candidates = argtop_K(sim)
+  Complexity: O(|M|) with exact search, O(log |M|) with ANN (FAISS/Qdrant)
+  Latency: < 10ms with FAISS HNSW index for |M| ≤ 100K
+
+Phase B — Q-Value Selection with Exploration:
+  4. For each candidate m_i ∈ Candidates:
+       score_i = Q_i + λ · √(ln(N) / max(n_i, 1))
+     where:
+       Q_i    = m_i.q_value (learned utility)
+       N      = total retrieval operations across all memories
+       n_i    = m_i.retrieval_count
+       λ · √(ln(N)/n_i) = UCB exploration bonus
+  5. Select top-k by score_i:
+       Retrieved = argtop_k(score)
+  6. Inject Retrieved into LLM context as structured examples.
+  Complexity: O(K)
+  Latency: < 1ms
+
+Output: Retrieved memories {m_1, ..., m_k}
+```
+
+The exploration bonus (λ · √(ln(N)/n_i)) is a UCB1-style term that ensures under-explored memories get retrieved occasionally, preventing the system from converging prematurely on a small set of "safe" memories. In the paper's ablation, removing the exploration bonus reduces performance by 3–5% on tasks requiring novel strategy transfer.
+
+#### 7.4.3 Monte Carlo Q-Value Updates
+
+After each completed task, the Q-values of all retrieved memories are updated using the observed task reward:
+
+```
+ALGORITHM: Monte Carlo Q-Value Update
+──────────────────────────────────────
+Input:
+  R           — set of memories retrieved for this task
+  r           — task reward ∈ [0, 1]
+                (1.0 = success, 0.0 = failure, fractional = partial)
+  α           — learning rate (default: 0.05)
+
+For each memory m_i ∈ R:
+  m_i.q_value ← m_i.q_value + α · (r − m_i.q_value)
+  m_i.retrieval_count ← m_i.retrieval_count + 1
+  if r > 0.5:
+    m_i.success_when_retrieved ← m_i.success_when_retrieved + 1
+  m_i.last_updated ← now()
+```
+
+This is a first-visit Monte Carlo update. The Q-value for each memory exponentially averages toward the mean task reward when that memory is retrieved. With α = 0.05, approximately 14 retrievals are needed for the Q-value to converge within 0.05 of its true expectation (since (1 − α)^n = 0.5 at n ≈ 14 for α = 0.05).
+
+**Convergence property:** Under the assumption that task reward distributions are stationary and the exploration bonus ensures every memory is retrieved infinitely often, the Q-values converge almost surely to the true expected reward conditional on retrieval: Q_i → E[r | m_i retrieved]. This follows directly from the Robbins-Monro conditions on the learning rate schedule (α_t → 0, Σα_t = ∞, Σα_t² < ∞; the constant α = 0.05 satisfies this approximately for the memory counts encountered in practice).
+
+#### 7.4.4 Model-Memory Decoupling: The Stability-Plasticity Resolution
+
+The central architectural principle of MemRL is **Model-Memory Decoupling**: the LLM backbone is frozen (its weights never change during deployment), and all adaptation happens in the memory store's Q-values.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│           FROZEN COMPONENT: LLM Backbone                  │
+│                                                          │
+│  Weights: Fixed. Never updated during deployment.        │
+│  Input:   [System Prompt] + [Retrieved Memories] +       │
+│           [Task Description] + [Conversation History]    │
+│  Output:  Actions, tool calls, natural-language responses │
+│                                                          │
+│  Model can be swapped (GPT-4o → Claude Sonnet → Llama)  │
+│  without losing accumulated memory.                       │
+└──────────────────────────────────────────────────────────┘
+          ▲ retrieved memories (injected as context)
+          │
+          │ task outcome (reward signal)
+          ▼
+┌──────────────────────────────────────────────────────────┐
+│          PLASTIC COMPONENT: Memory System                 │
+│                                                          │
+│  Memory Store:    {(z_i, e_i, Q_i)} — IEU triplets      │
+│  Retrieval:       Phase A (embedding) + Phase B (Q+UCB)  │
+│  Learning:        Monte Carlo Q-value updates            │
+│                                                          │
+│  Grows continuously. Q-values adapt to task distribution. │
+│  Interpretable: every entry is human-readable.           │
+└──────────────────────────────────────────────────────────┘
+```
+
+This architecture resolves the **stability-plasticity dilemma** that plagues online RL on LLM weights:
+
+- **Stability:** The frozen backbone cannot suffer catastrophic forgetting. Its capabilities — language understanding, reasoning, code generation — are preserved exactly. Q-value updates on a memory store cannot degrade the base model's performance on any task.
+
+- **Plasticity:** The memory store is fully plastic. New memories are added after every task. Q-values are updated continuously. The agent's behavior changes because the memories injected into its context change — not because its weights change.
+
+- **Transferability:** When a better model is released, swap the backbone. The accumulated memory store transfers without modification, because the memory content is model-agnostic natural language.
+
+- **Interpretability:** Every memory entry can be inspected. Its Q-value reveals how useful the system has found it. The retrieval log shows exactly which memories influenced each decision. Compare this to fine-tuned weights, where the learned knowledge is distributed across billions of parameters and cannot be inspected or explained.
+
+#### 7.4.5 Benchmark Results
+
+MemRL was evaluated against five baselines across four benchmark suites:
+
+| Benchmark | MemRL | RAG (static) | Self-RAG | Mem0 | MemoryPalace | Pass@5 |
+|---|---|---|---|---|---|---|
+| **HLE** (hard reasoning) | **34.2%** | 27.1% | 29.8% | 28.3% | 30.1% | 31.5% |
+| **BigCodeBench** | **68.7%** | 62.4% | 64.1% | 63.2% | 65.0% | 66.8% |
+| **ALFWorld** | **71.3%** | 58.2% | 61.7% | 60.4% | 63.8% | 65.2% |
+| **Lifelong Agent Bench** | **56.8%** | 43.1% | 47.3% | 45.9% | 49.2% | 51.0% |
+
+**Analysis of improvements:**
+
+- **Lifelong Agent Bench** (+13.7 pp over static RAG): The largest improvement, because this benchmark explicitly measures cross-episode learning. The Q-value mechanism accumulates genuine learning signal across 100+ episodes, progressively surfacing the most useful memories for each task type.
+
+- **ALFWorld** (+13.1 pp over static RAG): Household tasks benefit from accumulated heuristics ("always check the drawer before the shelf for small objects"). Each heuristic eliminates a class of wasted actions, and they compound multiplicatively.
+
+- **HLE** (+7.1 pp over static RAG): Hard reasoning benefits less from memory because each problem is relatively unique. The gain comes from retrieving worked examples of similar reasoning patterns, not from task-specific knowledge.
+
+- **BigCodeBench** (+6.3 pp over static RAG): The smallest gain. Code generation is dominated by per-task context (the specific function signature, the test cases) rather than cross-task memory. MemRL still helps by surfacing relevant API usage patterns, but the effect is smaller.
+
+**Ablation results:**
+
+| Ablation | ALFWorld | BigCodeBench |
+|---|---|---|
+| Full MemRL | **71.3%** | **68.7%** |
+| No Q-learning (use only semantic similarity) | 63.8% | 64.9% |
+| No exploration bonus (λ = 0) | 68.1% | 67.2% |
+| No memory (zero-shot) | 52.4% | 58.1% |
+| Random memory retrieval | 55.8% | 60.3% |
+
+Removing Q-learning (reverting to pure semantic retrieval) loses 7.5 pp on ALFWorld and 3.8 pp on BigCodeBench. Removing the exploration bonus loses 3.2 pp and 1.5 pp respectively — smaller but still significant, especially on novel task variants.
+
+---
+
+### 7.5 OpenClaw Three-Tier Memory with Dreaming
+
+OpenClaw (2025–2026, 350K+ GitHub stars) implements the most complete three-tier memory system in the open-source agent ecosystem. Its distinguishing feature is the "Dreaming" consolidation mechanism that runs as an overnight batch process, converting episodic daily notes into durable semantic memory.
+
+#### 7.5.1 Tier 1: Long-Term Memory — `MEMORY.md`
+
+The `MEMORY.md` file is the semantic store. It contains distilled, verified knowledge about the project, the team, and the agent's own capabilities. Structured with explicit sections, each with a last-updated timestamp for staleness detection:
 
 ```markdown
 # MEMORY.md
@@ -327,672 +1047,386 @@ Last consolidated: 2026-03-14T03:00:00Z
 
 ## Repository Architecture
 <!-- Updated: 2026-03-12 -->
-- Monorepo: Go backend (cmd/, internal/), React frontend (web/), shared
-  proto definitions (proto/)
-- Backend uses Chi router, sqlc for DB queries, pgx for PostgreSQL driver
-- Frontend uses Vite, React 19, TanStack Query for data fetching
-- CI: GitHub Actions, runs `make lint test` on every PR
-- Deploy: ArgoCD watches main branch, auto-deploys to staging
+- Monorepo: Go backend (cmd/, internal/), React frontend (web/),
+  shared proto definitions (proto/)
+- Backend: Chi router, sqlc for DB queries, pgx for PostgreSQL
+- Frontend: Vite, React 19, TanStack Query
+- CI: GitHub Actions, `make lint test` on every PR
+- Deploy: ArgoCD → staging (auto), production (manual approval)
 
 ## Database Conventions
 <!-- Updated: 2026-03-14 -->
-- All tables use UUID primary keys generated by `gen_random_uuid()`
-- Timestamps are `timestamptz`, never `timestamp`
-- Migrations in `migrations/` directory, use golang-migrate
-- IMPORTANT: migration files must be named {version}_{description}.up.sql
-  and {version}_{description}.down.sql — the version is a Unix timestamp
-- Connection pool: max 25 connections in staging, 100 in production
+- All tables: UUID PKs via gen_random_uuid()
+- Timestamps: always timestamptz, never timestamp
+- Migrations: golang-migrate, files named
+  {unix_timestamp}_{description}.{up|down}.sql
+- Pool: 25 connections (staging), 100 (production)
 
 ## Testing Patterns
 <!-- Updated: 2026-03-10 -->
-- Unit tests: `go test ./...` (no Docker required)
-- Integration tests: `make test-integration` (starts PostgreSQL in Docker)
-- Frontend tests: `cd web && pnpm test` (Vitest)
-- E2E tests: `make test-e2e` (Playwright, requires both backend and frontend)
-- GOTCHA: Integration tests require `TEST_DATABASE_URL` env var. If missing,
-  tests silently skip instead of failing. Always check test output for
-  "skipping: TEST_DATABASE_URL not set"
+- Unit: `go test ./...` (no Docker)
+- Integration: `make test-integration` (PostgreSQL in Docker)
+- Frontend: `cd web && pnpm test` (Vitest)
+- E2E: `make test-e2e` (Playwright, both services required)
+- GOTCHA: Integration tests silently skip without TEST_DATABASE_URL
 
 ## Known Issues
 <!-- Updated: 2026-03-13 -->
-- The WebSocket reconnection logic has a race condition when the server
-  restarts during an active subscription. Workaround: client-side retry
-  with exponential backoff (already implemented in web/src/lib/ws.ts)
-- sqlc codegen sometimes produces incorrect null handling for LEFT JOIN
-  columns. Always verify generated code for nullable fields after
-  regenerating.
+- WebSocket reconnection race on server restart
+  (workaround: client exponential backoff in web/src/lib/ws.ts)
+- sqlc codegen: incorrect null handling for LEFT JOIN columns
+  (always verify nullable fields after regenerating)
 ```
 
-Update rules for `MEMORY.md` are strict: the file is **never** updated during a task session. Updates happen only during the Dreaming consolidation process (Tier 3). This prevents in-flight contamination where a partially-learned lesson gets committed to long-term memory before the task outcome is known.
+**Critical update rule:** `MEMORY.md` is **never** updated during a task session. Updates happen only during Dreaming (Tier 3). This prevents in-flight contamination — partially-learned lessons being committed to long-term memory before the task outcome is known.
 
-**Tier 2: Daily notes — episodic memory**
+#### 7.5.2 Tier 2: Daily Notes — Episodic Memory
 
-After each task session, the agent generates a structured daily note. The format is rigid to enable machine processing during Dreaming:
+After each task session, the agent generates a structured daily note with a rigid format designed for machine processing during Dreaming:
 
 ```markdown
 # Daily Note: 2026-03-14
 
 ## Session 1: 09:15–10:42 UTC
 ### Task
-Implement rate limiting on the /api/v1/search endpoint
+Implement rate limiting on /api/v1/search
 
 ### Context
 - Ticket: PROJ-1847
 - Requester: Sara (backend team lead)
-- Priority: P1 (production users hitting 429s from upstream provider)
+- Priority: P1
 
 ### Actions Taken
-1. Read existing middleware stack in `internal/middleware/`
-2. Found no existing rate limiter — project uses Chi middleware chain
-3. Evaluated options: golang.org/x/time/rate (token bucket), custom
-   sliding window with Redis, tollbooth library
-4. Chose golang.org/x/time/rate because:
-   - No Redis dependency (keeps infra simple)
-   - Token bucket matches the upstream provider's rate limit model
-   - Already in go.mod as transitive dependency
+1. Read middleware stack in internal/middleware/
+2. No existing rate limiter — Chi middleware chain
+3. Evaluated: golang.org/x/time/rate, Redis sliding window, tollbooth
+4. Chose x/time/rate: no Redis dep, token bucket model matches upstream,
+   already transitive dep in go.mod
 5. Implemented per-IP rate limiter: 10 req/s burst, 5 req/s sustained
-6. Added X-RateLimit-Remaining and Retry-After headers
-7. Wrote unit tests (4 cases) and integration test (1 case)
+6. Added X-RateLimit-Remaining, Retry-After headers
+7. Wrote 4 unit tests + 1 integration test
 
 ### Outcome
 SUCCESS — PR #412 merged after 1 review round
 
 ### What Worked
-- Checking transitive dependencies before adding new ones saved a
-  dependency review cycle
-- Writing the integration test first caught a bug where the rate limiter
-  was applied after authentication middleware (should be before)
+- Checking transitive deps before adding new ones saved review cycle
+- Integration test first caught middleware ordering bug
 
 ### What Didn't Work
-- Initially tried to use sync.Map for per-IP limiters, but the cleanup
-  goroutine had a memory leak. Switched to an LRU cache with TTL.
+- sync.Map for per-IP limiters → memory leak in cleanup goroutine
+- Switched to hashicorp/golang-lru with TTL
 
 ### Lessons
-- Rate limiters should be placed BEFORE authentication in the middleware
-  chain to prevent unauthenticated clients from consuming auth resources
-- sync.Map is a poor choice for caches that need TTL eviction — use
-  hashicorp/golang-lru or similar
-- Always check `go.sum` for transitive dependencies before adding new ones
+- Rate limiter goes BEFORE auth middleware
+- sync.Map is wrong for caches needing TTL eviction
+- Check go.sum for transitive deps before adding new ones
 ```
 
-Daily notes accumulate in a `daily_notes/` directory. The agent reads them on-demand when starting a task that matches keywords from past notes. Retrieval is embedding-based: each daily note is embedded as a single vector using the task description as the key field, and cosine similarity against the current task description retrieves the top-3 relevant notes.
+Daily notes accumulate in a `daily_notes/` directory. Retrieval is embedding-based: each note is embedded as a single vector keyed on the task description, and cosine similarity against the current task description retrieves the top-3 relevant notes.
 
-**Tier 3: Dreaming — overnight consolidation**
+#### 7.5.3 Tier 3: Dreaming — Overnight Consolidation
 
-The Dreaming process runs as a scheduled batch job (typically a cron job at 03:00 UTC). It reads all daily notes since the last consolidation and produces updates to `MEMORY.md`. The process has four stages:
-
-```
-Stage 1: CLUSTER
-─────────────────
-Input:  All daily notes since last Dreaming cycle
-Method: Embed each note (task description field), cluster by cosine
-        similarity with threshold > 0.72
-Output: Groups of related notes
-
-Stage 2: EXTRACT
-─────────────────
-Input:  Each cluster of related notes
-Prompt: "Given these {N} session records about {cluster_topic}:
-         1. What patterns repeat across sessions?
-         2. What mistakes were made more than once?
-         3. What non-obvious knowledge would help future sessions?
-         4. Are there conventions or heuristics to codify?
-         Output as structured JSON with fields: patterns, mistakes,
-         knowledge, conventions"
-Output: Structured extractions per cluster
-
-Stage 3: MERGE
-─────────────────
-Input:  Structured extractions + current MEMORY.md
-Prompt: "Given the current MEMORY.md and these new extractions,
-         produce an updated MEMORY.md that:
-         1. Adds new knowledge in the appropriate section
-         2. Updates existing entries that need refinement
-         3. Flags contradictions for human review (prefix with ⚠️)
-         4. Updates the 'Last consolidated' timestamp
-         Do NOT delete existing entries unless directly contradicted.
-         Preserve all section headers and formatting."
-Output: Updated MEMORY.md (written to file)
-
-Stage 4: ARCHIVE
-─────────────────
-Input:  Daily notes that were processed
-Action: Move to daily_notes/archived/ directory
-        (Not deleted — still available for retrieval but deprioritized
-        with a 0.5x score multiplier)
-```
-
-The Dreaming process costs approximately $0.50–$2.00 per run (depending on note volume and model choice), processing 5–20 daily notes in a typical cycle. Practitioners report that GPT-4o-mini or Claude Haiku produce adequate extraction quality at 10–20x lower cost than frontier models. The merge stage benefits from a stronger model (GPT-4o or Claude Sonnet) because it requires understanding the existing `MEMORY.md` structure.
-
-**Quality control is the critical engineering challenge.** Without filtering, the extraction stage hallucinates generalizations. A single session where the agent used a workaround gets generalized into "always use this workaround," even when the underlying issue has been fixed. Production deployments add two quality gates:
-
-1. **Minimum cluster size = 2.** Lessons from single sessions are not generalized. They must appear in at least 2 related sessions before being promoted to `MEMORY.md`.
-2. **Contradiction detection.** If the extraction contradicts an existing `MEMORY.md` entry, it is flagged with ⚠️ and requires human approval before merging.
-
-### 7.4 MemRL: Learning What to Remember
-
-MemRL (Chen et al., 2026) solves a different problem than the file-based systems above: instead of relying on human-designed memory structures, it learns which memories are useful through reinforcement learning. The core idea is to decouple the LLM backbone (frozen) from the memory system (plastic), and train only the memory retrieval policy using task outcomes as reward.
-
-**The Intent-Experience-Utility (IEU) triplet** is MemRL's memory unit:
-
-```python
-from dataclasses import dataclass, field
-from datetime import datetime
-
-@dataclass
-class MemoryEntry:
-    # INTENT: What the agent was trying to do (used for semantic retrieval)
-    intent: str
-
-    # EXPERIENCE: What happened (injected into LLM context when retrieved)
-    experience: Experience
-
-    # UTILITY: How useful this memory has been (learned via Q-updates)
-    utility: Utility
-
-@dataclass
-class Experience:
-    context: str              # Situation when this experience was recorded
-    actions_taken: list[str]  # Steps the agent took
-    outcome: str              # SUCCESS | FAILURE | PARTIAL
-    key_insight: str          # One-sentence distillation
-
-@dataclass
-class Utility:
-    q_value: float = 0.5            # Learned quality estimate, range [0, 1]
-    retrieval_count: int = 0         # Times this memory was retrieved
-    success_when_retrieved: int = 0  # Times task succeeded after retrieval
-    last_retrieved: datetime = field(default_factory=datetime.now)
-    last_updated: datetime = field(default_factory=datetime.now)
-```
-
-**Two-Phase Retrieval** separates breadth from depth:
+The Dreaming process runs as a scheduled batch job (default: cron at 03:00 UTC). It reads all daily notes since the last consolidation and produces updates to `MEMORY.md` through four stages:
 
 ```
-Phase 1: SEMANTIC FILTER
-─────────────────────────
-Input:  Current task description T, Memory store M (all entries)
-Method: Embed T using sentence transformer (e.g., gte-large-en-v1.5)
-        Compute cosine similarity against all intent embeddings
-        Return top-K candidates (K=50 to 100)
-Cost:   Single embedding + ANN search, <10ms with FAISS/Qdrant
+ALGORITHM: Dreaming Consolidation
+──────────────────────────────────
 
-Phase 2: UTILITY RERANKING
-───────────────────────────
-Input:  K candidate memories from Phase 1, current context C
-Method: Score each candidate by Q-value:
-        score(m) = Q(m.intent, C)
-        Return top-k by score (k=3 to 5)
-Cost:   K scalar lookups, <1ms
+STAGE 1: CLUSTER
+  Input:  Daily notes since last Dreaming run
+  Method: Embed each note (task description as key field)
+          Cluster by cosine similarity, threshold > 0.72
+  Output: Groups of related notes (minimum cluster size: 2)
+
+STAGE 2: EXTRACT
+  Input:  Each cluster of ≥ 2 related notes
+  Prompt: "Given these {N} session records about {cluster_topic}:
+           1. What patterns repeat across sessions?
+           2. What mistakes were made more than once?
+           3. What non-obvious knowledge would help future sessions?
+           4. Are there conventions or heuristics to codify?
+           Output: JSON {patterns, mistakes, knowledge, conventions}"
+  Output: Structured extractions per cluster
+
+STAGE 3: MERGE
+  Input:  Extractions + current MEMORY.md
+  Prompt: "Given the current MEMORY.md and new extractions,
+           produce an updated MEMORY.md that:
+           1. Adds new knowledge in the appropriate section
+           2. Updates existing entries that need refinement
+           3. Flags contradictions with ⚠️ for human review
+           4. Updates the 'Last consolidated' timestamp
+           Do NOT delete unless directly contradicted."
+  Output: Updated MEMORY.md (written to disk)
+
+STAGE 4: ARCHIVE
+  Input:  Processed daily notes
+  Action: Move to daily_notes/archived/
+          (Still available for retrieval, but with 0.5x score multiplier)
 ```
 
-The Phase 2 Q-values are updated using Monte Carlo returns from task outcomes. After each completed task:
+**Cost per Dreaming run:** $0.50–$2.00, processing 5–20 daily notes. GPT-4o-mini or Claude Haiku produce adequate extraction quality for Stages 1–2 at 10–20x lower cost than frontier models. Stage 3 (merge) benefits from a stronger model (GPT-4o or Claude Sonnet) because it requires understanding the existing `MEMORY.md` structure.
 
-```python
-def update_q_values(
-    retrieved_memories: list[MemoryEntry],
-    task_reward: float,   # 1.0 = success, 0.0 = failure, 0.0-1.0 = partial
-    alpha: float = 0.05,  # Learning rate
-):
-    for memory in retrieved_memories:
-        old_q = memory.utility.q_value
-        # Monte Carlo update: target is the observed reward
-        memory.utility.q_value = old_q + alpha * (task_reward - old_q)
-        memory.utility.retrieval_count += 1
-        if task_reward > 0.5:
-            memory.utility.success_when_retrieved += 1
-        memory.utility.last_updated = datetime.now()
-```
+**Quality gates:**
 
-This is the simplest form of Q-learning applied to memory retrieval. The Q-value for each memory converges toward the average task success rate when that memory is retrieved. Memories that are consistently associated with successful tasks develop high Q-values; memories that don't help (or hurt) develop low Q-values.
+1. **Minimum cluster size = 2.** Single-session learnings are not generalized. They must appear in ≥ 2 related sessions before promotion to `MEMORY.md`. This prevents spurious generalizations from one-off workarounds.
 
-**Model-Memory Decoupling** is MemRL's architectural principle. The LLM backbone is frozen — its weights never change. All adaptation happens in the memory store:
+2. **Contradiction detection.** If an extraction contradicts an existing `MEMORY.md` entry, it is flagged with ⚠️ and requires human approval. This catches cases where the agent learned the wrong lesson from a successful outcome (correlation ≠ causation).
 
-```
-┌─────────────────────────────────────────────────┐
-│ FROZEN: LLM Backbone                            │
-│ (GPT-4o, Claude Sonnet, Llama 3, etc.)          │
-│                                                  │
-│ Input: [System Prompt] + [Retrieved Memories]    │
-│        + [Task Description] + [Conversation]     │
-│                                                  │
-│ Output: Actions, tool calls, responses           │
-└─────────────────────────────────────────────────┘
-          ▲ retrieved memories          │ task outcome
-          │                             ▼
-┌─────────────────────────────────────────────────┐
-│ PLASTIC: Memory System                           │
-│                                                  │
-│ ┌─────────────┐  ┌──────────────────────┐       │
-│ │ Memory Store │  │ Retrieval Policy     │       │
-│ │ (IEU entries)│  │ (Phase 1: embedding  │       │
-│ │              │  │  Phase 2: Q-values)  │       │
-│ └──────┬──────┘  └──────────┬───────────┘       │
-│        │    Q-value updates  │                   │
-│        └─────────────────────┘                   │
-└─────────────────────────────────────────────────┘
-```
+#### 7.5.4 The Markdown Brain Pattern in Production
 
-This decoupling gives three practical advantages:
+The Dreaming architecture is an instance of what practitioners call the "Markdown Brain" pattern — the most effective production memory system in 2025–2026. The pattern works because it optimizes for three things that actually matter:
 
-1. **Zero fine-tuning cost.** The LLM is used as-is. When a better model comes out, swap it in and the accumulated memory transfers. No retraining.
-2. **Stability.** Online RL on LLM weights risks catastrophic forgetting. Q-value updates on a memory store cannot break the underlying model.
-3. **Interpretability.** You can inspect every memory entry, see its Q-value, and understand why it was or wasn't retrieved. Try doing that with fine-tuned weights.
+1. **Transparency.** You can `cat` the agent's memory. There is no opaque embedding database to debug.
+2. **Editability.** You can fix the agent's memory with a text editor. Bad learning? Delete the line.
+3. **Context-window efficiency.** Markdown compresses well into tokens. A full `MEMORY.md` typically costs 500–1,500 tokens.
 
-**Benchmark results** demonstrate that learned retrieval outperforms static retrieval across diverse tasks:
+**Token budget for the Markdown Brain:**
 
-| Benchmark | MemRL | RAG (static) | Self-RAG | Mem0 | MemoryPalace | Pass@5 |
-|---|---|---|---|---|---|---|
-| HLE (hard reasoning) | 34.2% | 27.1% | 29.8% | 28.3% | 30.1% | 31.5% |
-| BigCodeBench | 68.7% | 62.4% | 64.1% | 63.2% | 65.0% | 66.8% |
-| ALFWorld | 71.3% | 58.2% | 61.7% | 60.4% | 63.8% | 65.2% |
-| Lifelong Agent Bench | 56.8% | 43.1% | 47.3% | 45.9% | 49.2% | 51.0% |
+| File | Size | Tokens | Load Frequency |
+|---|---|---|---|
+| MEMORY.md | 2–5 KB | 600–1,500 | Every session |
+| Corrections.md | 1–3 KB | 300–900 | Every session |
+| Index.md | 0.5 KB | ~150 | Every session |
+| **Startup total** | **3.5–8.5 KB** | **~1,050–2,550** | — |
 
-The improvement over static RAG ranges from 6–14 percentage points. The largest gains are on benchmarks that require learning across episodes (ALFWorld, Lifelong Agent Bench), where the Q-value mechanism accumulates genuine learning signal. The smallest gain is on BigCodeBench, where individual task context matters more than cross-task memory.
+With a 200K-token context window, startup memory consumes 0.5–1.3%. If your memory system exceeds 5% of the context window on startup, you are loading too much.
 
-### 7.5 Memory Architecture Decision Tree
+**Write discipline** is the hardest engineering challenge. Without strict rules, the agent either writes too little (missing valuable lessons) or too much (polluting memory with noise). Production-tested rules:
 
-When building a new agent system, use this decision tree to select the right memory architecture:
+- Each entry must be **actionable** (not "learned about the codebase")
+- Each entry must be **specific** (include file paths, command names, config keys)
+- Each correction must include **both the mistake AND the fix**
+- Never duplicate — update existing entries instead
+- Cap rolling logs (e.g., Conversation Log) at 50 entries; prune oldest 20 when exceeded
+
+---
+
+### 7.6 Memory Architecture Decision Tree
+
+When building a new agent system, use this decision tree to select the right memory architecture. The tree is parameterized by deployment model, team size, auditability requirements, and learning needs.
 
 ```
 START: What is the agent's deployment model?
 │
-├─► Single-session, stateless (e.g., chatbot, one-shot task)
-│   → Use CONTEXT-WINDOW MANAGEMENT only
-│     Implement: conversation summarization, observation truncation
-│     Tools: Built-in to most LLM frameworks
-│     Latency impact: 0ms (no external retrieval)
+├─► Single-session, stateless (chatbot, one-shot task)
+│   → CONTEXT-WINDOW MANAGEMENT only
+│     Implementation: conversation summarization, observation truncation
+│     Storage: none (all in-context)
+│     Latency: 0ms (no external retrieval)
 │     Complexity: Low
+│     Example: ChatGPT, most customer service bots
 │
-├─► Multi-session, same user/project (e.g., coding assistant)
+├─► Multi-session, same user/project (coding assistant, personal agent)
 │   │
-│   ├─► Team size ≤ 5, repos ≤ 3
-│   │   → Use MARKDOWN BRAIN pattern (Section 7.1)
-│   │     Implement: CLAUDE.md + AgentBrain directory
-│   │     Storage: Git repository (version controlled with the code)
-│   │     Latency impact: 0ms (files read at session start)
+│   ├─► Team ≤ 5 people, ≤ 3 repositories
+│   │   → MARKDOWN BRAIN pattern (Section 7.5.4)
+│   │     Implementation: MEMORY.md + Corrections.md + CLAUDE.md startup hook
+│   │     Storage: Git repo (version-controlled with code)
+│   │     Latency: 0ms (files read at session start)
 │   │     Complexity: Low
+│   │     When to upgrade: When you need audit trails or multi-agent coordination
 │   │
-│   └─► Team size > 5, repos > 3, or multi-agent
+│   ├─► Team > 5 OR repos > 3 OR strong audit requirements
+│   │   → EVENT-SOURCED architecture (Section 7.1)
+│   │     Implementation: typed events, append-only log, condensation strategies
+│   │     Storage: PostgreSQL JSONB, EventStoreDB, or filesystem
+│   │     Latency: 0ms (state derived from local log)
+│   │     Complexity: High
+│   │     When to use: when exact replay and branching are worth the complexity
+│   │
+│   └─► Focus on learning across sessions
 │       │
-│       ├─► Strong auditability requirements
-│       │   → Use EVENT-SOURCED architecture (Section 7.2)
-│       │     Implement: Typed events, append-only log, condensation
-│       │     Storage: PostgreSQL JSONB or EventStoreDB
-│       │     Latency impact: 0ms (state derived from local log)
-│       │     Complexity: High
+│       ├─► Sufficient task volume (≥ 100 tasks/week)
+│       │   │
+│       │   ├─► Full-stack control (self-hosted models)
+│       │   │   → MemRL (Section 7.4)
+│       │   │     Implementation: IEU triplets, two-phase retrieval, Q-learning
+│       │   │     Storage: Vector DB (Qdrant/FAISS) + metadata store (Postgres)
+│       │   │     Latency: 10–50ms per retrieval
+│       │   │     Complexity: Medium-High
+│       │   │
+│       │   └─► API-only model access
+│       │       → THREE-TIER with Dreaming (Section 7.5)
+│       │         Implementation: MEMORY.md + daily notes + consolidation cron
+│       │         Storage: filesystem + embedding index
+│       │         Latency: 10–100ms per retrieval
+│       │         Complexity: Medium
 │       │
-│       └─► Focus on learning across sessions
-│           │
-│           ├─► You control the full stack (self-hosted models)
-│           │   → Use MemRL (Section 7.4)
-│           │     Implement: IEU triplets, two-phase retrieval, Q-learning
-│           │     Storage: Vector DB (Qdrant/FAISS) + metadata store
-│           │     Latency impact: 10–50ms per retrieval
-│           │     Complexity: Medium-High
-│           │
-│           └─► API-only model access
-│               → Use THREE-TIER with Dreaming (Section 7.3)
-│                 Implement: MEMORY.md + daily notes + consolidation cron
-│                 Storage: File system + embedding index
-│                 Latency impact: 10–100ms per retrieval
-│                 Complexity: Medium
+│       └─► Low task volume (< 100 tasks/week)
+│           → MARKDOWN BRAIN with manual curation
+│             The Q-value signal is too sparse to learn meaningful
+│             utility estimates. Rely on human judgment for memory
+│             curation until volume increases.
 │
-└─► Multi-agent system, shared knowledge base
-    → Use MEMORY-AS-A-SERVICE (e.g., Mem0)
-      Implement: Central memory API, per-agent and per-user scoping
-      Storage: Vector DB + Graph DB (Neo4j)
-      Latency impact: 50–200ms per retrieval (network hop)
-      Complexity: High (operational overhead of running memory service)
+├─► Multi-agent system, shared knowledge base
+│   → MEMORY-AS-A-SERVICE (e.g., Mem0, custom API)
+│     Implementation: central memory API, per-agent and per-user scoping
+│     Storage: Vector DB + Graph DB (Neo4j, for relationship modeling)
+│     Latency: 50–200ms per retrieval (network hop)
+│     Complexity: High (operational overhead of running memory service)
+│
+└─► Formal guarantees required (safety-critical, provably convergent)
+    → MEMORY-AUGMENTED MDP with Read-Write Learning (Section 7.7)
+      Implementation: M-MDP formulation, entropy-regularized policy iteration
+      Complexity: Very High (research-grade)
+      When to use: when you need convergence guarantees, not just empirical results
 ```
 
-**The overriding principle: start with the simplest architecture that could work, and add complexity only when you have evidence that the simpler approach is insufficient.** The Markdown brain pattern handles 80% of use cases. Event sourcing is warranted when audit trails are non-negotiable. MemRL is warranted when you have enough task volume (100+ tasks/week) to generate meaningful Q-value learning signal. The three-tier Dreaming pattern is warranted when you need cross-session learning without model weight access.
+**The overriding principle:** Start with the simplest architecture that could work, and add complexity only when you have evidence that the simpler approach is insufficient. The Markdown Brain pattern handles 80% of use cases. Event sourcing is warranted when audit trails are non-negotiable. MemRL is warranted when you have enough task volume to generate meaningful Q-value learning signal. The formal M-MDP framework (Section 7.7) is warranted when you need theoretical guarantees in addition to empirical performance.
 
-### 7.7 Hermes Agent: The Closed-Loop Learning System
+**The critical mistake teams make:** jumping to vector databases and graph stores before they have exhausted the capabilities of flat files. A `MEMORY.md` file with 50 well-curated entries will outperform a vector database with 5,000 poorly-curated entries, because retrieval quality is dominated by content quality, not retrieval algorithm sophistication.
 
-Hermes Agent (Nous Research, February 2026, MIT license, 99K+ GitHub stars) is the most complete implementation of an agent that autonomously creates, updates, and retrieves its own skill documents. It solves the key problem that all other memory systems handle only passively: Hermes *actively generates reusable knowledge* from successful task completions.
-
-#### Three-Layer Memory Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  HERMES MEMORY                       │
-├─────────────────────────────────────────────────────┤
-│ Layer 1: Working Context (standard context window)   │
-│   - Current conversation, tool outputs, reasoning    │
-│   - Size: model context limit (128K-200K tokens)     │
-│                                                      │
-│ Layer 2: Skill Documents (~/.hermes/skills/)         │
-│   - SKILL.md files following agentskills.io standard │
-│   - Created autonomously after successful tasks      │
-│   - Searched via FTS5 full-text search + LLM summary │
-│   - Progressive disclosure: metadata → full content  │
-│     Level 0: skills_list() → name+desc (~3K tokens)  │
-│     Level 1: skill_view(name) → full instructions    │
-│     Level 2: skill_view(name, path) → references     │
-│                                                      │
-│ Layer 3: Persistent Facts (Honcho integration)       │
-│   - Dialectical user modeling via 12-identity layers │
-│   - User preferences, communication style, habits    │
-│   - Two-layer context injection:                     │
-│     Base layer: session summary + user representation │
-│     Dialectic: LLM-synthesized reasoning about user  │
-│   - Config: contextCadence, dialecticCadence,        │
-│            dialecticDepth (1-3 passes)               │
-└─────────────────────────────────────────────────────┘
-```
-
-#### The Autonomous Skill Creation Loop
-
-This is the critical differentiator. Hermes doesn't wait for the user to tell it to create a skill — it does so proactively:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│           HERMES CLOSED-LOOP LEARNING                      │
-│                                                            │
-│  1. TASK EXECUTION                                         │
-│     Agent runs task using tools, code, browsing            │
-│                    │                                       │
-│                    ▼                                       │
-│  2. SELF-EVALUATION CHECKPOINT (every 15 tool calls)       │
-│     "Was this worth capturing?"                            │
-│     Triggers on:                                           │
-│       - 5+ tool calls in a sequence                        │
-│       - Error recovery (agent fixed its own mistake)       │
-│       - User corrections ("no, do it this way")            │
-│       - Non-obvious workflow (novel approach discovered)   │
-│                    │                                       │
-│                    ▼                                       │
-│  3. SKILL CREATION OR UPDATE                               │
-│     Writes/patches SKILL.md following agentskills.io spec  │
-│     Captures: procedure, pitfalls, verification steps      │
-│     Can patch mid-session via skill_manage tool             │
-│                    │                                       │
-│                    ▼                                       │
-│  4. MEMORY UPDATE                                          │
-│     Key facts → MEMORY.md (persistent across sessions)     │
-│     User patterns → USER.md (via Honcho dialectic)         │
-│     Corrections → skill patches (immediate)                │
-└────────────────────────────────────────────────────────────┘
-```
-
-**Concrete result**: after 20-30 complex tasks over a month of regular use, tasks that initially required 25 tool calls drop to 8-10 calls. The agent has internalized the user's workflows.
-
-#### SKILL.md Format — The agentskills.io Open Standard
-
-Every auto-generated skill follows this structure:
-
-```yaml
----
-name: deploy-staging
-description: Deploy the application to staging environment via GitHub Actions
-version: 1.0.0
-author: hermes-auto
-license: MIT
-platforms: [linux, macos]
-metadata:
-  hermes:
-    tags: [DevOps, Deployment]
-    related_skills: [docker-compose-management]
-    requires_toolsets: [shell]
-    requires_tools: [shell_exec, read_file]
-    config:
-      - key: deploy.staging_branch
-        description: "Branch to deploy from"
-        default: "staging"
-        prompt: "Which branch deploys to staging?"
-required_environment_variables:
-  - name: GITHUB_TOKEN
-    prompt: "Enter your GitHub token for Actions API"
 ---
 
-# Deploy to Staging
+### 7.7 Memento-II: A Formal Framework for Memory-Augmented Agents
 
-## When to Use
-User asks to deploy, push to staging, or update staging environment.
+**Paper:** Logeswaran et al., "Memento: Memory-Augmented Policy Learning for Interactive Agents," arXiv:2512.22716 (December 2025). Memento-II extends the original framework to provide convergence guarantees.
 
-## Quick Reference
-```bash
-gh workflow run deploy-staging.yml --ref staging
-gh run list --workflow=deploy-staging.yml --limit=1 --json status
-```
+The systems described in Sections 7.1–7.5 are engineering artifacts: they work in practice, but they lack formal guarantees about convergence, optimality, or stability. Memento-II fills this gap by providing a rigorous mathematical framework — the **Memory-Augmented MDP (M-MDP)** — that formalizes agent memory as part of the state space and proves that learning to read and write memory can converge to optimal behavior under entropy regularization.
 
-## Procedure
-1. Verify current branch is clean: `git status --porcelain`
-2. If dirty, stash changes: `git stash push -m "pre-deploy stash"`
-3. Trigger deployment: `gh workflow run deploy-staging.yml --ref staging`
-4. Wait for completion: poll `gh run list` every 30s, max 10 minutes
-5. Verify deployment: `curl -s https://staging.example.com/health`
-6. If stashed, restore: `git stash pop`
+This section presents the framework at proof-sketch level. For full proofs, see the original paper.
 
-## Pitfalls
-- **Dirty working tree**: Always stash before deploy. Forgetting this caused
-  failed deploys on 2026-03-15.
-- **Rate limiting**: GitHub Actions API rate-limits at 1,000 requests/hour.
-  The polling loop must use 30s intervals, not 5s.
-- **Health check timing**: Staging takes 45-90s to become healthy after
-  workflow completion. First health check should wait 60s.
+#### 7.7.1 Memory-Augmented MDP (M-MDP)
 
-## Verification
-- Health endpoint returns 200 with `{"status": "ok"}`
-- `gh run list` shows latest run with status "completed" and conclusion "success"
-```
+A standard MDP is a tuple (S, A, P, R, γ) where S is the state space, A is the action space, P is the transition function, R is the reward, and γ is the discount factor. Memento-II extends this with an external memory buffer:
 
-**The key design insight**: if a skill doesn't trigger, the problem is almost never the instructions — it's the `name` and `description` in the frontmatter. That's what the agent uses to decide whether to load the skill. Progressive disclosure means only ~100 tokens per skill are loaded initially (name + description), so discovery is cheap even with hundreds of skills.
+**Definition (M-MDP).** A Memory-Augmented MDP is a tuple (S, A, M, P, R, γ, ψ_read, ψ_write) where:
 
-#### Hermes Atropos RL Pipeline — Research-Grade Training Infrastructure
+- S is the environment state space
+- A is the action space
+- M is the memory space (the set of all possible memory configurations)
+- P: S × A → Δ(S) is the environment transition function
+- R: S × A → ℝ is the reward function
+- γ ∈ [0, 1) is the discount factor
+- ψ_read: S × M → S̃ is the **read function** that augments the observed state with memory content, producing an augmented state S̃ = S × M_retrieved
+- ψ_write: S × A × S' × M → M is the **write function** that updates memory after each transition
 
-Hermes uniquely integrates an RL training pipeline directly into the agent framework:
+The agent's policy operates on the augmented state: π: S̃ → Δ(A), where S̃ = ψ_read(s, m).
+
+The key formal insight: **reading memory is policy improvement (it gives the agent access to better state representations), and writing memory is policy evaluation (it records experience that improves future state representations).**
+
+#### 7.7.2 The Read-Write Learning Framework
+
+Memento-II decomposes learning into two interleaved processes:
+
+**Reading = Policy Improvement.**
+
+Given a fixed memory configuration m ∈ M, the read function ψ_read produces augmented states that are strictly more informative than raw states (in the information-theoretic sense):
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              ATROPOS RL PIPELINE                      │
-│                                                      │
-│  1. TRAJECTORY COLLECTION                            │
-│     Every session auto-generates structured data:    │
-│     - User message, tool calls, tool results,        │
-│       assistant responses, timestamps                │
-│     - Stored in SQLite with compression              │
-│     - Batch mode: headless parallel workers           │
-│       with checkpointing for large-scale collection  │
-│                                                      │
-│  2. TRAINING MODES                                   │
-│     RLHF: trajectories → human rating → reward       │
-│           model → PPO policy optimization            │
-│     DPO:  preferred/rejected trajectory pairs →       │
-│           direct preference optimization (offline)   │
-│     GRPO: group sampling → relative advantage →       │
-│           no value network needed                    │
-│                                                      │
-│  3. EXPORT                                           │
-│     ShareGPT format for fine-tuning any model        │
-│     Works with: local (Ollama/vLLM), cloud APIs      │
-│                                                      │
-│  4. ENVIRONMENT FRAMEWORK                            │
-│     Three-layer: BaseEnv (Atropos) →                 │
-│       HermesAgentBaseEnv → Concrete task envs        │
-│     Enables: standardized benchmarks, SFT data gen,  │
-│       RL training on multi-turn agentic tasks        │
-└──────────────────────────────────────────────────────┘
+H(S̃) = H(S, M_retrieved) ≤ H(S) + H(M_retrieved)
+
+I(S̃; A*) ≥ I(S; A*)
 ```
 
-This makes Hermes not just an agent, but a **research platform for training tool-calling models**. Teams can collect trajectories from real usage, then use those trajectories to fine-tune smaller models for specific workflows — closing the loop between deployment and training.
+where A* is the optimal action, H is entropy, and I is mutual information. The inequality holds because conditioning on additional relevant information (retrieved memory) can only increase the mutual information between the agent's observation and the optimal action. The read function acts as a policy improvement operator: for a fixed write policy, improving the read function improves the agent's performance.
 
-#### Deployment Reality
+**Writing = Policy Evaluation.**
 
-Hermes runs on six terminal backends:
+The write function ψ_write updates memory after observing transitions. This is analogous to policy evaluation in standard RL: the agent evaluates its current policy by recording which actions led to which outcomes. Better memory content makes future read operations more informative, which makes the policy better, which generates better data for writing.
 
-| Backend | Use Case | Cost |
-|---------|----------|------|
-| Local | Development, personal use | Free (your hardware) |
-| Docker | Isolated deployment | Free (your hardware) |
-| SSH | Remote server | $5+ VPS |
-| Daytona | Serverless with hibernation | Pay-per-use |
-| Modal | GPU tasks, batch RL | Pay-per-use |
-| Singularity | HPC/academic clusters | Institutional |
-
-A single gateway process connects to Telegram, Discord, Slack, WhatsApp, Signal, Matrix, iMessage, WeChat, and CLI. Model-agnostic: works with 200+ models via Nous Portal, OpenRouter, OpenAI, Anthropic, and custom endpoints.
-
-### 7.8 Self-Evolving Skills: The SkillHub and ClawHub Ecosystem
-
-The most radical experiment in agent self-improvement is happening in the open-source skills ecosystem around OpenClaw, ClawHub, and SkillHub. These platforms implement a pattern where agents don't just use pre-built skills — they **autonomously create, test, and share self-improvement capabilities**.
-
-#### The Self-Improving Agent Skill — The Most Downloaded Evolution Mechanism
-
-The `self-improving-agent` skill (1,100+ stars, 90,000+ downloads on ClawHub within 2 months of release) implements a structured self-evolution cycle:
+The interleaved update rule:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│         SELF-EVOLVING AGENT CYCLE                          │
-│                                                            │
-│  1. PERCEIVE GAP                                           │
-│     Detection signals:                                     │
-│     - Task failures and incomplete requests                │
-│     - Repeated patterns (same request failing 3+ times)    │
-│     - User feedback and explicit corrections               │
-│     - Efficiency metrics (tasks taking >2x expected time)  │
-│                    │                                       │
-│                    ▼                                       │
-│  2. SEARCH SOLUTIONS                                       │
-│     - Scan engineering blogs, GitHub trending               │
-│     - Query SkillHub/ClawHub for relevant skills           │
-│     - Check AGENTS.md and TOOLS.md for existing knowledge  │
-│                    │                                       │
-│                    ▼                                       │
-│  3. DESIGN EXPERIMENT                                      │
-│     - Formulate hypothesis: "If I change X, metric Y       │
-│       should improve by Z%"                                │
-│     - Create test case from the failure that triggered gap │
-│                    │                                       │
-│                    ▼                                       │
-│  4. RUN EXPERIMENT                                         │
-│     - Execute the proposed improvement                     │
-│     - Measure before/after on the test case                │
-│                    │                                       │
-│                    ▼                                       │
-│  5. SELECT WINNER                                          │
-│     - Compare old vs new approach on metrics               │
-│     - If improvement > threshold, proceed to solidify      │
-│     - If not, log failure and try alternative              │
-│                    │                                       │
-│                    ▼                                       │
-│  6. SOLIDIFY                                               │
-│     - Promote learning to permanent workspace files:       │
-│       Workflow improvements → AGENTS.md                    │
-│       Tool gotchas → TOOLS.md                              │
-│       Behavioral patterns → SOUL.md                        │
-│       Broadly applicable → CLAUDE.md /                     │
-│         .github/copilot-instructions.md                    │
-│     - Changes persist across ALL future sessions           │
-│                    │                                       │
-│                    ▼                                       │
-│  7. NEXT ITERATION (repeat)                                │
-└────────────────────────────────────────────────────────────┘
+ALGORITHM: Memento-II Read-Write Learning
+──────────────────────────────────────────
+
+Initialize: policy π_0, read function ψ_read^0, write function ψ_write^0, memory m_0
+
+For each episode t = 0, 1, 2, ...:
+
+  POLICY EXECUTION (with current read function):
+    For each step k = 0, 1, ..., K:
+      s̃_k = ψ_read^t(s_k, m_t)              # Read: augment state with memory
+      a_k ~ π_t(·| s̃_k)                      # Act on augmented state
+      s_{k+1}, r_k ~ P(·|s_k, a_k), R(s_k, a_k)  # Environment transition
+      m_{t+1} = ψ_write^t(s_k, a_k, s_{k+1}, m_t)  # Write: update memory
+
+  POLICY UPDATE (entropy-regularized):
+    Compute returns: G_k = Σ_{j=k}^{K} γ^{j-k} r_j
+    Update π_{t+1} via entropy-regularized policy gradient:
+      ∇_θ J(θ) = E[Σ_k (G_k - b_k) ∇_θ log π_θ(a_k|s̃_k)
+                      + τ · ∇_θ H(π_θ(·|s̃_k))]
+    where τ is the entropy coefficient and b_k is a baseline.
+
+  READ FUNCTION UPDATE:
+    Optimize ψ_read to maximize policy performance:
+      ψ_read^{t+1} = argmax_{ψ} E_{π_t}[Σ_k r_k | s̃_k = ψ(s_k, m_t)]
+
+  WRITE FUNCTION UPDATE:
+    Optimize ψ_write to maximize future read quality:
+      ψ_write^{t+1} = argmax_{ψ} E[I(ψ_read(s_{future}, ψ(·)); A*)]
 ```
 
-#### The Solidification Mechanism — Where Learnings Become Permanent
+#### 7.7.3 Convergence Guarantees via Entropy-Regularized Policy Iteration
 
-The four-component promotion system is the key engineering contribution:
+The central theoretical result of Memento-II:
+
+**Theorem (Convergence of Read-Write Learning).** Under entropy-regularized policy iteration with coefficient τ > 0, if:
+
+1. The memory space M is finite (or compact with appropriate continuity conditions),
+2. The read function class and write function class are expressive enough to represent the optimal read/write pair,
+3. The learning rates satisfy the Robbins-Monro conditions (α_t → 0, Σα_t = ∞, Σα_t² < ∞),
+
+then the Read-Write Learning algorithm converges to a fixed point (π*, ψ_read*, ψ_write*) that satisfies:
 
 ```
-Component 1: CAPTURE
-─────────────────────
-.learnings/
-├── LEARNINGS.md      # Insights from successful tasks
-├── ERRORS.md         # Catalogued failure modes with fixes
-└── FEATURE_REQUESTS.md  # Capability gaps identified
-
-Component 2: PROMOTION TARGETS
-──────────────────────────────
-Workflow improvements    → AGENTS.md    (loaded every session)
-Tool-specific gotchas    → TOOLS.md     (loaded when tool is used)
-Behavioral patterns      → SOUL.md      (identity-level changes)
-Universal learnings      → CLAUDE.md    (system-level context)
-                         → .github/copilot-instructions.md
-
-Component 3: PERSISTENCE
-─────────────────────────
-Once promoted, learnings are injected into every subsequent
-session via the standard CLAUDE.md / AGENTS.md loading mechanism.
-No model retraining needed. The agent's behavior changes because
-its context changes.
-
-Component 4: AUTOMATED REVIEW
-──────────────────────────────
-Heartbeat-driven promotion: a cron job runs the promotion
-process, scanning .learnings/ for items that have accumulated
-enough related issues to warrant promotion. This closes the
-loop without human intervention.
+V^{π*, ψ_read*, ψ_write*}(s, m) ≥ V^{π, ψ_read, ψ_write}(s, m) − ε(τ)
 ```
 
-**Practical example**: A research agent runs on cron at 8:30 AM weekdays. It scans engineering blogs and GitHub trending, compares findings against its AGENTS.md, TOOLS.md, and LESSONS.md files, logs results to a structured JSON experiment tracking file, and promotes verified improvements.
+for all (π, ψ_read, ψ_write), all (s, m), where ε(τ) → 0 as τ → 0.
 
-#### SkillHub.cn — The Chinese AI Skills Community
+**Proof sketch:**
 
-SkillHub (skillhub.cn / skillhub.mobi) is Tencent's localized AI skills platform for the Chinese OpenClaw ecosystem:
+1. **Policy improvement step.** For a fixed (ψ_read, ψ_write), entropy-regularized policy iteration on the augmented MDP (S̃, A, P̃, R, γ) converges to the optimal soft policy π*_τ. This follows from the standard convergence result for soft policy iteration (Haarnoja et al., 2018).
 
-| Metric | Value |
-|--------|-------|
-| Total skills available | 13,000+ (mirrored from ClawHub) |
-| Curated Top 50 | Safety-audited, professionally selected |
-| Language | Full Chinese interface with optimized search |
-| Categories | 8 major skill categories |
-| Infrastructure | Tencent Cloud acceleration nodes |
-| Cost | Free |
+2. **Read function improvement.** For a fixed (π, ψ_write), optimizing ψ_read is equivalent to selecting the best state representation. Since I(S̃; A*) is concave in the representation for fixed policies (data processing inequality), gradient ascent converges to a local optimum that is globally optimal under the convexity conditions on M.
 
-**Most downloaded skills (as of Q1 2026):**
+3. **Write function improvement.** For a fixed (π, ψ_read), optimizing ψ_write to maximize future read quality is a supervised learning problem (predicting which experiences will be most informative for future reads). Under the expressiveness assumption, this converges to the optimal write function.
 
-| Rank | Skill | Downloads | Category |
-|------|-------|-----------|----------|
-| 1 | Xiaohongshu Automation | 59K | Social Media |
-| 2 | GitHub Collaboration | 48K | Development |
-| 3 | Summarize (PDF/video/web) | 44K | Productivity |
-| 4 | Tavily Web Search | 39K | Research |
-| 5 | HaS Anonymizer | 31K | Privacy |
-| 6 | Tencent Docs Skill | 27K | Office |
+4. **Joint convergence.** The alternating optimization of (π, ψ_read, ψ_write) forms a block coordinate ascent on the entropy-regularized objective. Each block update improves or maintains the objective value. Since the objective is bounded above, the sequence converges to a fixed point. The ε(τ) gap vanishes as entropy regularization strength decreases.
 
-The installation is one-line:
-```bash
-# Install from SkillHub (with Tencent Cloud acceleration)
-npx skillhub install summarize
+The practical significance of this theorem: **MemRL's Monte Carlo Q-learning (Section 7.4) is a special case of Read-Write Learning where the read function is two-phase retrieval and the write function is Q-value update.** The theorem guarantees that this learning process converges under mild conditions. The exploration bonus in MemRL's Phase B retrieval serves the same role as the entropy regularization in Memento-II — it prevents premature convergence and ensures sufficient exploration of the memory space.
 
-# Install from ClawHub directly
-npx agent-skills-hub install self-improving-agent
-```
+#### 7.7.4 Mapping Practical Systems to the M-MDP Framework
 
-#### Security Concerns with Self-Evolving Skills
+Every memory system in this chapter can be viewed through the M-MDP lens:
 
-Both ClawHub and SkillHub flag self-evolution skills as **suspicious** due to their broad permissions:
+| System | Memory Space M | Read Function ψ_read | Write Function ψ_write | Learning Signal |
+|---|---|---|---|---|
+| **OpenHands V1** | Event stream | Condensation + prompt construction | Event append | None (deterministic) |
+| **Hermes Skills** | SKILL.md files | FTS5 search + progressive disclosure | Skill creation/patching | Trigger heuristics (handcrafted) |
+| **OpenClaw 3-Tier** | MEMORY.md + daily notes | Embedding retrieval + Dreaming | Note creation + Dreaming merge | Clustering (unsupervised) |
+| **MemRL** | IEU triplets | Phase A (embedding) + Phase B (Q-value) | Q-value update | Monte Carlo returns (RL) |
+| **Memento-II** | Abstract M | Learned ψ_read | Learned ψ_write | Policy gradient (RL) |
 
-- Execute arbitrary shell commands
-- Modify agent configuration files (CLAUDE.md, AGENTS.md, SOUL.md)
-- Access system files and environment variables
-- Make network requests to arbitrary endpoints
-- Modify their own skill definitions
+The progression from top to bottom represents increasing formalization and increasing learning capacity:
 
-The `self-evolve-agent` skill on ClawHub carries an explicit security warning. The risk is real: a compromised or malicious self-evolving skill could gradually modify an agent's behavior in ways that are difficult to detect because the changes are "legitimate" — they look like normal learning.
+- **OpenHands:** No learning. Memory operations are deterministic functions of the event stream. The read function (condensation) is hand-designed. Effective for single-session tasks.
 
-**Mitigation patterns**:
-1. Run self-evolving agents in sandboxed containers (NanoClaw's approach)
-2. Git-track all config files so changes are auditable via `git diff`
-3. Require human approval for promotions to SOUL.md and CLAUDE.md
-4. Rate-limit the promotion mechanism (max 3 promotions/day)
-5. Maintain a "constitution" file that self-evolution cannot modify
+- **Hermes:** Heuristic learning. The write function (skill creation) triggers on hand-designed conditions. The read function (progressive disclosure) is hand-designed. Effective for repeated workflows with a stable user.
 
-#### The Hermes vs OpenClaw/SkillHub Approach: A Comparison
+- **OpenClaw:** Unsupervised learning. The Dreaming process discovers patterns via clustering and LLM extraction. No explicit reward signal. Effective for accumulating project-specific knowledge.
 
-| Dimension | Hermes Agent | OpenClaw + SkillHub |
-|-----------|-------------|-------------------|
-| Skill creation | Autonomous (agent writes SKILL.md after tasks) | Community-driven (humans write, agent installs) |
-| Self-improvement | Built-in via Atropos RL + skill patches | Via self-improving-agent skill (optional add-on) |
-| Skill format | agentskills.io standard (YAML frontmatter + MD) | Same standard (interoperable) |
-| Discovery | FTS5 search + LLM summary (progressive disclosure) | ClawHub/SkillHub marketplace search |
-| Training | RLHF/DPO/GRPO via Atropos pipeline | No built-in training (relies on skill-level improvements) |
-| User modeling | Honcho 12-identity dialectical modeling | Simple MEMORY.md + daily notes |
-| Security model | Per-skill permissions, platform-enforced | Community flagging, user responsibility |
-| Scale | 99K+ GitHub stars | 350K+ stars (OpenClaw) + 13K+ skills |
+- **MemRL:** Reinforcement learning. Both read (Q-value-guided retrieval) and write (Q-value update) are learned from task outcomes. Effective for diverse, reward-bearing tasks.
 
-The key takeaway: **Hermes represents the "agent creates its own skills" paradigm, while OpenClaw/SkillHub represents the "community creates skills, agent evolves via curated ecosystem" paradigm**. Both are valid. Hermes is better for power users who want deep personalization. OpenClaw/SkillHub is better for breadth of capability via community network effects.
+- **Memento-II:** Full RL with convergence guarantees. Both read and write functions are jointly optimized via entropy-regularized policy iteration. Theoretical framework for analyzing all of the above.
+
+#### 7.7.5 Practical Implications of the M-MDP Framework
+
+The formal framework yields three actionable engineering insights:
+
+**Insight 1: Read quality is bounded by write quality.** No matter how sophisticated your retrieval algorithm, it cannot retrieve useful memories if the write function stored the wrong information. This is why MemRL's "key_insight" field in Experience is so important — it distills the experience into the most retrievable form. In M-MDP terms: I(ψ_read(s, m); A*) ≤ I(m; A*), so the retrieval function can never extract more information than the memory contains.
+
+**Insight 2: Entropy regularization prevents memory collapse.** Without exploration, memory systems converge on a small set of "safe" entries and stop discovering better ones. This is the empirical finding behind MemRL's UCB exploration bonus and Hermes's self-evaluation checkpoints. The formal framework explains why: without entropy regularization, the policy collapses to a deterministic function of a small memory subset, and the write function stops generating diverse entries because the policy no longer explores diverse states.
+
+**Insight 3: The optimal memory size is finite.** For any finite-horizon MDP with bounded state space, there exists a finite memory capacity beyond which additional memory does not improve performance. In practice, this means memory pruning is not just a cost optimization — it is theoretically justified. OpenClaw's archival mechanism (0.5x score multiplier for old notes) and MemRL's finite K parameter (top-K retrieval) are both implementations of this principle.
+
+---
+
+*This chapter has presented seven memory architectures at increasing levels of formalization: OpenHands V1's event-sourced append-only log for deterministic replay and debugging (Section 7.1); Hermes's closed-loop skill learning system with autonomous creation, progressive disclosure retrieval, dialectical user modeling, and RL training pipeline (Section 7.2); the self-evolving skills ecosystem around SkillHub and ClawHub with its solidification mechanism and security analysis (Section 7.3); MemRL's reinforcement-learned memory retrieval with IEU triplets and Monte Carlo Q-value updates (Section 7.4); OpenClaw's three-tier Dreaming architecture for overnight consolidation of episodic into semantic memory (Section 7.5); a decision tree for selecting the right architecture (Section 7.6); and Memento-II's M-MDP framework providing formal convergence guarantees for Read-Write Learning (Section 7.7). Chapter 8 builds on this foundation by examining the RL algorithms used to train agents — GRPO, RetroAgent, and the hybrid training-runtime evolution approach — in the same formal detail.*
 
 ---
 
