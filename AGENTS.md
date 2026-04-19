@@ -2,16 +2,19 @@
 
 ## Cursor Cloud specific instructions
 
-This repository ("AgentEnvolveBook") is a Markdown-based book project. There are no application services, dependencies, build systems, or tests to run.
+This is a **mdBook** project. The only build dependency is `mdbook`.
 
 ### Structure
-- `book/README.md` — Book index and table of contents
-- `book/part1_foundations.md` — Part I: Foundations (Chapters 1-3)
-- `book/part2_architecture.md` — Part II: Architecture Patterns (Chapters 4-6)
-- `book/part3_evolution.md` — Part III: Making Agents Evolve (Chapters 7-9)
-- `book/part4_5_practice_future.md` — Part IV-V: Practice, Future, Appendices (Chapters 10-13)
+- `book.toml` — mdBook configuration
+- `src/SUMMARY.md` — Table of contents (defines chapter order)
+- `src/*.md` — Chapter files (12 chapters across 4 parts)
+- `_book/` — Build output (gitignored)
 
-### Development
-- No dependencies to install. This is a pure Markdown content project.
-- To preview: use any Markdown viewer or `grip` (GitHub Readme Instant Preview).
-- No lint, test, or build steps are configured.
+### Build & Preview
+- Build: `mdbook build` (output to `_book/`)
+- Live preview: `mdbook serve` (serves at `http://localhost:3000`)
+- `book.toml` has `create-missing = false` — every file referenced in `SUMMARY.md` must exist or the build fails. Create stub files for missing chapters if needed.
+
+### Writing style
+- Follow the style of the AgentMemoryBook (https://github.com/A7um/AgentMemoryBook): production-focused, evidence from real systems, direct quotes, ASCII diagrams, tables.
+- Target 400-700 lines per chapter.
