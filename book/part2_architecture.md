@@ -217,6 +217,25 @@ Output: retrieved memories R
 14: return R
 ```
 
+```mermaid
+graph TD
+    Q["New Task Query"] --> EMBED["Embed query"]
+    EMBED --> PHASE1["Phase 1: Semantic Filter<br/>cosine_sim > threshold"]
+    PHASE1 --> CAND["Candidate memories"]
+    CAND --> PHASE2["Phase 2: Q-Value Selection<br/>argmax Q_i"]
+    PHASE2 --> BEST["Best memory by utility"]
+    BEST --> INJECT["Inject into context"]
+    
+    EXEC["Execute task"] --> OUTCOME{"Success?"}
+    OUTCOME -->|"r=1"| UPDATE1["Q_i ← (1-α)·Q_i + α·1<br/>↑ utility increases"]
+    OUTCOME -->|"r=0"| UPDATE0["Q_i ← (1-α)·Q_i + α·0<br/>↓ utility decreases"]
+    
+    style PHASE1 fill:#4dabf7,color:#fff
+    style PHASE2 fill:#37b24d,color:#fff
+    style UPDATE1 fill:#69db7c
+    style UPDATE0 fill:#ff6b6b,color:#fff
+```
+
 #### 3.3.4 Why Two Phases Beat One: A Concrete Example
 
 Consider an agent that has accumulated 200 memories from math competition problems. A new problem arrives: "Find all integer solutions to x³ + y³ = z³ for z ≤ 100."
@@ -706,6 +725,27 @@ The optimal `α` is near 0.5, confirming that **both relevance and utility are n
 | Context cost per memory | High (full experience) | Low (distilled lesson) |
 | Theoretical grounding | Monte Carlo Q-learning | Multi-armed bandit (UCB1) |
 
+```mermaid
+graph LR
+    subgraph "SimUtil-UCB Scoring"
+        SIM["Semantic Similarity<br/>s_rel(x, x_i)"]
+        UTIL["Utility Score<br/>u_i (EMA)"]
+        EXPLORE["Exploration Bonus<br/>κ·√(ln N / n_i)"]
+    end
+    
+    SIM -->|"weight α"| SCORE["Final Score<br/>S(m_i | x, M)"]
+    UTIL --> UCB["UCB-augmented<br/>utility"]
+    EXPLORE --> UCB
+    UCB -->|"weight (1-α)"| SCORE
+    
+    SCORE --> SELECT["Select top-k<br/>memories"]
+    
+    style SIM fill:#4dabf7,color:#fff
+    style UTIL fill:#69db7c
+    style EXPLORE fill:#ffa94d
+    style SCORE fill:#da77f2,color:#fff
+```
+
 The key architectural distinction is **exploration**. MemRL's Q-values converge monotonically—once a memory's Q-value drops low enough, it is effectively dead (never retrieved, never re-evaluated, never recovered). SimUtil-UCB's exploration bonus prevents this: even a low-utility memory will eventually accumulate enough exploration bonus to be retrieved again, giving it a chance at rehabilitation if the task distribution has shifted.
 
 ---
@@ -1085,6 +1125,29 @@ Cycle k:
 ```
 
 This is exactly the structure of **generalized policy iteration** (Sutton & Barto, 2018, Chapter 4). Each read-write cycle performs one step of policy evaluation (via writing) and one step of policy improvement (via reading). The standard convergence theorems for policy iteration then apply to the M-MDP.
+
+```mermaid
+graph TD
+    subgraph "Memento-II: Read-Write Learning on M-MDP"
+        STATE["State s_t + Memory M_t"]
+        READ["READ from Memory<br/>(Policy Improvement)<br/>Retrieve relevant experiences"]
+        ACT["Take Action a_t<br/>using augmented policy"]
+        OBS["Observe outcome r_t"]
+        WRITE["WRITE to Memory<br/>(Policy Evaluation)<br/>Store experience + outcome"]
+        STATE2["State s_{t+1} + Memory M_{t+1}"]
+    end
+    
+    STATE --> READ
+    READ --> ACT
+    ACT --> OBS
+    OBS --> WRITE
+    WRITE --> STATE2
+    STATE2 -->|"next step"| STATE
+    
+    style READ fill:#4dabf7,color:#fff
+    style WRITE fill:#ffa94d
+    style OBS fill:#69db7c
+```
 
 #### 5.2.4 Unification of Existing Approaches
 
@@ -1520,6 +1583,27 @@ depth = 3 (Thesis + Antithesis + Synthesis):
 | 3 | 4.3 | 83 | 3.0× |
 
 Depth 2 provides the best cost/quality tradeoff. Depth 3 provides marginal improvement at 50% additional cost.
+
+```mermaid
+graph TB
+    subgraph "Honcho: Dialectical User Modeling"
+        direction TB
+        RAW["Raw Conversations"]
+        BASE["Base Layer<br/>Session summary +<br/>User representation +<br/>Peer card"]
+        DIAL["Dialectic Layer<br/>LLM reasoning about<br/>user patterns"]
+        MODEL["Evolved User Model<br/>Preferences, style,<br/>habits, goals"]
+    end
+    
+    RAW -->|"contextCadence<br/>refresh"| BASE
+    BASE -->|"dialecticCadence<br/>refresh"| DIAL
+    DIAL -->|"dialecticDepth<br/>1-3 passes"| MODEL
+    
+    COLD["Cold Start<br/>(no history)"] --> WARM["Warm Model<br/>(basic prefs)"] --> DEEP["Deep Model<br/>(behavioral patterns)"]
+    
+    style COLD fill:#ff6b6b,color:#fff
+    style WARM fill:#ffa94d
+    style DEEP fill:#37b24d,color:#fff
+```
 
 ---
 
