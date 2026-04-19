@@ -2,7 +2,37 @@
 
 **How top-tier production agents actually get better through use.**
 
+> **[Read the book online →](https://a7um.github.io/AgentEnvolveBook/)**
+
 Extracted from shipped products, leaked source code, open repos, and the ClawHub skill ecosystem — not academic papers.
+
+## How to Read This Book
+
+**[Introduction](chapters/introduction.md)** — Scope, audience, and how evidence is sourced
+
+### Part I: How Production Agents Evolve
+
+1. **[The Self-Evolution Landscape](chapters/01_landscape.md)** — Product map, five shared mechanisms, maturity spectrum
+2. **[Claude Code](chapters/02_claude_code.md)** — Memory, skills, and leaked internals
+3. **[Cursor](chapters/03_cursor.md)** — Merkle trees, embeddings, and rules
+4. **[Hermes Agent](chapters/04_hermes.md)** — Closed-loop skill creation
+
+### Part II: The Skills Ecosystem
+
+5. **[OpenClaw / ClawHub](chapters/05_openclaw.md)** — The self-improving-agent skill and marketplace signals
+6. **[SkillHub](chapters/06_skillhub.md)** — The Chinese ecosystem
+7. **[Skill Design Patterns](chapters/07_skill_patterns.md)** — Patterns that enable evolution
+
+### Part III: Deep Dives
+
+8. **[Manus](chapters/08_manus.md)** — Context engineering as evolution
+9. **[Codex](chapters/09_codex.md)** — Subagents and compaction
+10. **[Devin](chapters/10_devin.md)** — Self-verification and context anxiety
+
+### Part IV: Synthesis
+
+11. **[The Production Self-Evolution Playbook](chapters/11_playbook.md)**
+12. **[Open Problems and What's Next](chapters/12_future.md)**
 
 ## Products Covered
 
@@ -19,13 +49,13 @@ Extracted from shipped products, leaked source code, open repos, and the ClawHub
 | Devin | Self-verification + auto-fix (2.2) + DeepWiki | Official blog |
 | Manus | Context engineering iteration ("Stochastic Graduate Descent") | Published blog posts |
 
-## Read the Book
+## Build locally
 
-This is an [mdBook](https://rust-lang.github.io/mdBook/). To build locally:
+This is an [mdBook](https://rust-lang.github.io/mdBook/). Chapter source lives under [`chapters/`](chapters/introduction.md); [`src/SUMMARY.md`](src/SUMMARY.md) is the table of contents.
 
 ```bash
 cargo install mdbook mdbook-mermaid
 mdbook serve
 ```
 
-Chapter markdown lives in [`chapters/`](chapters/introduction.md). The mdBook entry point is [`src/SUMMARY.md`](src/SUMMARY.md); each file under `src/` includes the matching chapter from `chapters/`.
+See **[UPDATE_GUIDE.md](UPDATE_GUIDE.md)** for layout details and how to add chapters.
