@@ -370,25 +370,186 @@ For most teams, the runtime evolution system (skills + memory + self-evaluation)
 
 ---
 
+## Dreaming: Background Memory Consolidation
+
+The most sophisticated self-evolution mechanism in any production agent. Dreaming is Hermes's implementation of background memory consolidation — inspired by human sleep science, where the brain replays and consolidates memories during sleep stages.
+
+**Opt-in, disabled by default.** Enable with `/dreaming on` in any Hermes session. Once enabled, it runs as a managed cron job — default schedule: 3 AM daily.
+
+### The Three-Phase Process
+
+```mermaid
+graph TD
+    subgraph "Phase 1: Light Sleep"
+        A[Ingest daily memory +<br/>session transcripts] --> B[Deduplicate<br/>Jaccard similarity ≥ 0.9]
+        B --> C[Stage candidates]
+    end
+    subgraph "Phase 2: REM Sleep"
+        C --> D[Analyze recurring themes<br/>7-day lookback window]
+        D --> E[Identify candidate truths]
+    end
+    subgraph "Phase 3: Deep Sleep"
+        E --> F[Score candidates<br/>6 weighted signals]
+        F --> G{All 3 threshold<br/>gates pass?}
+        G -->|Yes| H[Promote to MEMORY.md ✅]
+        G -->|No| I[Archive to session<br/>history 📁]
+    end
+```
+
+#### Phase 1: Light Sleep — Ingestion and Deduplication
+
+The dreaming process begins by collecting all raw material from the day:
+
+1. **Ingest** — read the daily memory file (`memory/YYYY-MM-DD.md`) and all session transcripts from the past 24 hours
+2. **Deduplicate** — compare every candidate fact against existing MEMORY.md entries and other candidates using Jaccard similarity. Threshold: **0.9** (90% token overlap = duplicate). This prevents the memory from accumulating near-identical entries like "User prefers ruff" and "User likes ruff over black"
+3. **Stage** — surviving candidates (non-duplicates) are moved to a staging area for Phase 2
+
+#### Phase 2: REM Sleep — Theme Analysis
+
+The most computationally intensive phase. The agent analyzes the staged candidates against a **7-day lookback window** of session history:
+
+1. **Theme extraction** — cluster staged candidates by topic using embedding similarity
+2. **Cross-session pattern detection** — identify facts, preferences, or behaviors that appear across multiple sessions within the 7-day window
+3. **Candidate truth identification** — patterns that appear in 3+ sessions with consistent phrasing become "candidate truths"
+
+The 7-day window is a design choice: long enough to catch weekly patterns, short enough to avoid promoting stale information. A preference mentioned once on Monday and never again doesn't become a candidate truth; a preference mentioned Monday, Wednesday, and Friday does.
+
+#### Phase 3: Deep Sleep — Scoring and Promotion
+
+Each candidate truth is scored against six weighted signals, then checked against three threshold gates.
+
+### Ranking Signals (Weighted)
+
+| Signal | Weight | What It Measures |
+|--------|--------|-----------------|
+| **Relevance** | 0.30 | How central is this fact to the user's primary use cases? |
+| **Frequency** | 0.24 | How often has this fact appeared across sessions? |
+| **Query diversity** | 0.15 | Was this fact surfaced by different types of queries/tasks? |
+| **Recency** | 0.15 | How recently was this fact last observed? |
+| **Consolidation** | 0.10 | Has this fact already been partially consolidated from multiple sources? |
+| **Conceptual richness** | 0.06 | Does this fact connect to multiple other known facts? |
+
+The final score is a weighted sum: `score = 0.30×relevance + 0.24×frequency + 0.15×diversity + 0.15×recency + 0.10×consolidation + 0.06×richness`
+
+### Promotion Thresholds (ALL Must Pass)
+
+| Gate | Threshold | Purpose |
+|------|-----------|---------|
+| **minScore** | 0.8 | Composite quality bar — filters low-signal candidates |
+| **minRecallCount** | 3 | Minimum times the fact was recalled/referenced across sessions |
+| **minUniqueQueries** | 3 | Minimum distinct query contexts where the fact appeared |
+
+All three gates must pass simultaneously. A fact with a high score but only 2 recall instances doesn't get promoted. A fact recalled 10 times but always in the same query context doesn't get promoted. This triple-gate system is deliberately conservative — it's better to miss a valid memory than to promote a noisy one.
+
+### Memory Architecture (4 Layers)
+
+Dreaming operates on Hermes's full four-layer memory architecture:
+
+| Layer | Contents | Token Budget | Persistence | Access |
+|-------|----------|-------------|-------------|--------|
+| **Layer 1: Prompt Memory** | MEMORY.md (~800 tokens) + USER.md (~500 tokens) | ~1,300 tokens | Permanent | Always in system prompt |
+| **Layer 2: Session Archive** | Past session transcripts and daily logs | Unbounded | 90-day rolling window | Searchable via `session_search` tool |
+| **Layer 3: Skills** | Procedural memory from complex tasks (SKILL.md files) | ~500–1,500 tokens/skill | Permanent | FTS5 search + progressive disclosure |
+| **Layer 4: External Providers** | 8 pluggable memory backends | Varies by provider | Provider-dependent | API calls |
+
+#### Layer 1: Prompt Memory — Always Present
+
+MEMORY.md and USER.md are injected into every system prompt. This is the agent's "always-on" memory — facts that should influence every response. The token budget is tight (~800 for MEMORY.md, ~500 for USER.md) because this memory competes with skills and instructions for context window space.
+
+Dreaming's promotion pipeline is the primary mechanism for getting facts into MEMORY.md. Manual insertion is possible but discouraged — the dreaming process ensures only validated, high-signal facts occupy this premium real estate.
+
+#### Layer 2: Session Archive — Searchable History
+
+All past sessions are archived and searchable via the `session_search` tool. The agent can query its own history:
+
+```python
+results = await session_search(
+    query="user's preferred testing framework",
+    lookback_days=30,
+    max_results=5
+)
+```
+
+The session archive is the raw material that Dreaming processes. It's also available during normal operation — when the agent needs to recall something not in MEMORY.md, it searches the archive.
+
+#### Layer 3: Skills — Procedural Memory
+
+Skills are the agent's "how-to" memory. Created through the self-evaluation checkpoint system described earlier. Dreaming doesn't directly create skills, but it can promote observations about skill effectiveness to MEMORY.md (e.g., "The kubernetes-pod-debugging skill works well for CrashLoopBackOff but misses init container issues").
+
+#### Layer 4: External Providers — 8 Pluggable Backends
+
+Hermes supports 8 external memory providers, any of which can be enabled alongside the built-in memory:
+
+| Provider | Type | Specialty |
+|----------|------|-----------|
+| **Honcho** | Dialectical user modeling | Deep user profile with multi-pass reasoning |
+| **Mem0** | Managed memory service | Cloud-hosted, cross-device sync |
+| **Hindsight** | Temporal memory | Time-aware recall with decay modeling |
+| **Supermemory** | Hierarchical storage | Multi-tier memory with automatic promotion |
+| **RetainDB** | Vector database | Embedding-based semantic search |
+| **ByteRover** | Conversational memory | Dialogue-optimized storage and retrieval |
+| **OpenViking** | Open-source memory service | Self-hosted, privacy-focused |
+| **Holographic** | Associative memory | Connection-based recall (memory webs) |
+
+Each provider plugs into Layer 4 as an additional memory source. The agent can query all enabled providers simultaneously and merge results. Dreaming can optionally write promoted facts to external providers in addition to MEMORY.md.
+
+---
+
+## 40+ Bundled Skills
+
+Hermes ships with a library of 40+ built-in skills across 10 categories. These represent procedural memory that every Hermes agent starts with — no learning required.
+
+| Category | Example Skills | Count |
+|----------|---------------|-------|
+| **Software Development** | Code review, debugging, refactoring, dependency management | 8 |
+| **Research** | Web search, paper summarization, fact-checking, literature review | 5 |
+| **Productivity** | Task management, calendar integration, note-taking, meeting summaries | 6 |
+| **Data Science** | Data analysis, visualization, statistical testing, dataset cleaning | 4 |
+| **Diagramming** | Mermaid diagrams, flowcharts, architecture diagrams, sequence diagrams | 3 |
+| **Email** | Drafting, summarization, triage, follow-up tracking | 4 |
+| **GitHub** | PR review, issue triage, repo analysis, CI debugging | 4 |
+| **Media Processing** | Image analysis, audio transcription, video summarization | 3 |
+| **Smart Home** | Device control, automation rules, scene management | 2 |
+| **MLOps** | Model deployment, experiment tracking, pipeline debugging | 3 |
+
+These bundled skills serve two purposes:
+
+1. **Baseline capability** — the agent is useful from the first session without learning anything
+2. **Template for evolution** — the agent's self-created skills follow the same format and quality bar as the bundled skills, because the bundled skills are the examples the agent has seen
+
+The bundled skills are also the starting point for the self-evaluation system. When the agent encounters a task type that doesn't match any bundled or learned skill, that's a strong signal for skill creation.
+
+---
+
 ## Summary
 
 ```
-┌──────────────────────────────────────────────────┐
-│                   Hermes Agent                    │
-├──────────────────────────────────────────────────┤
-│  Layer 1: Working Context (ephemeral)            │
-│  Layer 2: Skills (~/.hermes/skills/, FTS5 index) │
-│  Layer 3: Persistent Facts (Honcho, dialectic)   │
-│                                                  │
-│  Self-Evaluation: 15-call checkpoint             │
-│  5 trigger conditions → skill creation/update    │
-│  skill_manage: ADD / EDIT / APPEND               │
-│                                                  │
-│  6 backends × 9 platforms × 200+ models          │
-│  Atropos: trajectory → ShareGPT → fine-tuning    │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       Hermes Agent                            │
+├──────────────────────────────────────────────────────────────┤
+│  Memory:                                                      │
+│    Layer 1: Prompt Memory (MEMORY.md + USER.md, ~1300 tokens)│
+│    Layer 2: Session Archive (searchable, 90-day window)      │
+│    Layer 3: Skills (~/.hermes/skills/, FTS5 index)           │
+│    Layer 4: External Providers (8 pluggable backends)        │
+│                                                              │
+│  Dreaming (opt-in, 3 AM daily):                              │
+│    Light Sleep → REM Sleep → Deep Sleep                      │
+│    6 ranking signals, 3 promotion gates                      │
+│    minScore: 0.8 | minRecallCount: 3 | minUniqueQueries: 3  │
+│                                                              │
+│  Self-Evaluation: 15-call checkpoint                         │
+│  5 trigger conditions → skill creation/update                │
+│  skill_manage: ADD / EDIT / APPEND                           │
+│                                                              │
+│  40+ bundled skills across 10 categories                     │
+│  6 backends × 9 platforms × 200+ models                      │
+│  Atropos: trajectory → ShareGPT → fine-tuning                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 Hermes is the most complete self-evolution system in open source. The key differentiator from Claude Code: Hermes's evolution is agent-driven. The agent creates its own skills, writes its own memory, evaluates its own performance, and improves its own procedures. Claude Code provides the platform for evolution; Hermes provides the autonomous learning loop.
 
-The trade-off: agent-driven evolution is powerful (68% fewer tool calls after a month) but can drift, accumulate noise, or create subtly wrong skills. The 15-call checkpoint and structured evaluation criteria mitigate this, but the system's quality ultimately depends on the underlying model's judgment.
+The Dreaming feature adds a dimension that no other production agent has: **offline consolidation**. While the user sleeps, the agent reviews, deduplicates, scores, and promotes memories. This is the closest any production system comes to biological memory consolidation.
+
+The trade-off: agent-driven evolution is powerful (68% fewer tool calls after a month) but can drift, accumulate noise, or create subtly wrong skills. The 15-call checkpoint, structured evaluation criteria, and Dreaming's triple-gate promotion system mitigate this, but the system's quality ultimately depends on the underlying model's judgment.

@@ -153,3 +153,122 @@ agentskills.io (format standard)
 ```
 
 The convergence on a single skill format across Hermes, OpenClaw, Claude Code, and enterprise platforms is the structural story. Skills are portable. The ecosystem competes on distribution, curation, and trust — not on format.
+
+---
+
+## Self-Evolution on SkillHub: The self-evolving-agent Skill
+
+SkillHub hosts its own self-evolution offering: **self-evolving-agent** (GitHub: `RangeKing/self-evolving-agent`). It takes a fundamentally different approach from the ClawHub self-improving skills. Where most ClawHub skills focus on *passive* improvement (logging errors, consolidating learnings), self-evolving-agent implements *active capability advancement* — the agent proactively seeks out new capabilities through a structured curriculum.
+
+### Self-Improving vs. Self-Evolving: The Distinction
+
+| | Self-Improving (passive) | Self-Evolving (active) |
+|---|---|---|
+| **Trigger** | Error or gap detected during normal use | Agent proactively initiates capability assessment |
+| **Learning source** | Past mistakes and user corrections | Structured curriculum + deliberate practice |
+| **Outcome** | "Don't repeat this mistake" | "I can now do something I couldn't before" |
+| **Capability growth** | Incremental (fix by fix) | Systematic (capability by capability) |
+| **Example** | "Remember that pytest needs conftest.py in root" | "I have passed assessment for Python testing and can now generalize to other test frameworks" |
+
+Most ClawHub skills (self-improving-agent, proactive-agent, openclaw-continuous-learning) are **self-improving**: they react to failures and accumulate fixes. self-evolving-agent is **self-evolving**: it actively builds new capabilities through practice.
+
+### Curriculum-Based Learning
+
+self-evolving-agent organizes learning into four phases:
+
+| Phase | What Happens | Duration |
+|-------|-------------|----------|
+| **task_light** | Agent encounters a simplified version of a new capability area. Low stakes, guided examples. | 1–3 sessions |
+| **task_full** | Agent works on full-complexity tasks in the capability area. Real stakes, minimal guidance. | 3–10 sessions |
+| **agenda_review** | Agent reviews its performance across all task_full sessions. Identifies remaining gaps. | 1 session |
+| **promotion_review** | Formal assessment: can the agent reliably demonstrate this capability? | 1 session |
+
+```mermaid
+graph TD
+    A[task_light<br/>Simplified exposure] --> B[task_full<br/>Full-complexity practice]
+    B --> C[agenda_review<br/>Self-assessment]
+    C -->|gaps found| B
+    C -->|ready| D[promotion_review<br/>Formal evaluation]
+    D -->|pass| E[Capability promoted ✅]
+    D -->|fail| B
+```
+
+### Capability Evaluation States
+
+Every capability the agent develops is tracked through a formal six-state progression:
+
+```
+recorded → understood → practiced → passed → generalized → promoted
+```
+
+| State | Meaning | How Agent Advances |
+|-------|---------|-------------------|
+| **recorded** | A new capability area has been identified | Agent encounters an unfamiliar task type |
+| **understood** | Agent can explain the capability and its context | Agent generates a correct explanation of the domain |
+| **practiced** | Agent has attempted real tasks in this capability area | task_full phase completed at least once |
+| **passed** | Agent demonstrates reliable competence (3+ successes, <10% error rate) | Assessment threshold met |
+| **generalized** | Agent can apply the capability to novel contexts outside the original domain | Cross-domain transfer validated |
+| **promoted** | Capability is permanently integrated into the agent's operational repertoire | promotion_review passed |
+
+### Transfer Learning: Cross-Task Strategy Validation
+
+The most sophisticated feature. When the agent learns a strategy in one context, self-evolving-agent validates whether it **transfers** to related contexts:
+
+```
+Strategy: "Use structured output schemas to reduce hallucination"
+  Learned in: API response parsing
+  
+  Transfer validation:
+    ✅ Database query results → works (reduces formatting errors)
+    ✅ Config file generation → works (enforces valid structure)
+    ❌ Creative writing → does NOT transfer (constrains useful variety)
+    ✅ Log analysis → works (standardizes extraction)
+  
+  Result: Strategy marked "generalized" for structured-data tasks
+          Strategy marked "domain-specific, do not apply" for creative tasks
+```
+
+Transfer validation prevents the agent from overgeneralizing. A strategy that works in one domain might be counterproductive in another — the evaluation pipeline catches this before it becomes a habit.
+
+---
+
+## Proposed: Adaptive Memory for OpenClaw Core
+
+There is an active proposal (RFC status, not yet merged) to add **Adaptive Memory** as a built-in feature of OpenClaw itself — not as a skill, but as core infrastructure. This would be the first self-evolution mechanism built into the platform rather than installed from a marketplace.
+
+### Hierarchical Memory Architecture
+
+The proposal defines three memory tiers:
+
+```
+Tier 3: MEMORY.md (~1000 tokens)
+  Permanent, always in system prompt
+  Promoted facts and core knowledge
+       ▲ promotion (high confidence + frequency)
+       │
+Tier 2: Active Context (~5000 tokens)
+  Session-spanning working memory
+  Current projects, recent decisions, active preferences
+       ▲ consolidation (pattern detection)
+       │
+Tier 1: Daily Notes (unbounded)
+  Per-session logs, raw observations
+  Automatically captured, ephemeral
+```
+
+| Tier | Name | Token Budget | Persistence | Loaded When |
+|------|------|-------------|-------------|-------------|
+| **Tier 1** | Daily Notes | Unbounded | 30-day rolling window | On demand (search) |
+| **Tier 2** | Active Context | ~5,000 tokens | Until superseded | Every session |
+| **Tier 3** | MEMORY.md | ~1,000 tokens | Permanent | Always (system prompt) |
+
+### Why Built-In vs. Skill?
+
+The argument for building this into OpenClaw core rather than leaving it as a skill:
+
+1. **Consistency** — every OpenClaw user gets baseline memory without knowing about ClawHub
+2. **Performance** — core memory can be optimized at the system level (e.g., pre-indexed search)
+3. **Interoperability** — skills can read/write to the core memory rather than maintaining their own separate memory files
+4. **Reliability** — no dependency on a third-party skill that might break or be abandoned
+
+The counterargument: the skill ecosystem has already produced multiple competing memory architectures (proactive-agent, cognitive-memory, self-evolution). Building one approach into core might stifle innovation. The RFC is still under discussion.
