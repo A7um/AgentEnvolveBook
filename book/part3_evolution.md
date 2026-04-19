@@ -70,6 +70,28 @@ Voyager consists of three tightly integrated components that form a closed loop:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+The following diagram summarizes the Voyager loop — how the curriculum, prompting mechanism, verification, and skill library interact in a continuous cycle:
+
+```mermaid
+graph TD
+    CURRICULUM["Automatic Curriculum<br/>Generate task matching<br/>current skill level"]
+    PROMPT["Iterative Prompting<br/>Write code → Execute →<br/>Get error → Fix → Repeat"]
+    VERIFY{"Verification<br/>test passes?"}
+    LIBRARY["Skill Library<br/>Store verified function<br/>+ docstring + test"]
+    COMPOSE["Future tasks<br/>Retrieve & compose<br/>existing skills"]
+    
+    CURRICULUM --> PROMPT
+    PROMPT --> VERIFY
+    VERIFY -->|No| PROMPT
+    VERIFY -->|Yes| LIBRARY
+    LIBRARY --> COMPOSE
+    COMPOSE --> CURRICULUM
+    
+    style LIBRARY fill:#37b24d,color:#fff
+    style CURRICULUM fill:#4dabf7,color:#fff
+    style VERIFY fill:#ffa94d
+```
+
 The key design decision: **code as the action space.** Rather than having the LLM emit low-level motor commands (move forward, turn left, click), Voyager has GPT-4 write JavaScript functions that call the Mineflayer bot API. This choice has three consequences:
 
 1. **Temporal abstraction.** A single skill function can encode a multi-step behavior (mine logs → craft planks → craft sticks → craft pickaxe) as a single callable unit.
@@ -622,6 +644,31 @@ async def delete_merged_branches(page, project_path):
 
 The fix scopes the ambiguous `get_by_role("textbox")` to the specific dialog context. This refinement is persisted back to the skill library, improving the API for all future invocations.
 
+The following diagram visualizes the full SkillWeaver pipeline — from browsing a website to accumulating reusable APIs and transferring them across agents:
+
+```mermaid
+graph LR
+    subgraph "Stage 1: Discover"
+        BROWSE["Browse website"] --> PATTERNS["Identify common<br/>interaction patterns"]
+    end
+    subgraph "Stage 2: Synthesize"
+        PATTERNS --> GENERALIZE["Generalize into<br/>Python API function"]
+        GENERALIZE --> DEBUG["Debug via<br/>trial & error"]
+        DEBUG --> VERIFY2["Verify API<br/>correctness"]
+    end
+    subgraph "Stage 3: Accumulate"
+        VERIFY2 --> LIB["Add to<br/>Skill Library"]
+        LIB --> REUSE["Reuse in<br/>future tasks"]
+    end
+    
+    subgraph "Cross-Agent Transfer"
+        LIB --> WEAK["Transfer to<br/>weaker agent<br/>(+54.3%)"]
+    end
+    
+    style LIB fill:#37b24d,color:#fff
+    style WEAK fill:#da77f2,color:#fff
+```
+
 ---
 
 ## 8.3 Cross-Agent Skill Transfer
@@ -792,6 +839,32 @@ Hermes Agent's skill system is a closed loop between task execution, self-evalua
 │  │ skill?       │                                                   │
 │  └──────────────┘                                                   │
 └─────────────────────────────────────────────────────────────────────┘
+```
+
+The following diagram distills the Hermes Agent closed-loop learning cycle — showing when skills are captured, how memory is updated, and how skills are retrieved for future tasks:
+
+```mermaid
+graph TD
+    TASK["Task Execution<br/>Using tools, code, browsing"]
+    CHECK{"Self-Evaluation<br/>Checkpoint<br/>(every 15 tool calls)"}
+    WORTH{"Worth<br/>capturing?"}
+    CREATE["Create/Update SKILL.md<br/>agentskills.io standard"]
+    MEMORY["Update MEMORY.md<br/>+ USER.md"]
+    SKIP["Continue without<br/>capturing"]
+    NEXT["Next Task"]
+    
+    TASK --> CHECK
+    CHECK --> WORTH
+    WORTH -->|"5+ tool calls OR<br/>error recovery OR<br/>user correction"| CREATE
+    WORTH -->|"Routine task"| SKIP
+    CREATE --> MEMORY
+    MEMORY --> NEXT
+    SKIP --> NEXT
+    NEXT -->|"Retrieve relevant<br/>skills via FTS5"| TASK
+    
+    style CREATE fill:#37b24d,color:#fff
+    style MEMORY fill:#4dabf7,color:#fff
+    style CHECK fill:#ffa94d
 ```
 
 ### 9.1.1 Progressive Disclosure: Token-Efficient Skill Loading
@@ -1276,6 +1349,35 @@ Verified subagents can be exported as standalone Python modules:
 
 The export removes all framework dependencies, producing pure Python that can run independently. This is AgentFactory's answer to the portability question: subagents are not locked into the framework.
 
+The following diagram illustrates AgentFactory's three-phase lifecycle — from task decomposition and subagent creation, through self-evolution on repeated tasks, to standalone deployment:
+
+```mermaid
+graph TD
+    subgraph "Phase 1: Install"
+        DECOMP["Meta-agent<br/>decomposes task"] --> SUBAGENT["Create Python<br/>subagent module"]
+        SUBAGENT --> TEST{"solve() +<br/>self_test()"}
+        TEST -->|Pass| SAVE["Save to<br/>skill library"]
+        TEST -->|Fail| DECOMP
+    end
+    
+    subgraph "Phase 2: Self-Evolve"
+        NEW["New similar task"] --> SEARCH["Search saved<br/>subagents"]
+        SEARCH --> REUSE["Retrieve & reuse"]
+        REUSE --> WORKS{"Execution<br/>succeeds?"}
+        WORKS -->|Yes| DONE["Done<br/>(57% fewer tokens)"]
+        WORKS -->|No| MODIFY["Detect limitation<br/>& modify code"]
+        MODIFY --> UPDATE["Update saved<br/>version"]
+    end
+    
+    subgraph "Phase 3: Deploy"
+        SAVE --> EXPORT["Export as standalone<br/>Python module"]
+    end
+    
+    style SAVE fill:#37b24d,color:#fff
+    style DONE fill:#37b24d,color:#fff
+    style MODIFY fill:#ffa94d
+```
+
 The Deploy phase also generates a **README** for each exported subagent, documenting:
 - Input/output interface
 - Dependencies (pip-installable packages)
@@ -1623,6 +1725,25 @@ This representation enables several properties that flat skill libraries lack:
 1. **Failure localization.** When a composed workflow fails, the failure can be attributed to a specific node or edge in the graph, not to the entire workflow.
 2. **Regression detection.** Individual skills can be periodically replay-tested to detect regressions without running full workflows.
 3. **Compositional verification.** New compositions can be verified by checking interface compatibility at each edge, not only by end-to-end execution.
+
+The following diagram shows the ASG-SI skill lifecycle — from task completion through compilation, independent verification, and promotion into the growing skill graph:
+
+```mermaid
+graph TD
+    TASK2["Agent completes task"] --> COMPILER["Skill Compiler<br/>Extract candidate skill"]
+    COMPILER --> VERIFY3["Verifier<br/>Replay + contract checks"]
+    VERIFY3 -->|Pass| PROMOTE["Promote to<br/>Skill Graph"]
+    VERIFY3 -->|Fail| REJECT["Reject<br/>(logged for audit)"]
+    PROMOTE --> GRAPH["Directed Skill Graph<br/>Growing over time"]
+    GRAPH --> RETRIEVE2["Retrieve for<br/>future tasks"]
+    
+    AUDITOR["Independent Auditor<br/>Verifiable rewards<br/>Replayable evidence"] --> VERIFY3
+    
+    style PROMOTE fill:#37b24d,color:#fff
+    style REJECT fill:#ff6b6b,color:#fff
+    style AUDITOR fill:#4dabf7,color:#fff
+    style GRAPH fill:#da77f2,color:#fff
+```
 
 ---
 
