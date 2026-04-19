@@ -9,7 +9,7 @@ description = "How top-tier production agents — Claude Code, Cursor, Hermes, O
 default-theme = "light"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/A7um/AgentEnvolveBook"
-edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/src/{path}"
+edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/chapters/{path}"
 site-url = "/AgentEnvolveBook/"
 print = { enable = false }
 additional-css = ["book-zoom.css"]
@@ -17,4 +17,7 @@ additional-js = ["mermaid.min.js", "mermaid-init.js", "book-zoom.js"]
 
 [output.html.search]
 enable = false
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
 

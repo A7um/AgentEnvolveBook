@@ -1,15 +1,18 @@
-# AGENTS.md
+# AgentEnvolveBook
 
 ## Cursor Cloud specific instructions
 
-This is an mdBook project. No application services, dependencies, or tests.
+This is an mdBook project. There are no application services or automated tests beyond building the book.
 
 ### Structure
-- `book.toml` — mdBook configuration
-- `src/SUMMARY.md` — Table of contents
-- `src/*.md` — Chapter files (12 chapters + introduction)
+
+- **`README.md`** — Overview and how to build.
+- **`chapters/`** — Full chapter markdown (the source of truth for book content).
+- **`src/`** — `SUMMARY.md` and small files that include each chapter from `chapters/` for mdBook.
+- **`research/`** — Working notes not included in the site output.
+- **`book.toml`**, **`book-zoom.css`**, **`book-zoom.js`**, **`mermaid-init.js`**, **`mermaid.min.js`** — mdBook and front-end assets.
 
 ### Development
-- Build: `mdbook build` (requires `cargo install mdbook`)
-- Serve: `mdbook serve` (live reload at localhost:3000)
-- No other dependencies needed.
+
+- Build: `mdbook build` (requires `mdbook` and `mdbook-mermaid` on `PATH`).
+- Serve: `mdbook serve` (live reload at localhost:3000).

@@ -24,12 +24,8 @@ Extracted from shipped products, leaked source code, open repos, and the ClawHub
 This is an [mdBook](https://rust-lang.github.io/mdBook/). To build locally:
 
 ```bash
-cargo install mdbook
+cargo install mdbook mdbook-mermaid
 mdbook serve
 ```
 
-Or browse the source directly in [`src/`](src/SUMMARY.md).
-
-## Format
-
-Matches the format of [AgentMemoryBook](https://github.com/A7um/AgentMemoryBook) and [SkillDesignBook](https://github.com/A7um/SkillDesignBook).
+Chapter markdown lives in [`chapters/`](chapters/introduction.md). The mdBook entry point is [`src/SUMMARY.md`](src/SUMMARY.md); each file under `src/` includes the matching chapter from `chapters/`.
