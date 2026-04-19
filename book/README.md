@@ -35,17 +35,15 @@ But building agents that *evolve* — that improve over time, handle long-horizo
 - [Chapter 8: Self-Improvement Through Reinforcement Learning](part3_evolution.md#chapter-8-self-improvement-through-reinforcement-learning)
 - [Chapter 9: Evaluation and Benchmarking](part3_evolution.md#chapter-9-evaluation-and-benchmarking)
 
-### Part IV: Production Practice
-- [Chapter 10: Safety, Alignment, and Guardrails](part4_5_practice_future.md#chapter-10-safety-alignment-and-guardrails)
-- [Chapter 11: The Open-Source Agent Ecosystem](part4_5_practice_future.md#chapter-11-the-open-source-agent-ecosystem)
-- [Chapter 12: Case Studies — Agents in Production](part4_5_practice_future.md#chapter-12-case-studies--agents-in-production)
-
-### Part V: The Future
-- [Chapter 13: What Comes Next](part4_5_practice_future.md#chapter-13-what-comes-next)
+### Part IV: Knowledge Crystallization and Self-Optimizing Systems
+- [Chapter 12: Knowledge Crystallization — Filesystem-Based Evolution](part4_5_practice_future.md#chapter-12-knowledge-crystallization--filesystem-based-evolution)
+- [Chapter 13: Prompt and Architecture Self-Optimization](part4_5_practice_future.md#chapter-13-prompt-and-architecture-self-optimization)
+- [Chapter 14: LATS — Planning-Time Self-Improvement](part4_5_practice_future.md#chapter-14-lats--planning-time-self-improvement)
+- [Chapter 15: Open Problems and the Future of Self-Evolving Agents](part4_5_practice_future.md#chapter-15-open-problems-and-the-future-of-self-evolving-agents)
 
 ### Appendices
-- [Appendix A: Agent Framework Comparison Matrix](part4_5_practice_future.md#appendix-a-agent-framework-comparison-matrix)
-- [Appendix B: Key Research Papers](part4_5_practice_future.md#appendix-b-key-research-papers)
+- [Appendix A: Paper Reference Table](part4_5_practice_future.md#appendix-a-paper-reference-table)
+- [Appendix B: Implementation Decision Guide](part4_5_practice_future.md#appendix-b-implementation-decision-guide)
 
 ## Key Themes
 
