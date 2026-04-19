@@ -1,2697 +1,2009 @@
-# Part I: Foundations — The Engineering of Agent Systems
+# Part I: Foundations of Runtime Self-Evolution
 
 ---
 
-# Chapter 1: The Agent Loop in Practice
+# Chapter 1: The Self-Evolution Problem
 
-## 1.1 The HTTP Anatomy of an Agent Turn
+Runtime self-evolution is the capacity of an AI agent to improve its performance across tasks without modifying the underlying model weights. This chapter formalizes the problem, establishes why it exists, and provides the complete taxonomy of mechanisms that address it.
 
-Every agent loop iteration is, at the wire level, an HTTP POST. Understanding the exact request and response shapes — not abstract diagrams — is the prerequisite for building, debugging, and optimizing agents.
+---
 
-### OpenAI Responses API: The Codex Agent Loop
+## 1.1 The Statelessness Problem
 
-The Responses API (`POST https://api.openai.com/v1/responses`) is what powers Codex. Here is the exact first request of a Codex-style agent session:
+Large language models are stateless functions. Given an input sequence, they produce an output distribution. There is no hidden state that persists between invocations. No internal notebook. No scratch memory that carries forward. Every API call begins from the same parameter checkpoint, with zero recollection of anything that happened before.
 
-```http
-POST /v1/responses HTTP/1.1
-Host: api.openai.com
-Authorization: Bearer sk-...
-Content-Type: application/json
+This is a fundamental architectural constraint, not a temporary limitation. The transformer architecture processes a fixed context window and produces a response. When that response is complete and the connection closes, everything the model "learned" during that interaction — every failed approach it tried, every user correction it received, every environmental detail it discovered — vanishes.
 
-{
-  "model": "o3-mini",
-  "instructions": "You are a coding agent operating in a sandboxed environment. You have access to the full repository at /workspace. Always read files before editing. Run tests after changes. If tests fail, debug and fix before reporting completion.",
-  "input": [
-    {
-      "role": "user",
-      "content": "The login endpoint returns 500 when the email contains a plus sign. Fix it."
-    }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "name": "shell",
-      "description": "Execute a shell command in the sandbox and return stdout/stderr.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "command": {
-            "type": "string",
-            "description": "The shell command to execute"
-          },
-          "timeout": {
-            "type": "integer",
-            "description": "Timeout in seconds (default 30)"
-          }
-        },
-        "required": ["command"]
-      }
-    },
-    {
-      "type": "function",
-      "name": "read_file",
-      "description": "Read a file from the filesystem. Returns content with line numbers.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": { "type": "string" },
-          "offset": { "type": "integer", "description": "Start line (0-indexed)" },
-          "limit": { "type": "integer", "description": "Max lines to return" }
-        },
-        "required": ["path"]
-      }
-    },
-    {
-      "type": "function",
-      "name": "write_file",
-      "description": "Write content to a file, creating it if necessary.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": { "type": "string" },
-          "content": { "type": "string" }
-        },
-        "required": ["path", "content"]
-      }
-    },
-    {
-      "type": "function",
-      "name": "str_replace",
-      "description": "Replace an exact string in a file. Fails if old_string is not found or is ambiguous.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": { "type": "string" },
-          "old_string": { "type": "string" },
-          "new_string": { "type": "string" }
-        },
-        "required": ["path", "old_string", "new_string"]
-      }
-    }
-  ],
-  "stream": true,
-  "max_output_tokens": 16384
-}
-```
+### The Concrete Cost of Statelessness
 
-The response streams back as Server-Sent Events. A typical first turn:
+Consider a coding agent tasked with deploying a staging environment. The first time it encounters this task, it must discover through trial and error:
+
+1. The project uses a non-standard Docker Compose configuration with environment-specific override files
+2. The staging database requires a VPN tunnel that must be established before migration scripts run
+3. The migration tool has a known bug with PostgreSQL 16 that requires a `--legacy-mode` flag
+4. The deployment webhook expects a specific header format that differs from the documentation
+5. The health check endpoint returns 200 before the application is actually ready; the agent must poll a `/ready` subpath instead
+
+This discovery process takes 25 tool calls, 4 failed deployment attempts, and roughly 180K tokens of context. The agent eventually succeeds.
+
+The next day, the same user asks for the same deployment. The agent starts from zero. It makes the same 25 tool calls. It hits the same 4 failures. It burns the same 180K tokens. It discovers the same VPN requirement, the same migration bug, the same webhook format, the same health check subtlety.
+
+After 20 such deployments, the agent's performance curve is flat:
 
 ```
-event: response.output_item.added
-data: {"type":"function_call","name":"shell","call_id":"call_abc123","arguments":""}
-
-event: response.function_call_arguments.delta
-data: {"delta":"{\"command\":\"grep -rn 'email' src/routes/auth.ts\"}"}
-
-event: response.function_call_arguments.done
-data: {"arguments":"{\"command\":\"grep -rn 'email' src/routes/auth.ts\"}"}
-
-event: response.output_item.done
-data: {"type":"function_call","name":"shell","call_id":"call_abc123","status":"completed"}
+Deployment  |  Tool Calls  |  Failures Before Success  |  Tokens Used
+------------|-------------|---------------------------|-------------
+     1      |     25      |           4               |   183,241
+     2      |     25      |           4               |   179,882
+     5      |     25      |           4               |   181,556
+    10      |     25      |           4               |   180,103
+    20      |     25      |           4               |   182,744
 ```
 
-The client-side agent loop then:
-1. Parses the function call from the stream
-2. Executes it in the sandbox: `grep -rn 'email' src/routes/auth.ts`
-3. Captures stdout/stderr
-4. Posts the result back in the next request, referencing the `call_id`
+A human engineer performing the same task 20 times would, by the third or fourth repetition, have written a deployment script, documented the VPN requirement, and memorized the migration flag. By the tenth repetition, the deployment would be a single command taking 30 seconds. The human's performance curve is a power law — steep initial improvement, then asymptotic efficiency.
 
-The follow-up request appends the tool output:
+The agent's curve is a horizontal line. Zero learning. This is the statelessness problem.
 
-```json
-{
-  "model": "o3-mini",
-  "previous_response_id": "resp_xyz789",
-  "input": [
-    {
-      "type": "function_call_output",
-      "call_id": "call_abc123",
-      "output": "src/routes/auth.ts:47:  const email = req.body.email;\nsrc/routes/auth.ts:48:  const user = await db.users.findOne({ email });\nsrc/routes/auth.ts:52:  const normalized = email.toLowerCase();"
-    }
-  ],
-  "stream": true
-}
+### What Statelessness Costs in Practice
+
+The costs compound across three dimensions:
+
+**Compute cost.** Every redundant discovery burns tokens. At current API pricing ($3–15 per million input tokens for frontier models, $12–60 per million output tokens for reasoning models), an agent that re-discovers the same deployment procedure 20 times costs 20× what it should. For organizations running thousands of agent sessions per day, this waste scales to thousands of dollars daily.
+
+**Latency cost.** Each failed attempt in the discovery process takes wall-clock time. The user waits while the agent re-learns what it already knew. For interactive coding agents, this transforms a 30-second task (if the agent "remembered") into a 15-minute ordeal.
+
+**Reliability cost.** Re-discovery is not just slow — it is fragile. The agent might fail in a different way on attempt 17 than it did on attempt 1, hitting a different branch of the error space. Statelessness means the agent cannot build a robust model of the task; each attempt is an independent Bernoulli trial with the same (often unsatisfying) success probability.
+
+**Trust cost.** Users lose confidence in an agent that repeatedly fails at familiar tasks. The perception of intelligence collapses when a system that successfully navigated a complex deployment yesterday cannot remember how to do it today. Trust, once lost, is difficult to rebuild — users downgrade their expectations and stop delegating complex tasks.
+
+### Measuring Statelessness: The Learning Curve Diagnostic
+
+A simple diagnostic for statelessness is the *learning curve*: plot task performance (success rate, tool call count, token cost) against the number of times the agent has encountered a similar task. For a stateless agent, this curve is flat — a horizontal line.
+
+For a self-evolving agent, the curve should follow a power law:
+
+$$\text{performance}(n) = a - b \cdot n^{-\alpha}$$
+
+where $n$ is the number of similar task encounters, $a$ is the asymptotic performance ceiling, $b$ is the initial performance gap, and $\alpha > 0$ is the learning rate. Larger $\alpha$ means faster improvement.
+
+In the deployment example:
+
+```
+Stateless agent:        tool_calls(n) = 25                    (flat)
+Self-evolving agent:    tool_calls(n) = 5 + 20 * n^{-0.7}    (power law)
+
+n=1:  25 tool calls → 25 tool calls  (identical first attempt)
+n=2:  25 tool calls → 17 tool calls  (-32%)
+n=5:  25 tool calls → 11 tool calls  (-56%)
+n=10: 25 tool calls →  8 tool calls  (-68%)
+n=20: 25 tool calls →  7 tool calls  (-72%)
 ```
 
-This is the fundamental rhythm: POST with tool results → stream back reasoning + tool calls → execute → POST again. The `previous_response_id` field enables server-side conversation tracking so the client doesn't need to re-send the full history.
+The learning curve diagnostic is the single most important metric for evaluating runtime self-evolution mechanisms. Throughout this book, every mechanism is evaluated by the shape of the learning curve it produces.
 
-### The Exact Turn Sequence of a Real Bug Fix
+### The Statelessness Problem Is Getting Worse, Not Better
 
-Here is the complete sequence for the plus-sign email bug, with actual token counts at each step:
+A common misconception is that larger context windows solve the statelessness problem. Models with 128K, 200K, or even 1M+ token context windows can hold more information per invocation — but they still start from zero on each new invocation. A larger context window is a larger scratchpad, not a persistent memory.
+
+Moreover, as agents tackle more complex tasks (multi-step workflows spanning hours or days, integration with more tools and APIs, interaction with more diverse environments), the amount of per-task context that must be discovered grows. The statelessness problem scales with task complexity, not with context window size.
+
+The fundamental issue is not that agents lack capacity to hold information — it is that they lack the ability to carry information *between* invocations. Solving this requires architectural interventions: external memory, persistent storage, and mechanisms for deciding what to keep and how to retrieve it. These interventions are the subject of this book.
+
+### The Formal Shape of the Problem
+
+Let $\pi_\theta$ be a frozen LLM with parameters $\theta$. Let $c_i$ be the context window contents at invocation $i$. The model's output distribution is:
+
+$$P(y \mid c_i; \theta) = \prod_{t=1}^{T} P(y_t \mid y_{<t}, c_i; \theta)$$
+
+The critical observation: there is no dependency between $c_i$ and $c_j$ for $i \neq j$ unless something external creates that dependency. The parameters $\theta$ are identical across invocations. If $c_i$ and $c_j$ contain the same prompt, the output distribution is identical.
+
+For performance to improve across invocations, something must change in $c_i$ as $i$ increases. Since $\theta$ is frozen, the only degree of freedom is the context window contents. Runtime self-evolution is therefore the problem of constructing a function:
+
+$$c_i = f(c_{\text{base}}, M_i)$$
+
+where $c_{\text{base}}$ is the base prompt/task description and $M_i$ is an external memory state that has been updated by all previous invocations $1, \ldots, i-1$. The contents of $M_i$ must be selected and formatted to improve the model's performance on the current task while fitting within the finite context window.
+
+This is the fundamental equation of runtime self-evolution. Everything in this book is about the design of $M$, the update rule for $M$, and the retrieval function that maps $M$ into context window contents.
+
+---
+
+## 1.2 Why Training-Time Improvement Is Not Enough
+
+The obvious objection to runtime self-evolution is: why not just train a better model? If the agent struggles with deployment tasks, fine-tune it on deployment trajectories. If it forgets user preferences, include those preferences in training data.
+
+This objection fails on five grounds.
+
+### Cost
+
+Fine-tuning a frontier model is expensive. Full fine-tuning of a 70B parameter model requires:
+
+- **Hardware:** 8× A100 80GB GPUs minimum, more typically 16–32 GPUs for reasonable training times
+- **Cost:** $10,000–$100,000+ per fine-tuning run, depending on dataset size and number of epochs
+- **Data preparation:** Weeks of curating, cleaning, and formatting training data
+- **Evaluation:** Each fine-tuning run must be evaluated across multiple benchmarks to detect regressions
+
+For comparison, a runtime memory update costs zero additional compute beyond the agent's normal operating costs. Writing a reflection to a text file after a failed deployment is essentially free.
+
+### Latency
+
+Fine-tuning takes hours to days. Model deployment takes additional time for validation, safety checks, and infrastructure rollout. The feedback loop from "agent encounters new situation" to "model has been updated to handle it" is measured in weeks when fine-tuning is involved.
+
+Runtime self-evolution operates on a feedback loop of seconds to minutes. The agent completes a task, reflects on what happened, writes a memory entry, and the next invocation benefits immediately.
+
+### Catastrophic Forgetting
+
+Fine-tuning on new data degrades performance on previously learned tasks. This is not a theoretical concern — it is a well-documented phenomenon in the neural network literature, extensively studied since McCloskey & Cohen (1989) and French (1999).
+
+In practice, this means fine-tuning an agent to excel at deployment tasks may degrade its performance on code review, debugging, or refactoring. Every fine-tuning run must include careful evaluation across the full capability spectrum, with mitigation strategies (replay buffers, elastic weight consolidation, LoRA) adding additional complexity and cost.
+
+Runtime memory updates have no catastrophic forgetting risk. Adding a memory entry about deployment procedures cannot degrade the model's code review capabilities because the model weights are untouched.
+
+### Distribution Shift at Deployment Time
+
+Training data is historical. The model is trained on tasks and environments that existed before the training cutoff. But agents encounter novel situations at deployment time:
+
+- A user's codebase uses a framework released after training
+- The deployment target runs an operating system version not in the training distribution
+- The user has non-standard conventions (e.g., all database migrations must be reviewed by a specific team before execution)
+- The CI/CD pipeline has custom steps unique to this organization
+
+No amount of pre-training or fine-tuning can anticipate every deployment environment. The long tail of user-specific configurations is, by definition, outside the training distribution.
+
+Runtime self-evolution handles distribution shift naturally. The agent encounters the novel situation, discovers the correct approach, and records it. Future invocations in the same environment benefit immediately.
+
+### User-Specific Personalization
+
+Different users have different preferences, conventions, and workflows. One user wants verbose commit messages; another wants single-line summaries. One team uses `snake_case`; another uses `camelCase`. One organization requires all changes to be wrapped in feature flags; another deploys directly to production.
+
+Fine-tuning a separate model for each user is economically infeasible. Even LoRA adapters, which reduce the per-user cost, require infrastructure for managing, serving, and switching between thousands of adapter weights.
+
+Runtime memory provides per-user personalization at zero infrastructure cost. Each user's memory store is a separate collection of text entries, retrieved into the context window at invocation time. No model weights are modified. No adapter infrastructure is needed. The personalization is as granular as the memory entries themselves.
+
+### The Complementarity Argument
+
+Training-time improvement and runtime self-evolution are not substitutes — they are complements. A better base model benefits from runtime evolution just as much as a weaker model does. The base model provides the reasoning capabilities; runtime evolution provides the experiential knowledge.
+
+This is analogous to the relationship between human innate cognitive abilities and learned expertise. A person with higher fluid intelligence still benefits from education, experience, and note-taking. The two operate on different timescales and address different aspects of competence.
+
+### The Frozen-Backbone Constraint in Practice
+
+In production deployments, keeping the model backbone frozen is not just economically motivated — it is architecturally necessary:
+
+**Safety certification.** Organizations that deploy agents in regulated environments (healthcare, finance, legal) must certify model behavior. Fine-tuning invalidates the certification because the model's behavior has changed in ways that may not be fully characterized by the evaluation suite. Runtime memory updates, by contrast, are fully auditable — every memory entry is a text string that humans can read, review, and approve.
+
+**Reproducibility.** With a frozen backbone, the agent's behavior is deterministic given the same context (modulo temperature sampling). This means that any behavioral difference between two invocations can be traced to differences in memory state, not to differences in model weights. This is critical for debugging and compliance.
+
+**Multi-tenant serving.** Cloud API providers serve the same model weights to thousands of users simultaneously. Fine-tuning creates per-user weight variants that require separate serving infrastructure. Runtime memory is purely context-based and requires no changes to the model serving layer.
+
+**Latency.** Loading fine-tuned weights or LoRA adapters adds latency to the first token. For interactive agents where latency is critical, frozen backbone + context injection is strictly faster than adapter switching.
+
+The remainder of this book focuses exclusively on runtime self-evolution: mechanisms that improve agent performance without modifying model weights.
+
+---
+
+## 1.3 The CoALA Framework: Cognitive Architecture for Self-Evolving Agents
+
+To reason precisely about runtime self-evolution, we need a formal framework that decomposes agent cognition into modular components with well-defined interfaces. The Cognitive Architectures for Language Agents (CoALA) framework, introduced by Sumers et al. in their 2024 TMLR paper "Cognitive Architectures for Language Agents" (arXiv:2309.02427), provides exactly this.
+
+CoALA draws on decades of cognitive science research — particularly the Soar and ACT-R architectures — and adapts their insights for LLM-based agents. The framework is not merely descriptive; it is prescriptive, offering a design space that maps directly to implementation decisions.
+
+### Memory Architecture
+
+CoALA decomposes agent memory into four types, each with distinct characteristics:
+
+**Working Memory** is the agent's active processing space — the LLM's context window. It holds the current task, recent observations, retrieved memories, and the agent's ongoing reasoning. Working memory is:
+- *Capacity-limited:* bounded by the context window size (4K–2M tokens depending on the model)
+- *Volatile:* cleared between invocations
+- *High-bandwidth:* the LLM attends to all working memory contents during generation
+
+In the CoALA formalism, working memory at time step $t$ is a set of records:
+
+$$W_t = \{w_1, w_2, \ldots, w_n\} \quad \text{where } \sum_{i=1}^{n} |w_i| \leq C_{\text{max}}$$
+
+where $C_{\text{max}}$ is the context window capacity and $|w_i|$ is the token count of record $w_i$.
+
+**Episodic Memory** stores records of past experiences — trajectories, outcomes, and temporal context. Each episodic memory entry is a record of "what happened" during a specific agent session:
+
+$$e = (\text{task}, \text{trajectory}, \text{outcome}, \text{timestamp}, \text{metadata})$$
+
+Episodic memory supports:
+- *Temporal indexing:* entries are ordered by when they occurred
+- *Similarity retrieval:* entries can be retrieved by semantic similarity to the current context
+- *Full trajectory access:* the complete sequence of actions, observations, and reasoning steps is preserved
+
+In human cognition, episodic memory corresponds to autobiographical memory — remembering specific events with their spatial and temporal context.
+
+**Semantic Memory** stores factual knowledge — facts, rules, and generalizations extracted from experience. Unlike episodic memory, semantic memory entries are context-independent:
+
+$$s = (\text{fact/rule}, \text{confidence}, \text{source}, \text{metadata})$$
+
+Examples of semantic memory entries:
+- "The staging database requires a VPN tunnel before migrations can run"
+- "User prefers single-line commit messages without conventional commit prefixes"
+- "PostgreSQL 16 migration tool requires `--legacy-mode` flag to avoid the VACUUM bug"
+
+Semantic memory supports:
+- *Category-based retrieval:* entries organized by topic, domain, or entity
+- *Confidence tracking:* entries have associated confidence scores updated by experience
+- *Generalization:* multiple episodic memories can be distilled into a single semantic memory entry
+
+**Procedural Memory** stores executable skills — action sequences, code snippets, tool-use patterns, and strategies that the agent can invoke to accomplish specific subtasks:
+
+$$p = (\text{trigger condition}, \text{action sequence}, \text{success rate}, \text{metadata})$$
+
+Examples of procedural memory entries:
+- A Python function that deploys to staging (code skill)
+- A multi-step procedure for database migration with rollback (markdown skill document)
+- An API interaction pattern for the organization's deployment webhook (API skill)
+
+Procedural memory supports:
+- *Condition-action retrieval:* skills are retrieved when their trigger conditions match the current state
+- *Composition:* skills can call other skills, forming hierarchical procedures
+- *Versioning:* skills evolve over time as the agent discovers improvements
+
+### The Learning Action
+
+The critical insight of CoALA for runtime self-evolution is the formalization of **learning as an internal action**. In the CoALA action space, the agent can perform:
+
+1. **External actions:** tool calls, API requests, file operations — actions that affect the external environment
+2. **Internal actions:** reasoning, retrieval from memory, and *writing to memory*
+
+Learning is the act of writing to long-term memory. Every runtime self-evolution mechanism in this book maps to a specific type of memory write:
+
+| Evolution Mechanism | Memory Type Written | Entry Format |
+|---|---|---|
+| Verbal reflection (Reflexion) | Episodic | Natural language reflection on a failed trajectory |
+| Cross-task insights (ExpeL) | Semantic | "When X, do Y because Z" rules with confidence scores |
+| Heuristic extraction (ERL) | Semantic | "When-Then" conditional heuristics |
+| Code skill accumulation (Voyager) | Procedural | Verified JavaScript/Python functions |
+| User modeling (Honcho) | Semantic | Dialectical user preference representations |
+| Knowledge crystallization (RKC) | Semantic + Procedural | Markdown files written to the filesystem |
+
+This mapping is the conceptual backbone of the entire book. When we analyze any self-evolution mechanism, we ask:
+1. What memory type is being written?
+2. What triggers the write (when does learning happen)?
+3. What is the format of the written entry?
+4. How is the entry retrieved and injected into working memory?
+5. How does the entry improve performance on future tasks?
+
+### The Decision Cycle
+
+CoALA defines the agent's decision cycle as a repeating loop:
 
 ```
-Turn 1: Agent searches for email handling
-  Request:  1,847 tokens (system + tools + user message)
-  Response: shell("grep -rn 'email' src/routes/auth.ts")
-  Output:   89 tokens
-  Latency:  340ms model + 45ms tool execution
+PERCEIVE → RETRIEVE → REASON → ACT → LEARN → REPEAT
 
-Turn 2: Agent reads the auth route file
-  Request:  2,291 tokens (previous + tool result)
-  Response: read_file("src/routes/auth.ts")
-  Output:   0 tokens (tool call only)
-  Latency:  280ms model + 12ms tool execution
+1. PERCEIVE: Observe the current environment state; add observation to working memory
+2. RETRIEVE: Query long-term memory (episodic, semantic, procedural) for relevant entries;
+             add retrieved entries to working memory
+3. REASON:  Process working memory contents through the LLM to decide on the next action
+4. ACT:     Execute the chosen action (external tool call or internal operation)
+5. LEARN:   Update long-term memory based on the action outcome
+6. REPEAT:  Return to step 1
+```
 
-Turn 3: Agent receives file content (187 lines), identifies the bug
-  Request:  4,103 tokens (previous + file content)
-  Response: read_file("src/utils/validation.ts")
-  Output:   0 tokens
-  Latency:  450ms model + 8ms tool execution
+The LEARN step is what distinguishes a self-evolving agent from a stateless agent. Without step 5, the cycle is the standard ReAct (Yao et al., 2023) loop. With step 5, each cycle iteration has the potential to improve all future iterations.
+
+The decision about *what* to learn and *when* to learn is itself a decision that can be made by the LLM (meta-learning) or by hardcoded rules in the agent harness. This design choice has significant implications:
+
+- **LLM-driven learning:** The model decides when and what to write to memory. More flexible, but subject to the LLM's judgment about what is worth remembering. Used by Reflexion, ExpeL, and most reflection-based systems.
+- **Harness-driven learning:** The agent infrastructure automatically records trajectories, computes metrics, and triggers learning based on programmatic rules. More reliable, but less adaptive. Used by MemRL and some skill accumulation systems.
+- **Hybrid:** The harness triggers the learning opportunity (e.g., "a task just completed"), and the LLM decides the content of the memory write (e.g., "what should be reflected on"). This is the most common pattern in production systems.
+
+### CoALA as Analytical Lens
+
+Throughout this book, we use CoALA as an analytical lens to decompose and compare self-evolution mechanisms. When analyzing a new system, we ask:
+
+1. Which memory types does it use?
+2. What is the read/write interface for each memory type?
+3. How does the decision procedure integrate memory retrieval?
+4. What triggers the learning action?
+5. How is memory maintained over time (pruning, updating, consolidation)?
+
+This framework transforms what might seem like a bewildering variety of self-evolution approaches into a structured design space with clear dimensions and trade-offs.
+
+### CoALA vs. Alternative Frameworks
+
+CoALA is not the only framework for analyzing agent architectures. Two alternatives deserve mention:
+
+**ReAct Framework (Yao et al., 2023).** ReAct formalizes the thought-action-observation loop but has no memory model. It describes what agents *do* on a single task but not how they *learn* across tasks. CoALA subsumes ReAct — the ReAct loop is the PERCEIVE→REASON→ACT portion of CoALA's decision cycle, without RETRIEVE or LEARN.
+
+**LATS Framework (Zhou et al., 2023).** Language Agent Tree Search adds tree search over action sequences but, like ReAct, does not model persistent memory. LATS is an *execution strategy* (how to search for a good trajectory) rather than a *cognitive architecture* (how to organize memory and learning).
+
+CoALA is the right framework for this book because it explicitly models the components that matter for runtime self-evolution: distinct memory types, memory read/write interfaces, and the learning action as a first-class operation in the agent's action space.
+
+### A Note on Terminology
+
+The literature uses inconsistent terminology for self-evolution concepts. We standardize on the following:
+
+| This Book | Also Called In Literature | Meaning |
+|---|---|---|
+| Runtime self-evolution | Self-improvement, lifelong learning, continual learning | Improving performance across tasks without weight updates |
+| Reflection | Self-reflection, verbal RL, introspection | LLM analyzing its own performance |
+| Heuristic | Rule, guideline, insight, principle | A learned conditional instruction |
+| Skill | Tool, function, procedure, subroutine | An executable action sequence |
+| Memory entry | Experience, record, trace | A single item stored in memory |
+| Retrieval | Recall, selection, memory access | Finding relevant entries from memory |
+
+---
+
+## 1.4 Taxonomy of Runtime Self-Evolution
+
+Runtime self-evolution encompasses every mechanism by which an agent improves its performance across tasks while keeping the model backbone frozen. No weight updates. No fine-tuning. No RLHF. The model parameters $\theta$ are read-only.
+
+The mechanisms differ in *what* they learn, *how* they learn it, *where* they store it, and *when* they apply it. We organize them into six families:
+
+```
+RUNTIME SELF-EVOLUTION (frozen backbone, no weight updates)
+│
+├── REFLECTION-BASED
+│   ├── Verbal Reflection (Reflexion, NeurIPS 2023)
+│   ├── Contrastive Reflection (ExpeL, AAAI 2024)
+│   ├── Single-Attempt Reflection (ERL, ICLR 2026)
+│   └── State-Aware Guidelines (AutoGuide, NeurIPS 2024)
+│
+├── MEMORY-BASED
+│   ├── Episodic Replay (raw trajectory storage + retrieval)
+│   ├── Utility-Learned Memory (MemRL, arXiv 2026)
+│   ├── Dialectical User Modeling (Honcho/Hermes, 2026)
+│   └── Memory-Augmented MDP (Memento-II, arXiv 2025)
+│
+├── SKILL-BASED
+│   ├── Code Skill Accumulation (Voyager, TMLR 2024)
+│   ├── API Skill Synthesis (SkillWeaver, arXiv 2025)
+│   ├── Markdown Skill Documents (Hermes Agent, 2026)
+│   ├── Executable Subagent Accumulation (AgentFactory, arXiv 2026)
+│   └── Audited Skill Graphs (ASG-SI, arXiv 2025)
+│
+├── KNOWLEDGE CRYSTALLIZATION
+│   ├── Filesystem Persistence (RKC, 2026)
+│   ├── Learnings Promotion (OpenClaw self-improving-agent, 2026)
+│   └── Progressive Solidification (AGENTS.md/TOOLS.md/SOUL.md)
+│
+├── PROMPT SELF-OPTIMIZATION
+│   ├── Optimization by Prompting (OPRO, 2023)
+│   ├── Evolutionary Prompt Optimization (EvoPrompt, 2024)
+│   └── Modular Policy Evolution (EvoTool, 2026)
+│
+└── ARCHITECTURE SELF-DESIGN
+    ├── Meta Agent Search (ADAS, ICLR 2025)
+    └── Hybrid Agentic Workflow Evolution (HyEvo, 2026)
+```
+
+### Family 1: Reflection-Based
+
+Reflection-based mechanisms generate natural language analyses of past performance and inject those analyses into future contexts. The learning artifact is text — a verbal reflection, a rule, a guideline — stored in episodic or semantic memory.
+
+**Verbal Reflection (Reflexion).** After a failed task attempt, the LLM generates a natural language analysis of what went wrong and how to do better. This reflection is stored and prepended to the context on subsequent retry attempts. The mechanism is intra-task: reflections help within the same task but do not transfer to different tasks. Source: Shinn et al., "Reflexion: Language Agents with Verbal Reinforcement Learning," NeurIPS 2023 (arXiv:2303.11366).
+
+**Contrastive Reflection (ExpeL).** Given pairs of successful and failed trajectories on the same task, the LLM extracts generalizable insights by contrasting the two. Insights are stored as rules with confidence scores (upvote/downvote counts) and can transfer across task types. Source: Zhao et al., "ExpeL: LLM Agents Are Experiential Learners," AAAI 2024 (arXiv:2308.10144).
+
+**Single-Attempt Reflection (ERL).** Generates "When-Then" heuristics from single task attempts — no contrastive pairs required. A separate LLM-based ranker selects the most relevant heuristics at inference time. Source: Allard et al., "Experiential Reflective Learning for Self-Improving LLM Agents," ICLR 2026 MemAgents Workshop (arXiv:2603.24639).
+
+**State-Aware Guidelines (AutoGuide).** Extracts guidelines from offline experience trajectories, each annotated with the state/context conditions under which it applies. At runtime, only guidelines matching the current agent state are injected. Source: Gao et al., "AutoGuide: Automated Generation and Selection of State-Aware Guidelines for LLM Agents," NeurIPS 2024 (arXiv:2403.08978).
+
+### Family 2: Memory-Based
+
+Memory-based mechanisms focus on the storage, retrieval, and management of experiential data. The learning artifact may be raw trajectories, compressed summaries, or structured user models.
+
+**Episodic Replay.** The simplest memory mechanism: store complete trajectories and retrieve similar ones at inference time. No extraction or compression — the raw experience is the memory. Retrieval is typically by embedding similarity between the current task and stored task descriptions.
+
+**Utility-Learned Memory (MemRL).** Trains a separate RL policy (a small neural network, not the frozen LLM) to decide what to remember, what to forget, and what to retrieve. The memory management policy is optimized to maximize task success rate. Source: Kang et al., "Don't Forget to Remember: A Reinforcement Learning Approach to Memory Management for Evolving LLM Agents," arXiv 2026 (arXiv:2506.XXXXX).
+
+**Dialectical User Modeling (Honcho/Hermes).** Maintains a structured model of user preferences, behaviors, and context through a dialectical process: the system generates candidate user models, tests them against observed behavior, and refines them through thesis-antithesis-synthesis cycles. Source: Nous Research Hermes Agent / Plastic Labs Honcho, 2026.
+
+**Memory-Augmented MDP (Memento-II).** Formalizes the agent's interaction as a memory-augmented Markov Decision Process where the action space includes memory read/write operations. The agent's policy jointly optimizes task actions and memory operations. Source: Palazzo et al., "Memory-Augmented Agent Training with Experience," arXiv 2025.
+
+### Family 3: Skill-Based
+
+Skill-based mechanisms extract reusable, executable procedures from experience. The learning artifact is code, an API interaction pattern, a markdown document, or an entire subagent — something that can be directly invoked on future tasks.
+
+**Code Skill Accumulation (Voyager).** After successfully completing a task in Minecraft, the agent extracts the solution as a verified JavaScript function, stores it in a skill library indexed by natural language description, and retrieves/composes skills for future tasks. Source: Wang et al., "Voyager: An Open-Ended Embodied Agent with Large Language Models," TMLR 2024 (arXiv:2305.16291).
+
+**API Skill Synthesis (SkillWeaver).** Discovers API capabilities through exploration, synthesizes reusable API interaction skills, and accumulates them in a structured library. Skills are parameterized and composable. Source: Ge et al., "SkillWeaver: Web Agents can Self-Improve by Discovering and Honing Skills," arXiv 2025.
+
+**Markdown Skill Documents (Hermes Agent).** Skills are stored as markdown files describing when to use a skill, the step-by-step procedure, and expected outcomes. The agent can create, modify, and version these documents during operation. Source: Nous Research Hermes Agent, 2026.
+
+**Executable Subagent Accumulation (AgentFactory).** Synthesizes entire executable subagents — not just skills, but complete agent configurations with their own prompts, tools, and orchestration logic — and stores them for future reuse. Source: Zhang et al., "AgentFactory: Bootstrapping LLM Agents via Executable Subagent Generation," arXiv 2026 (arXiv:2503.18115).
+
+**Audited Skill Graphs (ASG-SI).** Builds a directed graph of skills with dependency relationships, where each skill is formally verified through an audit process before being added to the library. Skills can be composed along graph edges. Source: "ASG-SI: Audited Skill Graphs for Self-Improving Agents," arXiv 2025.
+
+### Family 4: Knowledge Crystallization
+
+Knowledge crystallization mechanisms persist learned knowledge in structured, human-readable formats — typically files on the filesystem. The learning artifact is a markdown document, a configuration file, or a structured data file that both humans and agents can read and edit.
+
+**Filesystem Persistence (RKC).** After completing tasks, the agent writes learned knowledge (rules, procedures, conventions) to files in a designated directory. These files are loaded into context on subsequent invocations. The filesystem is the memory store. Source: RKC (Runtime Knowledge Crystallization) pattern, 2026.
+
+**Learnings Promotion (OpenClaw).** Implemented in the OpenClaw self-improving-agent: after successful task completion, the agent generates "learnings" — insights and procedures — that are stored at project scope. These learnings are progressively promoted from tentative to confirmed based on repeated validation. Source: OpenClaw self-improving-agent, 2026.
+
+**Progressive Solidification (AGENTS.md).** Knowledge moves through stages of increasing formality: scratchpad notes → tentative guidelines → confirmed rules → canonical documentation (AGENTS.md, TOOLS.md, SOUL.md). Each promotion requires evidence from successful application. This is the pattern used by Cursor Cloud Agents, where AGENTS.md serves as the durable knowledge store that persists across sessions.
+
+### Family 5: Prompt Self-Optimization
+
+Prompt self-optimization mechanisms treat the agent's prompts (system prompt, tool descriptions, few-shot examples) as optimizable parameters and use the LLM itself to search for better prompt configurations.
+
+**Optimization by Prompting (OPRO).** The LLM is prompted with a history of (prompt, score) pairs and asked to generate a new prompt that will score higher. The generated prompt is evaluated, the result is added to the history, and the process repeats. Source: Yang et al., "Large Language Models as Optimizers," arXiv 2023 (arXiv:2309.03409).
+
+**Evolutionary Prompt Optimization (EvoPrompt).** Applies evolutionary algorithms (mutation, crossover, selection) to a population of prompts. The LLM acts as the mutation/crossover operator, generating new prompt variants. Fitness is measured by task performance. Source: Guo et al., "Connecting Large Language Models with Evolutionary Algorithms Yields Powerful Prompt Optimizers," arXiv 2024 (arXiv:2309.08532).
+
+**Modular Policy Evolution (EvoTool).** Evolves modular prompt components (tool descriptions, instruction modules, few-shot examples) independently, allowing fine-grained optimization of specific agent capabilities without disrupting others. Source: EvoTool, 2026.
+
+### Family 6: Architecture Self-Design
+
+Architecture self-design mechanisms go beyond optimizing prompts to designing entirely new agent architectures — new tool configurations, new orchestration patterns, new multi-agent topologies.
+
+**Meta Agent Search (ADAS).** Maintains a growing archive of agent architectures (defined as code). A "meta agent" (an LLM) is prompted with the archive and asked to design a new architecture. The new architecture is evaluated on benchmarks, and if it outperforms existing entries, it is added to the archive. Source: Hu et al., "Automated Design of Agentic Systems," ICLR 2025 (arXiv:2408.08435).
+
+**Hybrid Agentic Workflow Evolution (HyEvo).** Evolves hybrid workflows that combine code execution, LLM reasoning, and tool use. Unlike ADAS which searches over monolithic architectures, HyEvo decomposes workflows into modules and evolves them independently with crossover. Source: HyEvo, 2026.
+
+### Cross-Family Comparison
+
+| Family | Learning Artifact | Memory Type (CoALA) | Transfer Scope | Compute Cost | Human Readable |
+|---|---|---|---|---|---|
+| Reflection | Natural language text | Episodic/Semantic | Task to cross-task | Low | Yes |
+| Memory | Trajectories/models | Episodic/Semantic | Within-user | Medium | Partially |
+| Skill | Code/procedures | Procedural | Cross-task, cross-user | Medium | Yes (code/markdown) |
+| Crystallization | Documents/files | Semantic/Procedural | Cross-session | Low | Yes |
+| Prompt Optimization | Prompt strings | Procedural | Cross-task | High | Yes |
+| Architecture Design | Agent code/configs | Procedural | Cross-task, cross-domain | Very High | Partially |
+
+The families are not mutually exclusive. Production systems typically combine mechanisms from multiple families. Voyager uses both skill-based learning (code skill library) and reflection-based learning (self-verification with retry). OpenClaw combines knowledge crystallization with skill accumulation. The design question is which combination of mechanisms provides the best cost-performance trade-off for a given deployment scenario.
+
+### Evolution Speed vs. Robustness Trade-off
+
+A key dimension differentiating these families is the trade-off between *evolution speed* (how quickly the agent improves) and *robustness* (how resistant the improvement is to noise and errors):
+
+- **Fast but fragile:** Reflection-based mechanisms learn from a single experience but are vulnerable to incorrect reflections. One bad reflection can degrade performance.
+- **Slow but robust:** Skill-based mechanisms require multiple successful experiences before a skill is verified and added to the library, but verified skills are highly reliable.
+- **In between:** Knowledge crystallization mechanisms (e.g., AGENTS.md) learn at medium speed and use progressive promotion (tentative → confirmed → canonical) as a robustness mechanism.
+
+The optimal trade-off depends on the deployment stakes. For low-stakes tasks (exploratory coding, prototyping), fast learning is preferred even at the cost of occasional errors. For high-stakes tasks (production deployments, financial operations), robustness is paramount.
+
+Understanding where each mechanism falls on this spectrum is essential for system design. We revisit this trade-off throughout the book with concrete quantitative comparisons.
+
+---
+
+## 1.5 The Formal Problem Statement
+
+We now formalize runtime self-evolution as an optimization problem. This formalization serves two purposes: it makes precise what "improvement" means, and it reveals the mathematical structure that constrains solution design.
+
+### Setup
+
+Let:
+- $\pi_\theta$: a frozen language model with parameters $\theta$ (read-only)
+- $\mathcal{D}$: a distribution over tasks the agent encounters
+- $M$: an external memory state (files, databases, vector stores — anything outside $\theta$)
+- $M_0$: the initial memory state (may be empty or pre-seeded)
+
+### Execution Protocol
+
+At each time step $i = 1, 2, 3, \ldots$:
+
+1. **Task arrival:** A task $t_i \sim \mathcal{D}$ arrives
+2. **Context construction:** The agent constructs context $c_i = f_{\text{retrieve}}(t_i, M_{i-1})$ by retrieving from memory
+3. **Trajectory generation:** The agent generates a trajectory $\tau_i = \text{Execute}(\pi_\theta, c_i, t_i)$ through iterative action-observation steps
+4. **Outcome evaluation:** An evaluator assigns a reward $r_i = R(t_i, \tau_i)$
+5. **Memory update:** The agent updates memory $M_i = f_{\text{learn}}(M_{i-1}, t_i, \tau_i, r_i)$
+
+### Objective
+
+$$\max_{f_{\text{retrieve}}, f_{\text{learn}}} \lim_{N \to \infty} \frac{1}{N} \sum_{i=1}^{N} \mathbb{E}_{t_i \sim \mathcal{D}} [R(t_i, \tau_i)]$$
+
+subject to:
+
+1. **Frozen backbone:** $\theta$ is constant across all $i$
+2. **Context constraint:** $|c_i| \leq C_{\max}$ (context window limit)
+3. **Memory constraint:** $|M_i| \leq S_{\max}$ (storage budget)
+4. **Compute constraint:** $\text{cost}(f_{\text{retrieve}}) + \text{cost}(f_{\text{learn}}) \leq B$ (per-step compute budget)
+
+### Key Properties
+
+**Monotonic improvement.** Ideally, we want the running average reward to be monotonically non-decreasing:
+
+$$\frac{1}{i+1} \sum_{j=1}^{i+1} r_j \geq \frac{1}{i} \sum_{j=1}^{i} r_j \quad \forall i$$
+
+In practice, this is too strong — individual tasks may be harder or easier regardless of accumulated knowledge. A weaker but achievable property is that the agent's performance on *repeated* task types improves:
+
+$$\mathbb{E}[R(t, \tau_i) \mid t \in \mathcal{T}_k] \geq \mathbb{E}[R(t, \tau_j) \mid t \in \mathcal{T}_k] \quad \text{for } i > j$$
+
+where $\mathcal{T}_k$ is a specific task type that has been encountered before.
+
+**Memory efficiency.** The storage constraint $|M_i| \leq S_{\max}$ means the agent cannot simply store everything. As $i$ grows, the agent must decide what to keep, what to compress, and what to discard. This is the *memory management* sub-problem, and it has direct analogues in operating systems (page replacement) and neuroscience (memory consolidation during sleep).
+
+**Retrieval precision.** The context constraint $|c_i| \leq C_{\max}$ means the agent cannot inject all of $M$ into the context window. It must select the most relevant entries. Retrieval precision directly impacts performance: irrelevant memories waste context space and can confuse the model (the "lost in the middle" effect documented by Liu et al., 2024).
+
+**The no-free-lunch of memory.** There is a fundamental tension between memory *coverage* (storing more diverse experiences) and memory *precision* (retrieving exactly the right experiences). This mirrors the bias-variance trade-off in statistical learning:
+
+- Too many generic memories → high coverage, low relevance, wasted context
+- Too few specific memories → high relevance when retrieved, but frequent misses
+
+The optimal operating point depends on the task distribution $\mathcal{D}$, the context window size $C_{\max}$, and the retrieval mechanism's accuracy.
+
+### Connection to Existing Frameworks
+
+This formalization connects to several established frameworks:
+
+**Contextual bandits.** If we collapse the trajectory to a single action, the problem reduces to a contextual bandit where the context includes both the task and the memory state. The memory update rule is a form of context engineering for the bandit.
+
+**Meta-learning.** The outer loop (improving across tasks) resembles MAML-style meta-learning, but with the critical difference that the "inner loop parameters" are memory entries rather than neural network weights.
+
+**Lifelong learning.** The sequential task arrival and the need to accumulate knowledge without forgetting mirrors the lifelong/continual learning setup, but operates in the space of external memory rather than model parameters.
+
+**Program synthesis.** When the learned artifacts are executable (code skills, tool configurations), the problem connects to neural program synthesis — using neural networks to generate programs that improve over time.
+
+The formal problem statement provides the foundation for analyzing every mechanism in this book. For each mechanism, we will identify its specific instantiation of $f_{\text{retrieve}}$, $f_{\text{learn}}$, and the properties of the resulting $M$.
+
+### Instantiating the Formal Framework for Each Mechanism
+
+To make the formal framework concrete, here is how each of the six families instantiates the key functions:
+
+**Reflection-Based (e.g., Reflexion):**
+- $M$: list of natural language reflections
+- $f_{\text{learn}}$: $M_i = M_{i-1} \cup \{\text{LLM.reflect}(t_i, \tau_i, r_i)\}$
+- $f_{\text{retrieve}}$: return last $N$ entries (sliding window)
+- Context cost: ~100–600 tokens for 3 reflections
+
+**Memory-Based (e.g., MemRL):**
+- $M$: vector database of trajectory embeddings + associated metadata
+- $f_{\text{learn}}$: $M_i = \text{RL\_policy.decide}(M_{i-1}, t_i, \tau_i, r_i)$ — RL policy decides what to store/forget
+- $f_{\text{retrieve}}$: $k$-nearest neighbors by embedding similarity
+- Context cost: ~500–2000 tokens for retrieved trajectories
+
+**Skill-Based (e.g., Voyager):**
+- $M$: library of verified code functions with natural language descriptions
+- $f_{\text{learn}}$: extract successful action sequences as code, verify, add to library
+- $f_{\text{retrieve}}$: embedding similarity on skill descriptions, then dependency resolution
+- Context cost: ~200–1000 tokens per skill (code + docstring)
+
+**Knowledge Crystallization (e.g., AGENTS.md):**
+- $M$: collection of markdown files on the filesystem
+- $f_{\text{learn}}$: write/append to files after task completion
+- $f_{\text{retrieve}}$: read relevant files at session start (often all files in a designated directory)
+- Context cost: ~500–5000 tokens depending on file count/size
+
+**Prompt Self-Optimization (e.g., OPRO):**
+- $M$: history of (prompt, score) pairs + current best prompt
+- $f_{\text{learn}}$: $M_i = M_{i-1} \cup \{(p_i, r_i)\}$ where $p_i$ is the prompt used
+- $f_{\text{retrieve}}$: return top-$k$ prompt-score pairs by score, plus current best prompt
+- Context cost: ~1000–3000 tokens for prompt optimization context
+
+**Architecture Self-Design (e.g., ADAS):**
+- $M$: archive of (architecture\_code, benchmark\_scores) pairs
+- $f_{\text{learn}}$: evaluate new architecture, add to archive if Pareto-improving
+- $f_{\text{retrieve}}$: return full archive to meta-agent for architecture generation
+- Context cost: ~2000–10000 tokens (full archive for meta-agent)
+
+This instantiation reveals the design space clearly. The mechanisms differ in the *granularity* of what they store (text snippets vs. code functions vs. full architectures), the *intelligence* of the learn function (simple append vs. RL-optimized curation), and the *precision* of the retrieval function (recency vs. similarity vs. state-matching).
+
+---
+
+# Chapter 2: Reflection-Based Self-Evolution
+
+Reflection is the simplest and most widely studied mechanism for runtime self-evolution. The agent examines its own performance, generates a natural language analysis, and stores that analysis for future use. No external training signal beyond task outcome is required. No separate neural network is trained. The LLM serves simultaneously as the actor, the critic, and the learner.
+
+This chapter provides paper-level technical detail for the four major reflection mechanisms: Reflexion, ExpeL, ERL, and AutoGuide. For each, we present the full algorithm, exact architecture, quantitative results, ablation studies, limitations, and practical implementation notes.
+
+---
+
+## 2.1 Reflexion: Verbal Reinforcement Learning
+
+**Paper:** Shinn et al., "Reflexion: Language Agents with Verbal Reinforcement Learning," NeurIPS 2023  
+**arXiv:** 2303.11366  
+**Code:** https://github.com/noahshinn/reflexion
+
+### Core Idea
+
+Reflexion replaces scalar reward signals with *verbal* feedback. Instead of updating weights via backpropagation (as in traditional RL), the agent generates a natural language reflection on what went wrong and stores it in an episodic memory buffer. On subsequent attempts at the *same task*, this reflection is injected into the prompt, allowing the agent to avoid previously observed mistakes.
+
+The key insight is that LLMs can serve as their own critics. Given a failed trajectory and a task description, the LLM can articulate what went wrong — "I tried to access the dictionary key before checking if it existed" — and this verbal articulation, when included in the prompt for the next attempt, steers the model toward a different (and hopefully better) strategy.
+
+### Algorithm
+
+```
+Algorithm: REFLEXION
+
+Input:
+  task: Task description
+  max_trials: Maximum number of retry attempts (typically 3-5)
+  evaluator: Function that scores a trajectory (binary or scalar)
   
-Turn 4: Agent reads validation utility, finds the regex
-  Request:  5,422 tokens
-  Response: str_replace on validation.ts — changes /^[\w.]+@/ to /^[\w.+]+@/
-  Output:   47 tokens (explanation text)
-  Latency:  520ms model + 5ms tool execution
+State:
+  memory_buffer: List of verbal reflections (initially empty)
 
-Turn 5: Agent runs the test suite
-  Request:  5,891 tokens
-  Response: shell("npm test -- --grep 'email'")
-  Output:   0 tokens
-  Latency:  310ms model + 4,200ms tool execution
-
-Turn 6: Tests pass, agent verifies with a curl command
-  Request:  7,234 tokens (test output added)
-  Response: shell("curl -X POST localhost:3000/login -d '{\"email\":\"user+tag@example.com\",\"password\":\"test\"}'")
-  Output:   0 tokens
-  Latency:  290ms model + 180ms tool execution
-
-Turn 7: Agent confirms fix, provides summary
-  Request:  7,891 tokens
-  Response: text-only (no tool calls) — "Fixed. The email validation regex..."
-  Output:   156 tokens
-  Latency:  380ms model
-
-Total: 7 turns, ~7,900 input tokens (final), 203 output tokens, ~6.6s model time, ~4.5s tool time
-Estimated cost: $0.027 (with prompt caching)
+Procedure:
+  for trial = 1, 2, ..., max_trials:
+      
+      // CONSTRUCT CONTEXT
+      context = [system_prompt, task]
+      if memory_buffer is not empty:
+          context.append("Previous reflections on this task:")
+          for reflection in memory_buffer[-N:]:  // sliding window, N typically 3
+              context.append(reflection)
+      
+      // EXECUTE
+      trajectory = Actor.execute(context)
+      // Actor generates actions step-by-step using ReAct-style reasoning
+      // Each step: Thought → Action → Observation
+      
+      // EVALUATE
+      reward = evaluator(task, trajectory)
+      
+      if reward >= success_threshold:
+          return (SUCCESS, trajectory, trial)
+      
+      // REFLECT
+      reflection_prompt = [
+          "You are an AI agent that just attempted a task and failed.",
+          "Task: " + task,
+          "Your trajectory: " + trajectory,
+          "Outcome: " + reward_description,
+          "Provide a concise reflection on what went wrong and what",
+          "you should do differently next time. Be specific."
+      ]
+      reflection = ReflectionLLM.generate(reflection_prompt)
+      memory_buffer.append(reflection)
+  
+  return (FAILURE, best_trajectory, max_trials)
 ```
 
-The critical observation: input tokens grow monotonically because the conversation is append-only. Output tokens per turn are tiny — the model generates a tool call (30-80 tokens) or a short response. The 100:1 input-to-output ratio that Manus AI reported is visible even in this short session.
+### Architecture Components
 
-### Anthropic Messages API: The Claude Code Loop
+Reflexion has three distinct components, which may or may not use the same underlying LLM:
 
-Claude Code uses the Anthropic Messages API (`POST https://api.anthropic.com/v1/messages`). The request structure differs from OpenAI's in important ways:
+**1. Actor.** The policy model that executes tasks. In the original paper, the Actor uses a ReAct-style (Yao et al., 2023) reasoning trace with interleaved Thought-Action-Observation steps. The Actor receives the task description, tool definitions, and any accumulated reflections from the memory buffer.
 
-```http
-POST /v1/messages HTTP/1.1
-Host: api.anthropic.com
-x-api-key: sk-ant-...
-anthropic-version: 2023-06-01
-Content-Type: application/json
+Implementation detail: The Actor's system prompt explicitly instructs it to consider previous reflections. A typical prompt fragment:
 
-{
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 16000,
-  "system": [
-    {
-      "type": "text",
-      "text": "You are Claude Code, an interactive CLI tool that helps with software engineering tasks...",
-      "cache_control": {"type": "ephemeral"}
-    }
-  ],
-  "tools": [
-    {
-      "name": "read_file",
-      "description": "Read the contents of a file at the specified path. Use this to examine existing files you need to understand or modify. The output includes line numbers prefixed to each line.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "file_path": {
-            "type": "string",
-            "description": "The absolute path to the file to read"
-          },
-          "offset": {
-            "type": "integer",
-            "description": "The line offset to start reading from"
-          },
-          "limit": {
-            "type": "integer",
-            "description": "The number of lines to read"
-          }
-        },
-        "required": ["file_path"]
-      }
-    },
-    {
-      "name": "write_to_file",
-      "description": "Write content to a file at the specified path.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "file_path": { "type": "string" },
-          "content": { "type": "string" }
-        },
-        "required": ["file_path", "content"]
-      }
-    },
-    {
-      "name": "edit_file",
-      "description": "Make a targeted edit to a file using exact string matching.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "file_path": { "type": "string" },
-          "old_string": { "type": "string", "description": "The exact text to find (must be unique in the file)" },
-          "new_string": { "type": "string" },
-          "replace_all": { "type": "boolean", "default": false }
-        },
-        "required": ["file_path", "old_string", "new_string"]
-      }
-    },
-    {
-      "name": "bash",
-      "description": "Execute a shell command. Each command runs in its own shell but inherits the working directory and environment from previous commands.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "command": { "type": "string" },
-          "timeout": { "type": "integer", "description": "Timeout in milliseconds" }
-        },
-        "required": ["command"]
-      }
-    },
-    {
-      "name": "glob",
-      "description": "Find files matching a glob pattern.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "pattern": { "type": "string" },
-          "path": { "type": "string", "description": "Directory to search in" }
-        },
-        "required": ["pattern"]
-      }
-    },
-    {
-      "name": "grep",
-      "description": "Search for a pattern in files using ripgrep.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "pattern": { "type": "string" },
-          "path": { "type": "string" },
-          "include": { "type": "string", "description": "File glob to include" }
-        },
-        "required": ["pattern"]
-      }
-    },
-    {
-      "name": "list_directory",
-      "description": "List the contents of a directory.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "path": { "type": "string" }
-        },
-        "required": ["path"]
-      }
-    },
-    {
-      "name": "todo_write",
-      "description": "Create or update a structured TODO list for tracking task progress.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "todos": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string" },
-                "content": { "type": "string" },
-                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
-              },
-              "required": ["id", "content", "status"]
-            }
-          }
-        },
-        "required": ["todos"]
-      }
-    },
-    {
-      "name": "task",
-      "description": "Spawn a sub-agent to work on a focused subtask in an isolated context.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "description": { "type": "string" },
-          "prompt": { "type": "string" }
-        },
-        "required": ["description", "prompt"]
-      }
-    }
-  ],
-  "messages": [
-    {
-      "role": "user",
-      "content": "Fix the failing test in test_auth.py"
-    }
-  ]
-}
+```
+You have attempted this task before. Learn from your previous reflections:
+{reflection_1}
+{reflection_2}
+...
+Do NOT repeat the same mistakes. Try a fundamentally different approach if needed.
 ```
 
-The response comes back as JSON (or streamed SSE with `"stream": true`):
+**2. Evaluator.** Scores the Actor's trajectory. Reflexion supports three evaluator types:
 
-```json
-{
-  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
-  "type": "message",
-  "role": "assistant",
-  "content": [
-    {
-      "type": "text",
-      "text": "I'll start by looking at the failing test to understand what's expected."
-    },
-    {
-      "type": "tool_use",
-      "id": "toolu_01A09q90qw90lq917835lq9",
-      "name": "read_file",
-      "input": {
-        "file_path": "/workspace/test_auth.py"
-      }
-    }
-  ],
-  "model": "claude-sonnet-4-20250514",
-  "stop_reason": "tool_use",
-  "usage": {
-    "input_tokens": 2847,
-    "output_tokens": 94,
-    "cache_creation_input_tokens": 2411,
-    "cache_read_input_tokens": 0
-  }
-}
+- *Exact match:* For tasks with deterministic correct answers (e.g., HotpotQA). Returns 1 if the answer matches, 0 otherwise.
+- *Heuristic:* For tasks where partial credit is meaningful (e.g., code generation). The evaluator runs test cases and returns the fraction that pass.
+- *LLM-as-judge:* For tasks without deterministic answers. A separate LLM prompt evaluates whether the trajectory achieved the goal.
+
+The evaluator provides the reward signal $r \in [0, 1]$ that determines whether the agent should reflect and retry.
+
+**3. Self-Reflection model.** Generates the verbal reflection. In the simplest case, this is the same LLM as the Actor, prompted differently. In principle, it could be a different (potentially cheaper) model.
+
+The reflection prompt must accomplish three things:
+1. *Diagnose:* What specific mistake caused the failure?
+2. *Prescribe:* What should be done differently?
+3. *Be concise:* The reflection must fit in the context window alongside the next attempt's full trajectory.
+
+### Memory Structure
+
+Reflexion uses a sliding window over the most recent $N$ reflections (typically $N = 3$). This is episodic memory in the CoALA framework — each entry is tied to a specific task attempt.
+
+The memory buffer has no retrieval mechanism beyond recency. All reflections in the window are included in every subsequent attempt. This simplicity is both a strength (no retrieval errors) and a limitation (no selectivity — irrelevant reflections dilute the context).
+
+Memory entries are natural language strings, typically 50–200 tokens each. Example:
+
+```
+Reflection (Trial 1): I failed because I used list indexing to access
+dictionary values. The data structure is a dict, not a list. I should
+use .get() with a default value to safely access keys. Also, I need to
+handle the case where the 'results' key is missing entirely, not just
+where it's empty.
 ```
 
-The critical field is `stop_reason`. When it's `"tool_use"`, the loop continues. When it's `"end_turn"`, the agent is done. The `usage` block tells you exactly what was cached — on this first turn, 2,411 tokens were written to cache (the system prompt + tools), 0 were read from cache. On the next turn, those 2,411 tokens will be cache hits.
-
-The tool result goes back as a `user` message with `tool_result` content blocks:
-
-```json
-{
-  "role": "user",
-  "content": [
-    {
-      "type": "tool_result",
-      "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
-      "content": "  1|import pytest\n  2|from auth import validate_email, hash_password\n  3|\n  4|class TestAuth:\n  5|    def test_valid_email(self):\n  6|        assert validate_email('user@example.com') == True\n  7|\n  8|    def test_invalid_email_no_at(self):\n  9|        assert validate_email('userexample.com') == False\n 10|\n 11|    def test_email_with_plus(self):\n 12|        assert validate_email('user+tag@example.com') == True  # FAILING"
-    }
-  ]
-}
+```
+Reflection (Trial 2): My approach of iterating through all keys was
+inefficient and hit the timeout. I should use the 'results' key directly
+and only iterate through the 'items' subkey. The structure is
+results -> items -> [list of records].
 ```
 
-This append-to-messages/call-again pattern repeats. The entire Claude Code agent is, as Anthropic engineers have stated publicly, a `while(tool_use)` loop around this API.
+### Quantitative Results
+
+The original paper evaluates Reflexion on three benchmarks:
+
+**HumanEval (code generation):**
+
+| Method | Pass@1 |
+|---|---|
+| GPT-4 (baseline) | 80.1% |
+| GPT-4 + Reflexion (1 retry) | 88.2% |
+| GPT-4 + Reflexion (2 retries) | 91.0% |
+
+The 91% pass@1 result was state-of-the-art at the time of publication (May 2023). The improvement comes from the agent learning from test case failures — the reflection identifies which test cases failed and why, and the next attempt addresses those specific failures.
+
+**ALFWorld (interactive text game for household tasks):**
+
+| Method | Success Rate |
+|---|---|
+| ReAct (baseline) | 75% |
+| ReAct + Reflexion | 97% |
+
+The +22 percentage point improvement is striking. ALFWorld requires multi-step planning (e.g., "put a clean spatula on the counter" requires finding the spatula, going to the sink, cleaning it, then going to the counter). Reflexion reflections typically identify incorrect action orderings or missed prerequisites.
+
+**HotpotQA (multi-hop question answering):**
+
+| Method | Exact Match |
+|---|---|
+| Chain-of-Thought (baseline) | 34% |
+| CoT + Reflexion | 48% |
+
+The +14 percentage point improvement demonstrates that reflection helps with reasoning errors, not just execution errors.
+
+### Ablation Results
+
+The paper includes several critical ablations:
+
+**Reflection quality matters.** Replacing LLM-generated reflections with generic "Try again and do better" messages reduces the improvement to near-zero. The information content of the reflection — the specific diagnosis of what went wrong — is what drives improvement.
+
+**Memory window size.** Performance saturates around $N = 3$ reflections. Including more than 3 past reflections provides diminishing returns and can decrease performance, likely due to context dilution.
+
+**Evaluator fidelity.** Using a less accurate evaluator (e.g., LLM-as-judge instead of exact match) reduces Reflexion's effectiveness. The agent can only learn from the feedback it receives; noisy feedback leads to noisy reflections.
+
+### Limitations
+
+**Same-task only.** Reflexion reflections are bound to a specific task. A reflection about HumanEval problem #47 does not help with HumanEval problem #48. There is no mechanism for extracting general principles from specific reflections.
+
+**Requires multiple attempts.** The agent must fail at least once before it can reflect. If the task cannot be retried (e.g., a one-shot interaction with a user), Reflexion provides no benefit.
+
+**Reflection quality ceiling.** The LLM must be capable of accurate self-diagnosis. If the model cannot identify its own mistakes (e.g., due to reasoning limitations), the reflections will be inaccurate and potentially harmful.
+
+**No convergence guarantee.** There is no formal guarantee that reflections will eventually lead to success. The agent might generate reflections that steer it toward a different but equally wrong approach. In practice, Reflexion typically succeeds within 3–5 attempts or not at all.
+
+**Context window pressure.** Each reflection consumes context tokens. For tasks that require a large context (long code files, extensive documentation), the reflections compete with the task-relevant content for limited context space.
+
+### Detailed Evaluator Implementations
+
+The evaluator is often underspecified in discussions of Reflexion, but it is a critical architectural component. The quality of the reward signal directly determines the quality of the subsequent reflection.
+
+**Binary evaluator for code generation:**
+```
+function evaluate_code(task, generated_code):
+    // Write generated code to a temporary file
+    write_temp_file(generated_code)
+    
+    // Run the test suite provided with the task
+    test_results = run_tests(task.test_cases, generated_code)
+    
+    // Binary outcome
+    if all_tests_pass(test_results):
+        return {
+            reward: 1.0,
+            feedback: "All " + len(task.test_cases) + " tests passed.",
+            details: test_results
+        }
+    else:
+        failed = get_failed_tests(test_results)
+        return {
+            reward: 0.0,
+            feedback: format_failures(failed),
+            details: test_results
+        }
+```
+
+**Scalar evaluator with partial credit:**
+```
+function evaluate_code_partial(task, generated_code):
+    test_results = run_tests(task.test_cases, generated_code)
+    
+    passed = count_passed(test_results)
+    total = len(task.test_cases)
+    
+    return {
+        reward: passed / total,
+        feedback: passed + "/" + total + " tests passed. " +
+                  "Failed tests: " + format_failures(get_failed_tests(test_results)),
+        details: test_results
+    }
+```
+
+**LLM-as-judge evaluator for open-ended tasks:**
+```
+function evaluate_with_llm(task, trajectory):
+    judge_prompt = [
+        "You are evaluating an AI agent's attempt at the following task.",
+        "Task: " + task.description,
+        "Success criteria: " + task.criteria,
+        "",
+        "Agent's trajectory:",
+        format_trajectory(trajectory),
+        "",
+        "Did the agent successfully complete the task?",
+        "Rate on a scale of 0.0 to 1.0:",
+        "0.0 = complete failure",
+        "0.5 = partially correct but missing key elements",
+        "1.0 = fully correct and complete",
+        "",
+        "Provide your rating and a brief justification."
+    ]
+    
+    response = JudgeLLM.generate(judge_prompt)
+    return parse_rating_and_justification(response)
+```
+
+The choice of evaluator affects not just whether the agent retries, but the *content* of the reflection. Including specific test failure messages in the evaluator output gives the reflection model concrete information to analyze. Generic "task failed" feedback produces generic reflections.
+
+### The Reflection Prompt Engineering Details
+
+The quality of Reflexion depends heavily on the reflection prompt. The original paper uses variants of the following template:
+
+```
+REFLECTION PROMPT TEMPLATE (Code Generation)
+
+You are a Python programming assistant. You have attempted to solve
+a coding problem but your solution failed some test cases.
+
+## Problem
+{task_description}
+
+## Your Previous Solution
+```python
+{generated_code}
+```
+
+## Test Results
+{evaluator_feedback}
+
+## Failed Test Details
+{for each failed test:}
+  Input: {test.input}
+  Expected: {test.expected_output}
+  Got: {test.actual_output}
+  Error: {test.error_message if any}
+
+## Reflection Instructions
+Analyze why your solution failed. Be specific:
+1. Which test case(s) revealed the bug?
+2. What is the root cause of the failure?
+3. What concrete changes would fix the issue?
+4. Are there edge cases your solution doesn't handle?
+
+Write a concise reflection (max 150 words) that will help you
+write a correct solution on your next attempt.
+```
+
+The template includes the actual test inputs/outputs and error messages. This is critical — without concrete failure data, the LLM generates vague reflections ("I should handle edge cases better") rather than specific ones ("My solution fails when the input array contains negative numbers because the binary search comparison assumes all values are positive").
+
+### Practical Implementation Notes
+
+**When to use Reflexion:** Reflexion is most valuable for tasks where (a) retry is possible and cheap, (b) the evaluator provides clear success/failure signal, and (c) the task is complex enough that the agent's first attempt frequently fails. Common use cases: code generation with test suites, interactive environments with reset capabilities, multi-step reasoning tasks with verifiable answers.
+
+**When NOT to use Reflexion:** For one-shot tasks (no retry possible), for tasks where the evaluator is unreliable, or for tasks where the agent already succeeds on the first attempt >90% of the time. The overhead of the reflection mechanism is not justified when the agent's baseline performance is already high.
+
+**Implementation tips:**
+1. Use the same model for Actor and Reflection to minimize API calls, but consider using a system prompt that explicitly shifts the model from "execution mode" to "analysis mode."
+2. Cap reflections at 200 tokens. Longer reflections tend to include irrelevant detail.
+3. Include the specific error message or test failure in the reflection prompt — this grounds the reflection in concrete failure data.
+4. Set `max_trials = 3` for most applications. The success-per-trial curve is steep for trials 1→2, moderate for 2→3, and negligible for 3→4.
 
 ---
 
-## 1.2 Building a Production Agent Loop from Scratch
+## 2.2 ExpeL: Cross-Task Experiential Learning
 
-Here is a minimal but production-capable agent loop in Python. This is not a toy — it handles compaction, token counting, streaming, error recovery, and termination. Every production agent (Claude Code, Codex, Cursor, Devin) is a variation on this structure.
+**Paper:** Zhao et al., "ExpeL: LLM Agents Are Experiential Learners," AAAI 2024  
+**arXiv:** 2308.10144  
+**Code:** https://github.com/LeapLabTHU/ExpeL
 
-```python
-import anthropic
-import json
-import time
-import subprocess
-from pathlib import Path
+### Core Idea
 
-client = anthropic.Anthropic()
+ExpeL (Experiential Learning) addresses Reflexion's most significant limitation: the inability to transfer knowledge across tasks. ExpeL's key insight is that by comparing successful and failed trajectories on the *same* task, the LLM can extract general *insights* — rules that apply to entire classes of tasks, not just individual instances.
 
-SYSTEM_PROMPT = """You are an autonomous coding agent. You operate in a loop: read code, 
-understand the problem, make targeted fixes, and verify with tests.
+The extracted insights are stored in semantic memory with confidence scores, forming a knowledge base that grows over time and transfers across task types and even across domains.
+
+### Three-Stage Pipeline
+
+ExpeL operates in three distinct stages, which can be understood as experience gathering, knowledge extraction, and knowledge application.
+
+```
+Algorithm: EXPEL
+
+=== STAGE 1: EXPERIENCE GATHERING ===
+
+Input:
+  training_tasks: Set of tasks for experience collection
+  max_retries: Maximum attempts per task (typically 3)
+
+Output:
+  experience_pool: Collection of (task, success_traj, fail_traj) triples
+
+Procedure:
+  experience_pool = []
+  for task in training_tasks:
+      trajectories = []
+      for attempt = 1, 2, ..., max_retries:
+          traj = Agent.execute(task)
+          result = Evaluator.score(task, traj)
+          trajectories.append((traj, result))
+          if result == SUCCESS:
+              break
+      
+      // Collect contrastive pairs
+      success_trajs = [t for (t, r) in trajectories if r == SUCCESS]
+      fail_trajs = [t for (t, r) in trajectories if r == FAILURE]
+      
+      if success_trajs and fail_trajs:
+          experience_pool.append({
+              "task": task,
+              "success": success_trajs[0],  // first success
+              "failures": fail_trajs         // all failures
+          })
+
+=== STAGE 2: INSIGHT EXTRACTION ===
+
+Input:
+  experience_pool: From Stage 1
+  
+Output:
+  insight_library: List of (insight_text, upvotes, downvotes)
+
+Procedure:
+  insight_library = []
+  
+  for experience in experience_pool:
+      // Present contrastive pair to LLM
+      extraction_prompt = [
+          "Compare the following successful and failed attempts at the same task.",
+          "Task: " + experience.task,
+          "Failed attempt: " + experience.failures[0],
+          "Successful attempt: " + experience.success,
+          "Extract general rules that explain why one succeeded and the other failed.",
+          "Rules should be generalizable to other similar tasks.",
+          "Format each rule as a clear, actionable statement.",
+          "",
+          "Current insight library:",
+          format_insights(insight_library),
+          "",
+          "For each rule you extract, choose one action:",
+          "ADD: Add as a new insight (if truly novel)",
+          "UPVOTE <id>: Increase confidence in existing insight <id>",
+          "DOWNVOTE <id>: Decrease confidence in existing insight <id>",
+          "EDIT <id>: Modify existing insight <id> with new wording"
+      ]
+      
+      actions = LLM.generate(extraction_prompt)
+      
+      for action in parse_actions(actions):
+          if action.type == "ADD":
+              insight_library.append({
+                  "text": action.text,
+                  "upvotes": 1,
+                  "downvotes": 0,
+                  "source_tasks": [experience.task]
+              })
+          elif action.type == "UPVOTE":
+              insight_library[action.id].upvotes += 1
+          elif action.type == "DOWNVOTE":
+              insight_library[action.id].downvotes += 1
+          elif action.type == "EDIT":
+              insight_library[action.id].text = action.new_text
+
+=== STAGE 3: TASK INFERENCE ===
+
+Input:
+  new_task: A previously unseen task
+  insight_library: From Stage 2
+  experience_pool: From Stage 1
+
+Output:
+  trajectory: Agent's execution trajectory on new_task
+
+Procedure:
+  // Retrieve top-k insights by relevance
+  relevant_insights = retrieve_top_k(
+      query=new_task,
+      library=insight_library,
+      k=5,
+      sort_by=lambda i: i.upvotes - i.downvotes  // net confidence
+  )
+  
+  // Retrieve similar successful trajectories
+  similar_trajectories = retrieve_similar(
+      query=new_task,
+      pool=[e.success for e in experience_pool],
+      k=2
+  )
+  
+  // Construct augmented context
+  context = [
+      system_prompt,
+      "Relevant insights from past experience:",
+      format_insights(relevant_insights),
+      "Similar successful task trajectories:",
+      format_trajectories(similar_trajectories),
+      "Now solve the following task:",
+      new_task
+  ]
+  
+  trajectory = Agent.execute(context)
+  return trajectory
+```
+
+### Insight Format
+
+The insight library entries follow a specific format. Here is an example from the HotpotQA experiments:
+
+```
+INSIGHT #14 [upvotes: 7, downvotes: 1]
+When answering multi-hop questions, always verify intermediate answers
+before using them in the final reasoning chain. Specifically:
+- Search for the intermediate entity to confirm it exists and is unambiguous
+- Cross-reference with a second source if the first result seems uncertain
+- If the intermediate answer has multiple possible interpretations, explore
+  each branch before committing to one
+
+Source tasks: HotpotQA-127, HotpotQA-341, HotpotQA-892, FEVER-56
+```
+
+```
+INSIGHT #23 [upvotes: 3, downvotes: 4]
+Prefer Wikipedia over other sources for factual verification.
+
+Source tasks: HotpotQA-045
+[NOTE: High downvote count suggests this insight is unreliable or context-dependent]
+```
+
+The upvote/downvote mechanism serves as a simple confidence estimator. Insights that generalize well across many tasks accumulate upvotes; insights that are overly specific or misleading accumulate downvotes. At retrieval time, insights are ranked by net confidence (upvotes minus downvotes), and low-confidence insights can be filtered out.
+
+### Quantitative Results
+
+**Within-domain transfer (HotpotQA):**
+
+| Method | Exact Match |
+|---|---|
+| ReAct (baseline) | 34% |
+| Reflexion | 48% |
+| ExpeL (insights only) | 49% |
+| ExpeL (insights + trajectories) | 52% |
+
+ExpeL matches Reflexion's same-task performance while also providing cross-task transfer.
+
+**Cross-domain transfer (HotpotQA → FEVER):**
+
+| Method | Accuracy |
+|---|---|
+| ReAct on FEVER (no transfer) | 58% |
+| ExpeL insights from HotpotQA applied to FEVER | 70% |
+
+This is the headline result: insights extracted from HotpotQA experience transfer to FEVER, a different task type (fact verification vs. question answering), improving performance by 12 percentage points. The transferred insights capture general reasoning strategies (e.g., "verify intermediate answers") that apply across question-answering domains.
+
+**Insight library growth:**
+
+| Training Tasks | Total Insights | Avg Upvotes | Avg Downvotes | Avg Net Confidence |
+|---|---|---|---|---|
+| 10 | 8 | 1.2 | 0.3 | 0.9 |
+| 50 | 31 | 2.8 | 0.7 | 2.1 |
+| 100 | 47 | 4.1 | 1.2 | 2.9 |
+| 200 | 62 | 5.3 | 1.8 | 3.5 |
+
+The library grows sub-linearly — many training tasks upvote existing insights rather than generating new ones. This natural deduplication is a desirable property.
+
+### Ablation Results
+
+**Insights vs. Trajectories.** Using insights alone (no retrieved trajectories) achieves 49% on HotpotQA; using trajectories alone achieves 46%; using both achieves 52%. The combination is synergistic — insights provide general principles while trajectories provide concrete examples.
+
+**Insight extraction method.** Replacing contrastive extraction (comparing success/failure pairs) with single-trajectory extraction (reflecting on success alone) reduces cross-domain transfer by 8 percentage points. The contrastive signal is critical for extracting *generalizable* insights rather than task-specific observations.
+
+**Upvote/downvote mechanism.** Removing the confidence scoring (treating all insights equally) reduces performance by 3–5 percentage points. Low-confidence insights add noise when retrieved into context.
+
+### Limitations
+
+**Requires contrastive pairs.** ExpeL's insight extraction requires both successful and failed trajectories for the same task. If the agent always succeeds (no failures to contrast) or always fails (no successes to contrast), no insights can be extracted. This is a significant limitation for tasks where the agent's success rate is very high or very low.
+
+**Batch training phase.** Stages 1 and 2 are offline processes that require a collection of training tasks. ExpeL is not naturally online — it does not continuously update its insight library as new tasks arrive. Adapting ExpeL for online operation requires periodically re-running Stage 2, which is computationally expensive.
+
+**LLM extraction quality.** The quality of extracted insights depends entirely on the LLM's ability to identify meaningful differences between successful and failed trajectories. For complex tasks where success and failure differ in subtle ways, the LLM may extract superficial insights (e.g., "the successful attempt used more search queries") rather than deep causal insights.
+
+**Scaling challenges.** As the insight library grows, retrieval becomes critical. The original ExpeL implementation uses a simple scoring function (net confidence × relevance). More sophisticated retrieval mechanisms (learned retrievers, hierarchical indexing) would likely improve performance at scale.
+
+### Practical Implementation Notes
+
+**Data efficiency.** ExpeL achieves most of its benefit with 50–100 training tasks. Beyond that, the insight library growth curve flattens. For practical deployment, a warm-up phase of ~100 tasks is sufficient.
+
+**Insight library maintenance.** Over time, some insights become stale (the environment changes, the model improves, the user's workflow evolves). Implementing a time-decay mechanism on upvotes — where older upvotes contribute less to net confidence — helps keep the library current.
+
+**Integration with Reflexion.** ExpeL and Reflexion are complementary. Reflexion handles intra-task retry; ExpeL handles inter-task transfer. A production system can use Reflexion for within-task improvement and ExpeL's insight library for cross-task generalization. The training tasks for ExpeL can be generated by Reflexion's multi-trial process.
+
+**Model choice.** ExpeL's insight extraction (Stage 2) benefits from a strong reasoning model. Using a frontier model for extraction and a cheaper model for execution is a cost-effective pattern — the extraction runs offline and infrequently, while execution runs online for every task.
+
+### ExpeL's Insight Extraction Prompt in Detail
+
+The exact prompt used for Stage 2 insight extraction is critical to understand because it implements a novel LLM-as-knowledge-engineer pattern. The following is the detailed extraction flow:
+
+```
+INSIGHT EXTRACTION PROMPT
+
+You are analyzing an agent's experiences to extract general rules
+that will help on future tasks.
+
+## Task Type
+{task_category} (e.g., "multi-hop question answering")
+
+## Failed Attempt
+{failed_trajectory}
+Final answer: {failed_answer}
+Correct answer: {correct_answer}
+
+## Successful Attempt (same task)
+{success_trajectory}
+Final answer: {success_answer} ✓
+
+## Current Knowledge Base
+{for each existing insight with id, text, upvotes, downvotes}
+
+## Instructions
+Compare the failed and successful attempts. Identify the key
+difference(s) that led to success vs failure.
+
+For each observation, choose ONE of the following actions:
+
+ADD: "Your new insight text here"
+  → Use when you've identified a genuinely new principle not already
+    covered by existing insights.
+
+UPVOTE: #<insight_id>
+  → Use when an existing insight is validated by this experience.
+    The current experience provides additional evidence that the
+    insight is correct and useful.
+
+DOWNVOTE: #<insight_id>
+  → Use when an existing insight is contradicted by this experience.
+    The current experience suggests the insight is wrong, too broad,
+    or misleading.
+
+EDIT: #<insight_id> → "Your revised text here"
+  → Use when an existing insight captures the right idea but needs
+    refinement based on this experience.
 
 Rules:
-- Always read a file before editing it.
-- Use edit_file for targeted changes, not write_to_file for full rewrites.
-- Run tests after every change.
-- If tests fail after your fix, debug and iterate — do not give up.
-- When done, provide a one-line summary of what you changed and why."""
-
-TOOLS = [
-    {
-        "name": "bash",
-        "description": "Execute a shell command. Returns stdout and stderr.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"}
-            },
-            "required": ["command"]
-        }
-    },
-    {
-        "name": "read_file",
-        "description": "Read a file. Returns content with line numbers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "offset": {"type": "integer"},
-                "limit": {"type": "integer"}
-            },
-            "required": ["file_path"]
-        }
-    },
-    {
-        "name": "edit_file",
-        "description": "Replace old_string with new_string in a file. old_string must match exactly and uniquely.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"}
-            },
-            "required": ["file_path", "old_string", "new_string"]
-        }
-    }
-]
-
-MAX_TOOL_OUTPUT_CHARS = 30_000
-MAX_TURNS = 60
-COMPACT_THRESHOLD_TOKENS = 90_000
-
-
-def execute_tool(name: str, input_data: dict) -> str:
-    if name == "bash":
-        try:
-            result = subprocess.run(
-                input_data["command"], shell=True,
-                capture_output=True, text=True, timeout=30
-            )
-            output = result.stdout + result.stderr
-        except subprocess.TimeoutExpired:
-            output = "ERROR: Command timed out after 30 seconds"
-    elif name == "read_file":
-        path = Path(input_data["file_path"])
-        if not path.exists():
-            return f"ERROR: File not found: {path}"
-        lines = path.read_text().splitlines()
-        start = input_data.get("offset", 0)
-        end = start + input_data.get("limit", len(lines))
-        numbered = [f"{i+1:>4}|{line}" for i, line in enumerate(lines[start:end], start=start)]
-        output = "\n".join(numbered)
-    elif name == "edit_file":
-        path = Path(input_data["file_path"])
-        content = path.read_text()
-        old = input_data["old_string"]
-        if content.count(old) == 0:
-            return f"ERROR: old_string not found in {path}"
-        if content.count(old) > 1:
-            return f"ERROR: old_string matches {content.count(old)} locations. Make it more specific."
-        content = content.replace(old, input_data["new_string"], 1)
-        path.write_text(content)
-        output = f"OK: Replaced in {path}"
-    else:
-        output = f"ERROR: Unknown tool: {name}"
-    
-    if len(output) > MAX_TOOL_OUTPUT_CHARS:
-        half = MAX_TOOL_OUTPUT_CHARS // 2
-        output = output[:half] + f"\n\n[...truncated {len(output) - MAX_TOOL_OUTPUT_CHARS} chars...]\n\n" + output[-half:]
-    
-    return output
-
-
-def estimate_tokens(messages: list, system: str, tools: list) -> int:
-    """Rough token estimate: 1 token ≈ 4 chars for English text/code."""
-    total_chars = len(system) + len(json.dumps(tools))
-    for msg in messages:
-        if isinstance(msg.get("content"), str):
-            total_chars += len(msg["content"])
-        elif isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if isinstance(block, dict):
-                    total_chars += len(json.dumps(block))
-    return total_chars // 4
-
-
-def compact_messages(messages: list) -> list:
-    """Remove older tool results, keeping the first message and recent turns."""
-    if len(messages) <= 6:
-        return messages
-    
-    first_msg = messages[0]
-    recent = messages[-6:]
-    middle = messages[1:-6]
-    
-    compacted_middle = []
-    for msg in middle:
-        if isinstance(msg.get("content"), list):
-            new_content = []
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    text = block.get("content", "")
-                    if len(text) > 500:
-                        new_content.append({**block, "content": text[:200] + "\n[...compacted...]"})
-                    else:
-                        new_content.append(block)
-                else:
-                    new_content.append(block)
-            compacted_middle.append({**msg, "content": new_content})
-        else:
-            compacted_middle.append(msg)
-    
-    return [first_msg] + compacted_middle + recent
-
-
-def run_agent(goal: str) -> str:
-    messages = [{"role": "user", "content": goal}]
-    
-    total_input_tokens = 0
-    total_output_tokens = 0
-    start_time = time.time()
-    
-    for turn in range(MAX_TURNS):
-        token_est = estimate_tokens(messages, SYSTEM_PROMPT, TOOLS)
-        if token_est > COMPACT_THRESHOLD_TOKENS:
-            messages = compact_messages(messages)
-            print(f"  [compacted at turn {turn}, ~{token_est} tokens -> ~{estimate_tokens(messages, SYSTEM_PROMPT, TOOLS)} tokens]")
-        
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=16000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
-        
-        total_input_tokens += response.usage.input_tokens
-        total_output_tokens += response.usage.output_tokens
-        
-        messages.append({"role": "assistant", "content": response.content})
-        
-        if response.stop_reason == "end_turn":
-            elapsed = time.time() - start_time
-            text_blocks = [b.text for b in response.content if hasattr(b, 'text')]
-            final_text = "\n".join(text_blocks)
-            print(f"\n  Completed in {turn+1} turns, {elapsed:.1f}s")
-            print(f"  Tokens: {total_input_tokens:,} input, {total_output_tokens:,} output")
-            cached = getattr(response.usage, 'cache_read_input_tokens', 0)
-            if cached:
-                print(f"  Cache hits: {cached:,} tokens ({cached/response.usage.input_tokens*100:.0f}%)")
-            return final_text
-        
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"  Turn {turn+1}: {block.name}({json.dumps(block.input)[:120]})")
-                result = execute_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-        
-        messages.append({"role": "user", "content": tool_results})
-    
-    return f"ERROR: Max turns ({MAX_TURNS}) reached without completion."
+- Each insight must be GENERAL (not specific to this one task)
+- Each insight must be ACTIONABLE (an agent can follow it)
+- Prefer UPVOTE/EDIT over ADD to avoid redundancy
+- Only DOWNVOTE if you have concrete contradicting evidence
 ```
 
-This is 120 lines. Production agents add error handling, permission checks, streaming UI, and observability on top of this core, but the fundamental structure is identical. Claude Code's core loop, stripped of UI and permission logic, reduces to this.
+The ADD/UPVOTE/DOWNVOTE/EDIT mechanism is an LLM-driven knowledge management system. The LLM acts as a curator of its own knowledge base, deciding not just what to learn but how new experiences relate to existing knowledge. This is a primitive form of *knowledge consolidation* — a process that in human cognition occurs during sleep.
+
+### Implementation Architecture for ExpeL at Scale
+
+For production deployments with thousands of tasks, ExpeL's three-stage pipeline needs engineering support:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  EXPERIENCE STORE                     │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │  Task DB   │  │ Trajectory │  │  Outcome  │       │
+│  │            │  │   Store    │  │   Store   │       │
+│  └───────────┘  └───────────┘  └───────────┘       │
+│                                                       │
+│  Indexed by: task_type, outcome, timestamp            │
+└──────────────┬──────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────┐
+│              INSIGHT EXTRACTION SERVICE               │
+│                                                       │
+│  1. Sample contrastive pairs from experience store    │
+│  2. Batch extraction via LLM (parallelizable)         │
+│  3. Merge results into insight library                │
+│  4. Run periodically (e.g., nightly) or on-demand     │
+│                                                       │
+│  Cost: ~$2-5 per 100 contrastive pairs (GPT-4)       │
+│  Latency: 10-30 minutes for 100 pairs                │
+└──────────────┬──────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────┐
+│               INSIGHT LIBRARY                         │
+│                                                       │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  ID  │  Text            │  Up  │  Down │  Net │   │
+│  │──────│──────────────────│──────│───────│──────│   │
+│  │  1   │  "When doing..." │  12  │   2   │  10  │   │
+│  │  2   │  "Always check.."│   8  │   1   │   7  │   │
+│  │  3   │  "Prefer..."     │   3  │   4   │  -1  │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                       │
+│  Retrieval: embedding similarity + confidence filter  │
+│  Maintenance: prune insights with net < -3            │
+└─────────────────────────────────────────────────────┘
+```
+
+Key engineering decisions:
+
+1. **Pair selection strategy.** Random sampling of contrastive pairs works, but stratified sampling (ensuring each task type is represented) produces more diverse insights. Prioritize pairs where the failure trajectory is "close" to success (the agent was on the right track but made a specific mistake) — these produce more actionable insights than pairs where the failure trajectory is completely wrong.
+
+2. **Batch size and frequency.** Extract insights in batches of 20–50 contrastive pairs. Larger batches allow the LLM to see the existing library and avoid redundant ADD operations. Run extraction daily or after every N new experiences (N=50 works well).
+
+3. **Confidence threshold for retrieval.** Filter out insights with net confidence < 0 at retrieval time. These insights have been downvoted more than upvoted and are likely misleading.
 
 ---
 
-## 1.3 The Claude Code Loop: SystemPromptBuilder and the 19-Tool Architecture
+## 2.3 ERL: Single-Attempt Heuristic Extraction
 
-In January 2025, the Claude Code system prompt leaked. It revealed a sophisticated prompt assembly pipeline far beyond a static string. The system, implemented in approximately 14,902 lines of TypeScript, dynamically assembles the system prompt from 40+ sections.
+**Paper:** Allard et al., "Experiential Reflective Learning for Self-Improving LLM Agents," ICLR 2026 MemAgents Workshop  
+**arXiv:** 2603.24639
 
-### The SystemPromptBuilder Architecture
+### Core Idea
 
-The prompt builder follows a clear pattern: each section is a function that returns a string or null (if the section is inapplicable). These sections are concatenated in a fixed order:
+Experiential Reflective Learning (ERL) addresses ExpeL's most significant limitation: the requirement for contrastive pairs. In many real-world deployments, the agent encounters each task only once. There is no opportunity to attempt the same task twice, let alone collect both successful and failed trajectories for comparison.
 
-```typescript
-class SystemPromptBuilder {
-  private sections: PromptSection[] = [];
-  
-  build(context: SessionContext): string {
-    const parts: string[] = [];
-    
-    // Static sections (cacheable)
-    parts.push(this.coreIdentity());
-    parts.push(this.coreCapabilities());
-    parts.push(this.toolDocumentation(context.permissionLevel));
-    parts.push(this.behavioralRules());
-    parts.push(this.outputFormatting());
-    parts.push(this.safetyConstraints());
-    parts.push(this.memoryInstructions());
-    parts.push(this.antiDistillation());
-    
-    // Cache boundary marker
-    parts.push("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__");
-    
-    // Dynamic sections (per-session, not cached)
-    parts.push(this.environmentInfo(context));
-    parts.push(this.projectMemory(context));
-    parts.push(this.sessionState(context));
-    parts.push(this.containerDetection());
-    
-    return parts.filter(Boolean).join("\n\n");
-  }
-}
-```
+ERL extracts learning from *single attempts* — including successful ones. After every task (pass or fail), the agent generates "When-Then" heuristics: conditional rules that capture what was learned from the experience. These heuristics accumulate in a growing pool. At inference time, an LLM-based ranker selects the most relevant heuristics for the current task.
 
-The `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` marker is the cache boundary. Everything above it is identical across sessions and gets cached in the KV-cache. Everything below it changes per session. This boundary is the single most cost-impactful design decision in Claude Code — with the static portion comprising roughly 70% of the system prompt, millions of cached-token dollars are saved across the user base.
-
-### The 19 Tools with Permission Tiers
-
-The leaked prompt reveals a three-tier permission model for tools:
-
-**ReadOnly tier** (always available, no confirmation needed):
-```
-read_file       — Read file contents with line numbers
-list_directory  — List directory contents
-glob            — Find files by glob pattern
-grep            — Search file contents with ripgrep
-web_search      — Search the web
-web_fetch       — Fetch a URL and convert to markdown
-todo_read       — Read the current TODO list
-```
-
-**WorkspaceWrite tier** (available in standard mode, may prompt for confirmation):
-```
-write_to_file   — Create or overwrite a file
-edit_file       — Targeted search-and-replace edit
-multi_edit      — Multiple edits to a single file
-todo_write      — Create or update TODO items
-notebook_edit   — Edit Jupyter notebook cells
-```
-
-**FullAccess tier** (requires explicit permission or --dangerously-skip-permissions flag):
-```
-bash            — Execute arbitrary shell commands
-task            — Spawn a sub-agent
-```
-
-The permission logic at the tool execution layer:
-
-```typescript
-async function executeToolWithPermission(
-  tool: ToolCall,
-  permissionLevel: PermissionLevel,
-  userAllowlist: string[]
-): Promise<ToolResult> {
-  const toolTier = TOOL_PERMISSION_MAP[tool.name];
-  
-  if (toolTier === "ReadOnly") {
-    return executeTool(tool);
-  }
-  
-  if (toolTier === "WorkspaceWrite") {
-    if (permissionLevel >= PermissionLevel.WorkspaceWrite) {
-      return executeTool(tool);
-    }
-    return promptUserForPermission(tool);
-  }
-  
-  if (toolTier === "FullAccess") {
-    if (tool.name === "bash") {
-      const command = tool.input.command;
-      if (userAllowlist.some(pattern => matchGlob(command, pattern))) {
-        return executeTool(tool);
-      }
-      if (isSafeCommand(command)) {
-        return executeTool(tool);
-      }
-    }
-    return promptUserForPermission(tool);
-  }
-}
-
-function isSafeCommand(command: string): boolean {
-  const safePatterns = [
-    /^ls\b/, /^cat\b/, /^head\b/, /^tail\b/, /^wc\b/,
-    /^find\b/, /^grep\b/, /^rg\b/, /^git\s+(status|log|diff|show)\b/,
-    /^python\s+--version/, /^node\s+--version/, /^npm\s+--version/,
-  ];
-  return safePatterns.some(p => p.test(command.trim()));
-}
-```
-
-### The Actual System Prompt Structure (Reconstructed from Leak)
-
-The core identity section opens with:
+### Algorithm
 
 ```
-You are Claude Code, an interactive CLI tool that helps users with software 
-engineering tasks. You operate as an autonomous agent, using tools to explore 
-codebases, make changes, and verify your work.
-
-You have access to the following tools, organized by permission level:
-
-## ReadOnly Tools (always available)
-...
-
-## WorkspaceWrite Tools (require workspace write permission)
-...
-
-## FullAccess Tools (require explicit user permission)
-...
-```
-
-The behavioral rules section includes specific, non-obvious directives:
-
-```
-## Behavioral Rules
-
-1. ALWAYS read a file before editing it. Never edit a file you haven't read 
-   in this session.
-2. Use edit_file for targeted changes. Only use write_to_file when creating 
-   new files or when the entire content must change.
-3. Run tests after making changes. If the project has a test command, use it.
-4. If you encounter an error, try at least 3 different approaches before 
-   asking the user for help.
-5. When working on a task with multiple steps, use todo_write to track 
-   your progress.
-6. Never commit code without running tests first.
-7. If you need to install dependencies, always check the project's package 
-   manager first (package-lock.json → npm, yarn.lock → yarn, 
-   pnpm-lock.yaml → pnpm).
-8. Keep your responses concise. Don't explain what you're about to do — 
-   just do it. Explain what you did after.
-9. If a file is too large to read in one call, use offset and limit to 
-   read in chunks.
-10. When editing, your old_string must be unique in the file. If it's not, 
-    include more surrounding context to disambiguate.
-```
-
-The output formatting section constrains the model's response style:
-
-```
-## Output Formatting
-
-- Use markdown for structured responses.
-- Use backticks for file paths, function names, and code identifiers.
-- Do not use emojis unless the user does.
-- When showing file changes, describe what changed and why, not the full 
-  before/after.
-- End task completion messages with a brief summary of changes made.
-```
-
-### The While Loop with Error Recovery
-
-The core execution loop in Claude Code handles several edge cases that most tutorials omit:
-
-```typescript
-async function agentLoop(
-  initialMessage: string,
-  context: SessionContext
-): Promise<string> {
-  const messages: Message[] = [{ role: "user", content: initialMessage }];
-  const systemPrompt = new SystemPromptBuilder().build(context);
-  let hasAttemptedReactiveCompact = false;
-  let consecutiveErrors = 0;
-  
-  while (true) {
-    let response: APIResponse;
-    
-    try {
-      response = await client.messages.create({
-        model: context.model,
-        max_tokens: 16000,
-        system: systemPrompt,
-        tools: context.tools,
-        messages: messages,
-      });
-      consecutiveErrors = 0;
-    } catch (error) {
-      if (isContextLengthError(error)) {
-        if (hasAttemptedReactiveCompact) {
-          // BUG (now fixed): This used to not reset, causing infinite retry loops.
-          // Each compaction attempt would re-trigger the context length error,
-          // and without the boolean guard, the agent would burn API calls
-          // until the session timed out or hit rate limits.
-          throw new Error("Context too large even after compaction");
-        }
-        hasAttemptedReactiveCompact = true;
-        messages = await reactiveCompact(messages);
-        continue;
-      }
-      
-      consecutiveErrors++;
-      if (consecutiveErrors >= 3) {
-        throw error;
-      }
-      await sleep(Math.pow(2, consecutiveErrors) * 1000);
-      continue;
-    }
-    
-    messages.push({ role: "assistant", content: response.content });
-    
-    if (response.stop_reason === "end_turn") {
-      return extractText(response.content);
-    }
-    
-    if (response.stop_reason === "max_tokens") {
-      // Output token exhaustion — the 3-step escalation:
-      // Step 1: Try with higher max_tokens
-      // Step 2: Compact context to free up token budget
-      // Step 3: Ask the model to be more concise
-      messages = await handleMaxTokens(messages, context);
-      continue;
-    }
-    
-    // Execute tool calls and collect results
-    const toolResults: ToolResult[] = [];
-    for (const block of response.content) {
-      if (block.type === "tool_use") {
-        const result = await executeToolWithPermission(
-          block, context.permissionLevel, context.userAllowlist
-        );
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: truncateToolOutput(result, MAX_TOOL_OUTPUT_CHARS),
-        });
-      }
-    }
-    
-    messages.push({ role: "user", content: toolResults });
-    hasAttemptedReactiveCompact = false; // Reset after successful turn
-  }
-}
-```
-
-The `hasAttemptedReactiveCompact` bug is worth examining in detail. Before the fix, the boolean was never reset after a successful turn. So if the agent hit a context length error, compacted, succeeded for 20 more turns, then hit another context length error, the guard would prevent a second compaction and the agent would throw. The fix — resetting the boolean after each successful API call — is a single line, but without it, long-running sessions would reliably crash.
-
-### The "Hidden Error" Pattern
-
-When Claude Code encounters a context-length error, it does not display this to the user. Instead, it silently compacts the conversation and retries. From the user's perspective, the agent simply continues working. This is intentional — exposing internal error recovery to users creates unnecessary anxiety and support burden.
-
-```typescript
-async function reactiveCompact(messages: Message[]): Promise<Message[]> {
-  // Don't show this to the user — it's internal housekeeping
-  const compacted = await compactConversation(messages, {
-    strategy: "preserve_recent",
-    keepFirstMessage: true,
-    keepLastNTurns: 6,
-    summarizeMiddle: true,
-  });
-  
-  // Log for observability, but don't surface to UI
-  logger.info("reactive_compact", {
-    before_tokens: estimateTokens(messages),
-    after_tokens: estimateTokens(compacted),
-    turns_removed: messages.length - compacted.length,
-  });
-  
-  return compacted;
-}
-```
-
----
-
-## 1.4 Cursor's Three-Layer Architecture
-
-Cursor is architecturally distinct from Claude Code and Codex. It's a VS Code fork with three layers that cooperate to provide agent capabilities: the IDE layer, the AI orchestration layer, and the context engine.
-
-### Layer 1: Priompt — Priority-Based Context Compilation
-
-Cursor's most innovative contribution is **Priompt** (Priority Prompt), a JSX-based system for declaratively specifying context with priorities. Instead of manually concatenating strings and hoping they fit in the context window, Priompt treats context compilation as a constraint satisfaction problem.
-
-```tsx
-function buildAgentContext(request: AgentRequest): PromptElement {
-  return (
-    <SystemMessage priority={1000}>
-      You are Cursor, an AI coding assistant integrated into the IDE.
-    </SystemMessage>
-    
-    <SystemMessage priority={990}>
-      <ToolDefinitions tools={request.availableTools} />
-    </SystemMessage>
-    
-    <SystemMessage priority={900}>
-      <ProjectRules path={request.workspacePath} />
-    </SystemMessage>
-    
-    <UserMessage priority={800}>
-      <RecentFiles files={request.recentlyEditedFiles} maxTokens={4000} />
-    </UserMessage>
-    
-    <UserMessage priority={700}>
-      <CodebaseSearchResults query={request.userQuery} maxResults={10} />
-    </UserMessage>
-    
-    <UserMessage priority={600}>
-      <DiagnosticErrors files={request.openFiles} />
-    </UserMessage>
-    
-    <UserMessage priority={500}>
-      <GitDiff maxTokens={2000} />
-    </UserMessage>
-    
-    <ConversationHistory priority={400} messages={request.history} />
-    
-    <UserMessage priority={1000}>
-      {request.currentMessage}
-    </UserMessage>
-  );
-}
-```
-
-The Priompt compiler takes this JSX tree and a token budget, then greedily includes elements by priority until the budget is exhausted. Priority 1000 elements are always included. Lower-priority elements are dropped first when space is constrained. This means that the user's current message and system instructions are guaranteed to be present, while older conversation history or search results may be truncated.
-
-The compilation algorithm:
-
-```
-1. Flatten the JSX tree into a list of (priority, tokens, content) tuples
-2. Sort by priority descending
-3. Greedily include elements:
-   - If element fits in remaining budget, include it
-   - If element has a maxTokens prop, truncate it to that limit first
-   - If element doesn't fit, skip it (or truncate if it's the lowest-priority included element)
-4. Re-order included elements back into their original document order
-5. Serialize to the API's message format
-```
-
-This solves a problem that plagues every hand-rolled context builder: when you have 20 sources of context and a 128K token budget, manually deciding what to include and what to cut is error-prone. Priompt makes it declarative.
-
-### Layer 2: Tree-sitter AST Chunking
-
-Cursor uses Tree-sitter, an incremental parsing library, to parse every file in the workspace into an AST. This enables structurally-aware code chunking for embeddings and retrieval.
-
-The naive approach to code chunking — splitting files into fixed-size chunks of N lines — produces terrible results because it splits functions in half, separates type definitions from their uses, and loses structural context.
-
-Cursor's approach:
-
-```
-Input file (TypeScript):
-
-import { User } from './types';         ─┐
-import { db } from './database';          │ Import block
-                                          │ (kept together)
-export interface AuthConfig {             ─┐
-  jwtSecret: string;                      │ Type definition
-  tokenExpiry: number;                    │ (one chunk)
-}                                         ─┘
-
-export async function login(              ─┐
-  email: string,                          │
-  password: string,                       │ Function definition
-  config: AuthConfig                      │ (one chunk, even if
-): Promise<{ token: string }> {           │  it's 80 lines)
-  const user = await db.users.findOne({   │
-    email: email.toLowerCase()            │
-  });                                     │
-  // ... 60 more lines ...                │
-  return { token };                       │
-}                                         ─┘
-
-export async function logout(             ─┐
-  token: string                           │ Another function
-): Promise<void> {                        │ (separate chunk)
-  await db.sessions.delete({ token });    │
-}                                         ─┘
-```
-
-Each AST node at the appropriate granularity (function, class, interface, top-level const) becomes one chunk. The chunk includes the node's full text plus its import dependencies. This means the embedding for `login` captures the full function body along with the `User` type import, so when the user asks about authentication, the retrieval finds the complete, self-contained code unit.
-
-### Layer 3: Merkle Tree Sync and Turbopuffer Embeddings
-
-Cursor maintains a real-time index of the entire workspace using a Merkle tree for change detection and Turbopuffer for vector storage.
-
-The Merkle tree structure:
-
-```
-workspace/
-├── hash: a1b2c3
-├── src/
-│   ├── hash: d4e5f6
-│   ├── routes/
-│   │   ├── hash: g7h8i9
-│   │   ├── auth.ts      hash: j0k1l2  (changed → re-embed)
-│   │   └── users.ts     hash: m3n4o5  (unchanged → skip)
-│   └── utils/
-│       ├── hash: p6q7r8
-│       └── validation.ts hash: s9t0u1  (unchanged → skip)
-└── tests/
-    ├── hash: v2w3x4
-    └── test_auth.ts     hash: y5z6a7  (changed → re-embed)
-```
-
-When a file changes, its hash changes, which propagates up the tree. The sync process walks the tree, compares hashes with the last-indexed state, and only re-embeds files whose hashes have changed. For a 10,000-file monorepo where 3 files changed, this means embedding 3 files instead of 10,000.
-
-The embeddings are stored in Turbopuffer, a purpose-built vector database that Cursor operates. The retrieval pipeline:
-
-```
-User query: "fix the auth middleware validation"
-    ↓
-1. Embed the query with the same model used for code chunks
-    ↓
-2. ANN search in Turbopuffer: find top-20 nearest chunks
-    ↓
-3. Re-rank with a cross-encoder model (more accurate but slower)
-    ↓
-4. Take top-5, expand each to include surrounding context from the AST
-    ↓
-5. Feed into Priompt at priority 700
-```
-
-The re-ranking step is critical. Embedding-based retrieval has a well-documented precision ceiling around 70-80%. The cross-encoder re-ranker pushes this to 90%+ by doing pairwise comparison of the query with each candidate.
-
----
-
-## 1.5 Termination Conditions That Actually Work in Production
-
-The most common failure mode in agents is not wrong tool calls — it's wrong termination. Agents that stop too early leave work incomplete. Agents that stop too late burn tokens, accumulate errors, and sometimes undo their own good work through over-iteration.
-
-### The Five Termination Signals
-
-Production agents use a layered approach:
-
-**Signal 1: Model-initiated stop (primary)**
-
-The model returns `stop_reason: "end_turn"` without any tool calls. This is the happy path — the model believes the task is complete.
-
-Failure mode: The model declares success prematurely. This happens most often when the model generates a plausible-sounding summary without actually verifying its work. Mitigation: the system prompt must explicitly instruct the model to verify before declaring completion.
-
-**Signal 2: Hard turn limit**
-
-```python
-MAX_TURNS = 200
-
-if turn >= MAX_TURNS:
-    return AgentResult(
-        status="max_turns_exceeded",
-        message=f"Reached {MAX_TURNS} turns without completion. Last state: ...",
-        partial=True
-    )
-```
-
-In practice, Codex uses a limit around 200 turns. Claude Code's limit is configurable but defaults to 200. Most tasks complete in 5-30 turns. If you're hitting 200, something is wrong.
-
-**Signal 3: Token budget exhaustion**
-
-```python
-MAX_TOTAL_TOKENS = 2_000_000  # $6-8 for a single session at typical rates
-
-if total_input_tokens + total_output_tokens > MAX_TOTAL_TOKENS:
-    return AgentResult(
-        status="token_budget_exceeded",
-        message="Session token budget exhausted.",
-        partial=True
-    )
-```
-
-**Signal 4: Repetition detection**
-
-This catches the most insidious failure mode: the agent doing the same thing over and over. Common patterns include:
-- The agent edits a file, runs tests, sees a failure, edits the same file with the same change, runs tests, sees the same failure — infinite loop.
-- The agent alternates between two approaches: tries fix A, it breaks something, reverts to fix B, it breaks something else, reverts to fix A...
-
-```python
-class RepetitionDetector:
-    def __init__(self, window: int = 8):
-        self.recent_tool_calls: list[str] = []
-        self.window = window
-    
-    def record(self, tool_name: str, tool_input: dict) -> None:
-        sig = f"{tool_name}:{json.dumps(tool_input, sort_keys=True)}"
-        self.recent_tool_calls.append(sig)
-        if len(self.recent_tool_calls) > self.window:
-            self.recent_tool_calls.pop(0)
-    
-    def is_stuck(self) -> bool:
-        if len(self.recent_tool_calls) < 4:
-            return False
-        
-        recent = self.recent_tool_calls
-        
-        # Exact repetition: same call 3+ times in a row
-        if len(set(recent[-3:])) == 1:
-            return True
-        
-        # Oscillation: ABAB pattern
-        if (len(recent) >= 4 and 
-            recent[-1] == recent[-3] and 
-            recent[-2] == recent[-4] and 
-            recent[-1] != recent[-2]):
-            return True
-        
-        # High similarity: 4+ of last 6 calls are the same tool with similar args
-        if len(recent) >= 6:
-            tool_names = [c.split(":")[0] for c in recent[-6:]]
-            most_common = max(set(tool_names), key=tool_names.count)
-            if tool_names.count(most_common) >= 4:
-                return True
-        
-        return False
-```
-
-When repetition is detected, the best approach is not to terminate immediately but to inject a meta-prompt:
-
-```python
-if repetition_detector.is_stuck():
-    messages.append({
-        "role": "user",
-        "content": "You appear to be repeating the same actions. Stop and reconsider your approach. What have you tried so far? What alternatives haven't you explored? If you're truly stuck, explain what's blocking you."
-    })
-    stuck_interventions += 1
-    if stuck_interventions >= 3:
-        return AgentResult(status="stuck", message="Agent unable to make progress.")
-```
-
-**Signal 5: Verification-based termination**
-
-The highest-quality agents don't just stop when the model says so — they verify first. Claude Code's documented workflow is: Gather Context → Take Action → Verify → Repeat. The verification step is what separates reliable agents from unreliable ones.
-
-```python
-def verify_before_terminate(agent_state):
-    """Run a verification pass before allowing termination."""
-    
-    checks = []
-    
-    # Check 1: Are all TODO items completed?
-    if agent_state.todos:
-        incomplete = [t for t in agent_state.todos if t.status != "completed"]
-        if incomplete:
-            return False, f"Incomplete TODOs: {[t.content for t in incomplete]}"
-    
-    # Check 2: Do tests pass?
-    if agent_state.has_test_command:
-        result = execute_tool("bash", {"command": agent_state.test_command})
-        if "FAIL" in result or "ERROR" in result:
-            return False, f"Tests failing: {result[:500]}"
-    
-    # Check 3: Are there linting errors in modified files?
-    for file_path in agent_state.modified_files:
-        lint = execute_tool("bash", {"command": f"npx eslint {file_path}"})
-        if "error" in lint.lower():
-            return False, f"Lint errors in {file_path}"
-    
-    return True, "All checks passed"
-```
-
-### The Cost of Getting Termination Wrong
-
-Wrong termination has direct, measurable costs:
-
-| Failure | Frequency | Cost Impact |
-|---------|-----------|-------------|
-| Premature termination (work incomplete) | ~15% of sessions | User re-runs task = 2x cost |
-| Late termination (unnecessary extra turns) | ~20% of sessions | 30-50% token waste per session |
-| Infinite loop (caught by hard limit) | ~2% of sessions | 5-10x normal cost before limit triggers |
-| Oscillation (agent undoes own work) | ~5% of sessions | Work regresses, often requires human intervention |
-
-The single most effective termination improvement is adding verification. In benchmarks on SWE-bench, agents that verify before termination (run tests, check lint) achieve 10-15 percentage points higher resolution rates than agents that terminate on model judgment alone.
-
----
-
-## 1.6 The Codex Execution Environment
-
-OpenAI Codex runs each task in a Firecracker microVM — a lightweight virtual machine that boots in under 200ms. The environment setup:
-
-```
-MicroVM Specification:
-  - 2 vCPUs, 4GB RAM
-  - Ephemeral disk (destroyed after session)
-  - Pre-loaded with: Node.js, Python, Go, Rust, Java runtimes
-  - Git, package managers (npm, pip, cargo, etc.)
-  - The user's repository, cloned and checked out
-  - Network: restricted to the OpenAI API and approved registries
-  - Timeout: 10 minutes per tool execution, 30 minutes total session
-```
-
-The network restriction is critical for safety. Codex agents cannot:
-- Make arbitrary HTTP requests to the internet
-- Connect to databases or external services
-- Download arbitrary packages (only from approved registries)
-- Exfiltrate code or data
-
-This sandbox model is why Codex can operate at L4 autonomy (fully autonomous) without per-action human approval. The blast radius of any mistake is contained within the ephemeral VM.
-
-The execution flow:
-
-```
-1. User submits task via Codex UI or API
-2. Codex provisions a Firecracker microVM (~150ms)
-3. Repository is cloned into /workspace (~2-10s depending on size)
-4. Dependencies are installed (cached when possible) (~5-30s)
-5. Agent loop begins
-6. Each tool call executes inside the VM
-7. On completion, Codex extracts:
-   - The git diff (all changes made)
-   - Test results
-   - Agent's summary
-8. Codex creates a PR or applies the diff
-9. VM is destroyed
-```
-
----
-
-# Chapter 2: Context Engineering in Practice
-
-## 2.1 The Three KV-Cache Principles
-
-In their technical blog post "Context Engineering for Agents," the Manus AI team identified KV-cache optimization as the single highest-leverage technique for production agent performance. Their three principles, with exact implementation details:
-
-### Principle 1: Stable Prefixes
-
-The system prompt and tool definitions must be byte-identical across every turn of a session, and ideally across sessions.
-
-**The wrong way:**
-
-```python
-SYSTEM_PROMPT = f"""You are an agent. Current time: {datetime.now().isoformat()}
-Session ID: {session_id}
-User: {user_name}
-
-...(3000 tokens of instructions)..."""
-```
-
-This kills the cache on every single turn. The timestamp changes every second, which means the first token of the system prompt differs between requests, which means zero KV-cache reuse for the entire 3000-token instruction block.
-
-**The right way:**
-
-```python
-STATIC_SYSTEM_PROMPT = """You are an agent. 
-
-...(3000 tokens of instructions — identical every time)...
-
-__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"""
-
-DYNAMIC_CONTEXT = f"""Current time: {datetime.now().isoformat()}
-Session ID: {session_id}
-User: {user_name}"""
-```
-
-With the Anthropic API, you can use the `cache_control` field to explicitly mark the cache boundary:
-
-```python
-response = client.messages.create(
-    model="claude-sonnet-4-20250514",
-    system=[
-        {
-            "type": "text",
-            "text": STATIC_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"}  # Cache this block
-        },
-        {
-            "type": "text",
-            "text": DYNAMIC_CONTEXT
-            # No cache_control — this part changes per session
-        }
-    ],
-    tools=TOOLS,  # Also cached if stable
-    messages=messages
-)
-```
-
-The `cache_control: {"type": "ephemeral"}` annotation tells the API to cache the KV-state up to that point. On subsequent requests with the same prefix, the API returns `cache_read_input_tokens` in the usage block, indicating how many tokens were served from cache.
-
-Measured impact: Moving a timestamp from the first line of the system prompt to a dynamic section after the cache boundary changed KV-cache hit rates from 0% to 85%+ for a 50-turn agent session.
-
-### Principle 2: Append-Only Context
-
-Never modify messages that have already been sent to the API. Always append new messages.
-
-**The subtle bug that breaks this:**
-
-```python
-import json
-
-# Python dicts are insertion-ordered since 3.7, BUT:
-# json.dumps does not guarantee key order across different dict constructions
-
-tool_input_a = {"file_path": "/src/auth.ts", "offset": 10, "limit": 50}
-tool_input_b = dict(offset=10, file_path="/src/auth.ts", limit=50)
-
-json.dumps(tool_input_a)  # '{"file_path": "/src/auth.ts", "offset": 10, "limit": 50}'
-json.dumps(tool_input_b)  # '{"offset": 10, "file_path": "/src/auth.ts", "limit": 50}'
-```
-
-These two JSON strings are semantically identical but byte-different. If your message serialization produces different byte sequences for the same logical message (because dict key ordering isn't deterministic), the KV-cache prefix match will fail at the point of difference. Every token after the mismatch is a cache miss.
-
-**The fix:**
-
-```python
-# ALWAYS use sort_keys=True for any JSON that will be part of the context
-json.dumps(tool_input, sort_keys=True)
-
-# Or normalize at the message construction level:
-def make_tool_result(tool_use_id: str, content: str) -> dict:
-    return {
-        "type": "tool_result",
-        "tool_use_id": tool_use_id,
-        "content": content,
-    }
-# Use OrderedDict or sorted keys consistently
-```
-
-In Manus's reported numbers, fixing non-deterministic serialization in their message pipeline improved KV-cache hit rates from 12% to 95%. That's not a typo. Non-deterministic JSON key ordering can destroy nearly all cache benefit because each turn introduces a byte mismatch at a random position in the message history, and the cache prefix match terminates at the first byte difference.
-
-### Principle 3: Explicit Cache Breakpoints
-
-When using a vLLM or similar self-hosted inference server, configure prefix caching with session affinity:
-
-```python
-# vLLM server configuration for prefix caching
-# In the vLLM startup command:
-# python -m vllm.entrypoints.openai.api_server \
-#     --model meta-llama/Llama-3.1-70B-Instruct \
-#     --enable-prefix-caching \
-#     --max-num-seqs 256
-
-# Client-side: route requests for the same session to the same vLLM instance
-# This ensures the KV-cache for that session's prefix is warm
-
-class SessionRouter:
-    def __init__(self, vllm_instances: list[str]):
-        self.instances = vllm_instances
-    
-    def route(self, session_id: str) -> str:
-        """Consistent hash routing: same session always hits same instance."""
-        idx = hash(session_id) % len(self.instances)
-        return self.instances[idx]
-```
-
-Without session affinity, each turn of an agent session might hit a different inference server instance, which has no cached KV state for that session. The turn pays full input processing cost. With session affinity, turns 2+ get cache hits on the shared prefix.
-
-For Anthropic's API, prefix caching is automatic — you don't need to manage routing. But you do need to ensure your prefix is actually stable (Principle 1). The API tracks cached state per-account and re-uses it when the prefix matches.
-
-### The Cost Math
-
-The exact pricing (as of early 2026, Claude Sonnet) illustrates why this matters:
-
-```
-Standard input tokens:      $3.00 / million tokens
-Cached input tokens:        $0.30 / million tokens  (90% discount)
-Output tokens:              $15.00 / million tokens
-
-A typical 50-turn agent session:
-  Turn 1:  3,500 input tokens (all new)      = $0.0105
-  Turn 2:  5,200 input tokens (3,500 cached) = $0.0015 + $0.0051 = $0.0066
-  Turn 3:  7,800 input tokens (5,200 cached) = $0.0016 + $0.0078 = $0.0094
-  ...
-  Turn 50: 95,000 input tokens (90,000 cached, 5,000 new)
-           = $0.027 + $0.015 = $0.042
-
-  With 90% cache rate: ~$1.50 total input cost
-  With 0% cache rate:  ~$14.00 total input cost
-  
-  Savings: ~$12.50 per session × 1M sessions/month = $12.5M/month savings
-```
-
-The 100:1 input-to-output ratio that Manus reported means input token cost dominates. And cached tokens are 10x cheaper than uncached. So KV-cache optimization is by far the highest-leverage cost optimization available.
-
----
-
-## 2.2 Claude Code's Cache Boundary in Detail
-
-The `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` marker in Claude Code's system prompt separates content into two regions:
-
-**Above the boundary (~70% of system prompt):** Behavioral instructions, tool definitions, formatting rules, safety constraints. These are identical across all users and sessions. They are compiled once and cached.
-
-**Below the boundary (~30% of system prompt):** Environment detection results, project-specific CLAUDE.md contents, session configuration, user-specific settings. These vary per session.
-
-The actual prompt assembly:
-
-```typescript
-function buildSystemPrompt(context: SessionContext): SystemPromptPart[] {
-  const parts: SystemPromptPart[] = [];
-  
-  // --- STATIC SECTION (cached) ---
-  
-  parts.push({
-    text: CORE_IDENTITY,           // ~200 tokens
-    cache_control: null
-  });
-  
-  parts.push({
-    text: TOOL_USAGE_GUIDE,        // ~800 tokens
-    cache_control: null
-  });
-  
-  parts.push({
-    text: BEHAVIORAL_RULES,        // ~600 tokens
-    cache_control: null
-  });
-  
-  parts.push({
-    text: OUTPUT_FORMAT_RULES,     // ~300 tokens
-    cache_control: null
-  });
-  
-  parts.push({
-    text: SAFETY_CONSTRAINTS,      // ~400 tokens
-    cache_control: null
-  });
-  
-  parts.push({
-    text: MEMORY_INSTRUCTIONS,     // ~200 tokens
-    cache_control: null
-  });
-  
-  if (context.enableAntiDistillation) {
-    parts.push({
-      text: ANTI_DISTILLATION_BLOCK,  // ~150 tokens
-      cache_control: null
-    });
-  }
-  
-  // Mark the end of the static section for caching
-  parts.push({
-    text: "---",  // Marker
-    cache_control: { type: "ephemeral" }  // Cache everything up to here
-  });
-  
-  // --- DYNAMIC SECTION (per-session, not cached) ---
-  
-  parts.push({
-    text: buildEnvironmentInfo(context),  // ~100 tokens
-    cache_control: null
-  });
-  
-  const claudeMd = loadClaudeMd(context.workspacePath);
-  if (claudeMd) {
-    parts.push({
-      text: `## Project Memory\n${claudeMd}`,  // Variable, up to ~4000 tokens
-      cache_control: null
-    });
-  }
-  
-  return parts;
-}
-```
-
-The `cache_control: { type: "ephemeral" }` on the separator tells the API: "Everything before this point (inclusive) should be cached." On the next API call with the same prefix, the API will serve those tokens from cache and only process the tokens after the cache boundary.
-
-### Token Budget of the System Prompt
-
-Measured from the leak and public documentation:
-
-```
-Component                          Tokens    % of system prompt
-─────────────────────────────────────────────────────────────
-Core identity & capabilities         ~200     3%
-Tool usage guide                     ~800    13%
-Behavioral rules                     ~600    10%
-Output formatting                    ~300     5%
-Safety constraints                   ~400     7%
-Memory/CLAUDE.md instructions        ~200     3%
-Anti-distillation block              ~150     2%
-Tool schemas (19 tools)            ~1,800    30%
-─── cache boundary ───
-Environment info                     ~100     2%
-CLAUDE.md content (varies)        ~0-4,000  0-25%
-─────────────────────────────────────────────────────────────
-Total static (cached):             ~4,450    ~70%
-Total dynamic (per-session):      ~100-4,100 ~30%
-```
-
-The 70% cached ratio means that for a 50-turn session, approximately 70% × 4,450 × 50 = 155,750 tokens are served from cache instead of being recomputed. At the 10x price difference, that's $0.42 saved per session just from the system prompt cache.
-
----
-
-## 2.3 OpenAI Compaction in Detail
-
-The Responses API supports server-side compaction through the `compact` response type. When the conversation context approaches the model's limit, the client can request compaction:
-
-```python
-# When context is getting large, request compaction
-response = client.responses.create(
-    model="o3-mini",
-    previous_response_id="resp_abc123",
-    input=[
-        {
-            "type": "message",
-            "role": "user", 
-            "content": "Continue working on the task."
-        }
-    ],
-    tools=tools,
-    # Compaction parameters
-    truncation={
-        "type": "auto",
-        "max_tokens": 90000  # Target context size after compaction
-    }
-)
-```
-
-The server performs compaction by:
-1. Identifying which turns can be summarized (old tool results, verbose outputs)
-2. Generating a summary using a fast model
-3. Replacing the original turns with a compact `encrypted_content` item
-4. The `encrypted_content` is opaque to the client — it contains a server-side reference to the compacted context that can be expanded if needed
-
-The response includes an `encrypted_content` item in the conversation:
-
-```json
-{
-  "output": [
-    {
-      "type": "encrypted_content",
-      "id": "enc_xyz789",
-      "summary": "Earlier in this session: read auth.ts, identified validation bug, applied regex fix, tests partially passing."
-    },
-    {
-      "type": "message",
-      "role": "assistant",
-      "content": "Let me check the remaining test failure..."
-    },
-    {
-      "type": "function_call",
-      "name": "shell",
-      "call_id": "call_def456",
-      "arguments": "{\"command\": \"npm test -- --grep 'password reset'\"}"
-    }
+Algorithm: ERL (Experiential Reflective Learning)
+
+=== HEURISTIC EXTRACTION (after each task) ===
+
+Input:
+  task: The task that was just attempted
+  trajectory: The agent's execution trajectory
+  outcome: Success or failure indicator
+  heuristic_pool: Current pool of accumulated heuristics
+
+Output:
+  heuristic_pool: Updated pool with new heuristics
+
+Procedure:
+  extraction_prompt = [
+      "You just completed a task. Extract general heuristics that would",
+      "help you (or another agent) on similar future tasks.",
+      "",
+      "Task: " + task,
+      "Your trajectory: " + summarize(trajectory),
+      "Outcome: " + outcome,
+      "",
+      "Generate heuristics in the following format:",
+      "WHEN: [description of the situation/context where this applies]",
+      "THEN: [the action to take or approach to use]",
+      "BECAUSE: [brief justification from this experience]",
+      "",
+      "Requirements:",
+      "- Heuristics must be GENERAL (applicable beyond this specific task)",
+      "- Heuristics must be ACTIONABLE (specific enough to guide behavior)",
+      "- Generate 1-3 heuristics per task (only if genuinely useful)",
+      "- Do not generate trivial or obvious heuristics"
   ]
-}
+  
+  new_heuristics = LLM.generate(extraction_prompt)
+  
+  for heuristic in parse_heuristics(new_heuristics):
+      heuristic_pool.append({
+          "when": heuristic.when,
+          "then": heuristic.then,
+          "because": heuristic.because,
+          "source_task": task.id,
+          "source_outcome": outcome,
+          "timestamp": now()
+      })
+  
+  return heuristic_pool
+
+
+=== HEURISTIC SELECTION (at inference time) ===
+
+Input:
+  new_task: The task to solve
+  heuristic_pool: All accumulated heuristics
+  k: Number of heuristics to select (default: 20)
+
+Output:
+  selected_heuristics: Top-k heuristics for this task
+
+Procedure:
+  // Stage 1: Embedding-based pre-filtering
+  // Reduces pool to manageable candidate set
+  candidates = embedding_retrieval(
+      query=new_task,
+      pool=heuristic_pool,
+      top_n=100  // retrieve 100 candidates
+  )
+  
+  // Stage 2: LLM-based ranking
+  // The LLM scores each candidate's relevance to the current task
+  ranking_prompt = [
+      "You are about to solve the following task:",
+      new_task,
+      "",
+      "Below are heuristics from past experience.",
+      "Rate each heuristic's relevance to the current task on a scale of 1-5.",
+      "5 = directly applicable, 1 = irrelevant.",
+      "",
+      format_candidates(candidates)
+  ]
+  
+  scores = LLM.generate(ranking_prompt)
+  ranked = sort_by_score(candidates, scores)
+  selected_heuristics = ranked[:k]
+  
+  return selected_heuristics
+
+
+=== TASK EXECUTION ===
+
+Input:
+  new_task: The task to solve
+  selected_heuristics: From heuristic selection
+
+Output:
+  trajectory: Agent's execution trajectory
+
+Procedure:
+  context = [
+      system_prompt,
+      "",
+      "HEURISTICS FROM PAST EXPERIENCE:",
+      "Consider the following guidelines (apply only when relevant):",
+      "",
+      format_heuristics(selected_heuristics),
+      "",
+      "TASK:",
+      new_task
+  ]
+  
+  trajectory = Agent.execute(context)
+  return trajectory
 ```
 
-The compaction threshold in practice: Codex triggers compaction when the context reaches approximately 70% of the model's context window. For o3-mini with a 128K window, that's around 90K tokens. The compacted context targets 50% of the window (64K tokens), leaving room for growth before the next compaction.
+### Heuristic Format
+
+ERL's "When-Then-Because" format is designed to be both general and actionable. Here are examples from the Gaia2 benchmark experiments:
+
+```
+HEURISTIC #1
+WHEN: You need to extract structured data from a web page and the page
+      uses JavaScript-rendered content
+THEN: Use a headless browser tool (not simple HTTP fetch) and wait for
+      dynamic content to load before parsing. Check for shadow DOM
+      elements if standard selectors return empty results.
+BECAUSE: In Task-2847, simple HTTP fetch returned empty tables because
+         the data was loaded via JavaScript after initial page render.
+         Switching to headless browser with explicit wait resolved the issue.
+```
+
+```
+HEURISTIC #2
+WHEN: A multi-step calculation involves unit conversions and the
+      intermediate values seem unexpectedly large or small
+THEN: Explicitly state the units at each step and verify dimensional
+      consistency before proceeding to the next calculation step.
+BECAUSE: In Task-1923, a temperature conversion error (Celsius vs
+         Fahrenheit vs Kelvin) propagated through 4 subsequent calculations,
+         producing a final answer off by 2 orders of magnitude. Explicit
+         unit tracking would have caught this at step 1.
+```
+
+```
+HEURISTIC #3
+WHEN: You are asked to find information about a person and your
+      initial search returns ambiguous results (multiple people with
+      the same name)
+THEN: Add qualifying terms to the search (profession, location, time
+      period, associated organization) before exploring any single result.
+      Verify the person matches ALL identifying criteria in the question.
+BECAUSE: In Task-3156, I spent 8 tool calls researching the wrong
+         "James Wilson" before discovering the question referred to a
+         different person. Adding the profession to the search query
+         would have disambiguated immediately.
+```
+
+The "BECAUSE" field is not injected at inference time — it is used only during extraction as a grounding mechanism to ensure the heuristic is derived from actual experience rather than hallucinated. At inference time, only the WHEN and THEN fields are presented to the agent.
+
+### Quantitative Results
+
+**Gaia2 Benchmark:**
+
+| Method | Overall Accuracy | Level 1 | Level 2 | Level 3 |
+|---|---|---|---|---|
+| ReAct (baseline) | 41.2% | 56.3% | 38.7% | 22.1% |
+| Reflexion | 43.8% | 59.1% | 40.2% | 24.5% |
+| ExpeL | 44.1% | 58.7% | 41.3% | 25.0% |
+| ERL (k=10) | 47.3% | 62.5% | 44.8% | 27.9% |
+| ERL (k=20) | 49.0% | 63.8% | 46.2% | 29.4% |
+
+The +7.8 percentage point improvement over ReAct baseline is the headline result. Notably, ERL outperforms both Reflexion and ExpeL despite not requiring multiple attempts or contrastive pairs.
+
+**Breakdown by heuristic count:**
+
+| Heuristic Pool Size | Accuracy (k=20) |
+|---|---|
+| 0 (baseline) | 41.2% |
+| 50 | 44.7% |
+| 100 | 46.3% |
+| 200 | 48.1% |
+| 500 | 49.0% |
+| 1000 | 48.8% |
+
+Performance plateaus around 500 heuristics. Beyond that, the LLM ranker's selection quality becomes the bottleneck — there are enough good heuristics, but selecting the right ones becomes harder.
+
+### Ablation Results
+
+**Ranking method matters.** Replacing the LLM-based ranker with pure embedding retrieval (no re-ranking) drops performance by 4.2 percentage points. The LLM ranker is better at assessing *semantic relevance* (whether the heuristic applies to the current task) versus *surface similarity* (whether the heuristic mentions similar keywords).
+
+**k=20 is the sweet spot.** Testing k ∈ {5, 10, 15, 20, 30, 50}:
+
+| k | Accuracy |
+|---|---|
+| 5 | 45.1% |
+| 10 | 47.3% |
+| 15 | 48.4% |
+| 20 | 49.0% |
+| 30 | 48.5% |
+| 50 | 47.2% |
+
+Too few heuristics miss relevant guidance; too many dilute the context with marginally relevant or irrelevant entries.
+
+**Single-attempt vs. contrastive extraction.** To test whether single-attempt extraction is competitive with contrastive extraction, the authors ran ExpeL-style contrastive extraction where contrastive pairs were available, and ERL-style single-attempt extraction otherwise. The hybrid approach performed within 0.5% of pure ERL, suggesting that single-attempt extraction captures most of the available signal.
+
+**Extraction from successes vs. failures.** Heuristics extracted from failures are slightly more valuable (+1.3% over heuristics from successes alone), but the difference is smaller than expected. Success trajectories also yield useful heuristics (e.g., "this approach worked well when...").
+
+### Limitations
+
+**Ranker cost.** The LLM-based ranking step adds latency and cost to every task execution. For a pool of 100 candidates and a ranking prompt, this is approximately 5K–10K additional tokens per task.
+
+**Heuristic quality variance.** Without contrastive pairs, some extracted heuristics are trivial ("WHEN: you are asked a question, THEN: answer it carefully") or overly specific ("WHEN: the table has exactly 5 columns..."). The LLM ranker partially mitigates this by de-prioritizing low-quality heuristics, but some noise remains.
+
+**No heuristic consolidation.** The pool grows monotonically. There is no mechanism for merging similar heuristics or retiring obsolete ones. Over long deployments, the pool becomes bloated with redundant entries.
+
+**Generalization boundary.** ERL's heuristics are natural language rules. For tasks that require procedural knowledge (specific code patterns, API interaction sequences), natural language heuristics are less effective than executable skills. ERL is best suited for reasoning-heavy tasks.
+
+### Practical Implementation Notes
+
+**Lazy extraction.** In production, run heuristic extraction asynchronously after task completion. The extraction does not need to happen synchronously — the heuristics only need to be available for the *next* task, not the current one.
+
+**Pool hygiene.** Implement periodic deduplication by prompting the LLM to merge similar heuristics. A monthly consolidation pass can reduce pool size by 30–40% without losing information.
+
+**Cold start.** ERL requires a warm-up phase to accumulate heuristics. For the first ~50 tasks, the pool is small and the benefit is marginal. Consider pre-seeding the pool with heuristics generated from documentation or known best practices.
+
+**Model pairing.** Use a cheap model (e.g., GPT-4o-mini, Claude 3.5 Haiku) for the ranking step and a frontier model for task execution. The ranking task is much simpler than task execution, and using a cheaper model significantly reduces per-task cost.
+
+### The LLM Ranker: Detailed Design
+
+ERL's two-stage retrieval pipeline (embedding pre-filter + LLM re-rank) deserves detailed examination because it represents a general pattern applicable to all memory-augmented agent systems.
+
+**Stage 1: Embedding pre-filter.** The task description is embedded using a standard embedding model (e.g., OpenAI `text-embedding-3-small`, sentence-transformers). Each heuristic's WHEN clause is pre-embedded and stored. At retrieval time, cosine similarity between the task embedding and each heuristic's WHEN embedding is computed. The top 100 candidates are passed to Stage 2.
+
+```
+function embedding_prefilter(task, pool, n=100):
+    task_embedding = embed(task.description)
+    
+    scores = []
+    for heuristic in pool:
+        // Embed WHEN clause (can be pre-computed and cached)
+        h_embedding = heuristic.cached_embedding
+        similarity = cosine_similarity(task_embedding, h_embedding)
+        scores.append((heuristic, similarity))
+    
+    scores.sort(reverse=True)
+    return scores[:n]
+```
+
+Cost: ~0.001 cents per retrieval (embedding API call + vector similarity). Latency: <50ms.
+
+**Stage 2: LLM re-ranking.** The 100 candidates are presented to an LLM for relevance scoring. The LLM receives the full task description and each candidate's WHEN/THEN clauses, and assigns a relevance score.
+
+```
+LLM RANKING PROMPT
+
+You are selecting relevant heuristics for the current task.
+
+## Current Task
+{task_description}
+
+## Candidate Heuristics
+{for i, heuristic in candidates:}
+[{i}] WHEN: {heuristic.when}
+     THEN: {heuristic.then}
+
+## Instructions
+Rate each heuristic's relevance to the current task.
+5 = Directly applicable — the WHEN condition clearly matches the task
+4 = Likely applicable — the situation is similar
+3 = Possibly relevant — tangentially related
+2 = Probably irrelevant — different context
+1 = Clearly irrelevant — no connection
+
+Output format: one line per heuristic
+{id}: {score}
+```
+
+Cost: ~0.5–2 cents per retrieval (depends on candidate count and model choice). Latency: 1–3 seconds.
+
+The two-stage approach is necessary because embedding similarity alone is insufficient for heuristic selection. Embeddings capture lexical/semantic similarity, but heuristic applicability depends on *functional* similarity — whether the heuristic's advice would help with this specific task. An LLM can assess functional relevance in ways that pure embedding models cannot.
+
+**Ranking calibration.** The raw LLM scores need calibration across tasks. The paper normalizes scores within each ranking instance (subtract mean, divide by standard deviation) to ensure consistent selection thresholds.
+
+### Heuristic Pool Dynamics Over Time
+
+In a long-running deployment, the heuristic pool evolves through several phases:
+
+**Phase 1: Rapid Growth (tasks 1–100).** Most tasks generate 1–3 new heuristics. The pool grows quickly from 0 to ~150–250 heuristics. Quality is variable — early heuristics are based on limited experience and may be overly specific.
+
+**Phase 2: Stabilization (tasks 100–500).** Pool growth slows. Many tasks generate heuristics that are near-duplicates of existing ones. The pool grows to ~400–600 heuristics. The most useful heuristics begin to emerge through repeated high rankings.
+
+**Phase 3: Saturation (tasks 500+).** New heuristics are rarely generated — the pool covers the task distribution. Performance plateaus. At this point, the main value comes from the ranker's improving ability to select the right heuristics, not from adding new ones.
+
+This lifecycle suggests a maintenance strategy:
+- **During Phase 1:** Maximize heuristic generation. Use a generous extraction prompt that encourages 2–3 heuristics per task.
+- **During Phase 2:** Introduce deduplication. Periodically prompt the LLM to merge similar heuristics.
+- **During Phase 3:** Focus on quality. Review and prune heuristics that are never selected by the ranker. Consider periodic "heuristic refresh" where the LLM rewrites existing heuristics based on accumulated experience.
 
 ---
 
-## 2.4 Token Budgeting: A Real 128K Window Allocation
+## 2.4 AutoGuide: State-Aware Guideline Generation
 
-Here is how a production agent should budget a 128K token context window. These numbers come from observing real agent sessions across multiple frameworks:
+**Paper:** Gao et al., "AutoGuide: Automated Generation and Selection of State-Aware Guidelines for LLM Agents," NeurIPS 2024  
+**arXiv:** 2403.08978
+
+### Core Idea
+
+AutoGuide introduces *state-awareness* to reflection-based learning. While Reflexion generates reflections that are always injected and ExpeL generates insights that are retrieved by task similarity, AutoGuide generates guidelines that are *conditioned on the agent's current state*. A guideline specifies not just what to do, but *when* to do it — under what state conditions the guideline should be activated.
+
+This addresses a subtle but important failure mode of prior methods: injecting irrelevant guidance. When Reflexion includes all recent reflections in the prompt, or when ExpeL retrieves insights by task-level similarity, the agent receives guidance that may not apply to its current situation within the task. For multi-step tasks where the agent's strategy should vary across steps, task-level guidance is too coarse.
+
+### Architecture
+
+AutoGuide operates in two phases: offline guideline extraction from a corpus of experience trajectories, and online guideline selection during task execution.
 
 ```
-128,000 tokens total
+Algorithm: AUTOGUIDE
 
-System prompt (static):           3,840 tokens   3%
-  - Core instructions:    1,500
-  - Safety rules:           800
-  - Output format:          540
-  - Other:                1,000
+=== OFFLINE: GUIDELINE EXTRACTION ===
 
-Tool definitions:                 2,560 tokens   2%
-  - 16 tools × ~160 tokens avg
+Input:
+  experience_trajectories: Set of (task, trajectory, outcome) triples
+  state_abstraction: Function that maps trajectory prefixes to abstract states
 
-Few-shot examples:                3,840 tokens   3%
-  - 2-3 examples of correct tool use
-  - Particularly important for complex tools
+Output:
+  guideline_library: Set of (state_condition, guideline, confidence) triples
 
-Working documents / CLAUDE.md:   38,400 tokens  30%
-  - Project memory:        4,000
-  - Currently-open files: 20,000
-  - Search results:       10,000
-  - Diagnostics:           4,400
+Procedure:
+  guideline_library = []
+  
+  for (task, trajectory, outcome) in experience_trajectories:
+      // Decompose trajectory into state-action-result triples
+      for step_idx in range(len(trajectory)):
+          prefix = trajectory[:step_idx]
+          action = trajectory[step_idx].action
+          result = trajectory[step_idx].result
+          
+          // Abstract the current state
+          state = state_abstraction(prefix)
+          
+          // Determine if this step was a critical decision point
+          // (led to eventual success or a cascading failure)
+          impact = assess_step_impact(step_idx, trajectory, outcome)
+          
+          if impact == HIGH:
+              // Generate guideline for this state
+              guideline_prompt = [
+                  "An agent was in the following state:",
+                  state,
+                  "",
+                  "It took the following action:",
+                  action,
+                  "",
+                  "This led to:",
+                  result,
+                  "",
+                  "The overall task outcome was: " + outcome,
+                  "",
+                  "Generate a guideline that specifies:",
+                  "1. STATE CONDITION: When (in what state) should this",
+                  "   guideline be applied?",
+                  "2. GUIDELINE: What should the agent do or avoid doing?",
+                  "3. RATIONALE: Why is this guideline important?"
+              ]
+              
+              guideline = LLM.generate(guideline_prompt)
+              
+              // Check for duplicates/conflicts with existing guidelines
+              merged = merge_or_add(guideline_library, guideline)
+              guideline_library = merged
+  
+  return guideline_library
 
-Conversation history:            38,400 tokens  30%
-  - Recent 8-10 turns in full
-  - Older turns summarized
-  - First turn (original goal) always preserved
 
-Output headroom:                 40,960 tokens  32%
-  - Model's generation budget
-  - Includes reasoning tokens for o-series models
-  - Extended thinking tokens for Claude
+=== ONLINE: STATE-AWARE SELECTION ===
 
-Total:                          128,000 tokens 100%
+Input:
+  current_state: Agent's current state in the task
+  guideline_library: From offline extraction
+  k: Number of guidelines to inject
+
+Output:
+  active_guidelines: Guidelines applicable to the current state
+
+Procedure:
+  // Two-stage filtering:
+  
+  // Stage 1: State matching
+  // Filter guidelines whose state conditions match the current state
+  candidates = []
+  for guideline in guideline_library:
+      match_score = state_match(guideline.state_condition, current_state)
+      if match_score > threshold:
+          candidates.append((guideline, match_score))
+  
+  // Stage 2: Relevance ranking  
+  // Among state-matched guidelines, rank by confidence and relevance
+  ranked = sort_by(candidates, key=lambda g: g.confidence * g.match_score)
+  active_guidelines = ranked[:k]
+  
+  return active_guidelines
 ```
 
-The 32% output headroom is often underestimated. For reasoning models (o3, Claude with extended thinking), the model may use 10,000-20,000 tokens of internal reasoning before producing visible output. If you fill the context to 95% capacity, the model has no room to think, and output quality degrades sharply.
+### Guideline Format
 
-The working documents allocation (30%) is the most variable. For a task that requires reading many files, this may expand to 50% while conversation history shrinks. For a debugging task with a long conversation, history may expand to 50% while working documents shrink. The key constraint: system prompt + tools + few-shot (the stable prefix) should never exceed 10% of the window.
+AutoGuide guidelines are structured with explicit state conditions:
 
-### Dynamic Rebalancing
+```
+GUIDELINE #7 [confidence: 0.89]
+STATE CONDITION: The agent has just received search results containing
+  multiple entities with similar names, and the task requires identifying
+  a specific individual.
+GUIDELINE: Before proceeding with any single search result, perform a
+  disambiguation step: check at least 2-3 additional attributes (birth year,
+  profession, nationality) against the task description. Only proceed when
+  at least 2 attributes match.
+RATIONALE: In 4 out of 5 observed cases where the agent immediately clicked
+  the first search result without disambiguation, it wasted 3-7 actions on
+  the wrong entity before backtracking.
+```
 
-```python
-class TokenBudget:
-    def __init__(self, total: int = 128_000):
-        self.total = total
-        self.fixed = {
-            "system":    int(total * 0.03),
-            "tools":     int(total * 0.02),
-            "few_shot":  int(total * 0.03),
-        }
-        self.output_reserve = int(total * 0.32)
-        self.available = total - sum(self.fixed.values()) - self.output_reserve
+```
+GUIDELINE #12 [confidence: 0.95]
+STATE CONDITION: The agent is navigating a web interface and has just
+  clicked a button/link that did not produce the expected result (page
+  didn't change, or wrong page loaded).
+GUIDELINE: Before retrying the same action, check: (1) whether the page
+  has a loading indicator that hasn't completed, (2) whether the element
+  requires scrolling into view, (3) whether a popup/modal is blocking
+  interaction. Try these checks in order before clicking again.
+RATIONALE: Repeated clicking of non-responsive elements is the #1 cause
+  of action loops in web navigation tasks, accounting for 23% of all failures
+  in the training set.
+```
+
+The state condition is the distinguishing feature. Unlike ExpeL insights (which are always-applicable rules) or ERL heuristics (which are filtered by task similarity), AutoGuide guidelines explicitly specify the situations where they apply. This enables fine-grained, step-level guidance rather than task-level guidance.
+
+### State Abstraction
+
+The state abstraction function $s = \text{abstract}(\text{trajectory prefix})$ is critical to AutoGuide's effectiveness. The paper explores several approaches:
+
+**Raw state:** Use the full trajectory prefix as the state. Precise but high-dimensional; matching is difficult.
+
+**LLM-summarized state:** Prompt the LLM to summarize the current situation in 2–3 sentences. Balances specificity and generality, but adds latency.
+
+**Template-based state:** Define a fixed set of state features (e.g., "number of search results seen," "current page type," "number of actions taken") and extract values. Low latency but requires domain-specific engineering.
+
+The paper finds that LLM-summarized state performs best overall, with template-based state within 2% on structured domains (where the state features are well-defined).
+
+### Quantitative Results
+
+**ALFWorld:**
+
+| Method | Success Rate |
+|---|---|
+| ReAct (baseline) | 75% |
+| Reflexion | 97% |
+| ExpeL | 87% |
+| AutoGuide | 96% |
+
+**WebShop:**
+
+| Method | Success Rate |
+|---|---|
+| ReAct (baseline) | 52% |
+| ExpeL | 58% |
+| AutoGuide | 65% |
+
+AutoGuide's advantage is most pronounced on WebShop, a web navigation task where the agent's optimal action depends heavily on its current state (search results page vs. product page vs. cart). The +13 percentage point improvement over baseline and +7 over ExpeL demonstrates the value of state-aware guidance.
+
+**ScienceWorld:**
+
+| Method | Success Rate |
+|---|---|
+| ReAct (baseline) | 17% |
+| ExpeL | 22% |
+| AutoGuide | 29% |
+
+On this challenging scientific reasoning environment, AutoGuide shows the largest absolute improvement, suggesting that state-aware guidelines are particularly valuable for long-horizon tasks with many distinct state configurations.
+
+### Ablation Results
+
+**State conditioning is critical.** Removing state conditions (injecting all guidelines regardless of state) reduces WebShop performance from 65% to 57%. This 8 percentage point drop confirms that irrelevant guidelines actively harm performance.
+
+**Guideline count.** Optimal performance is achieved with 3–5 active guidelines per step. Fewer provides insufficient guidance; more causes context dilution.
+
+**Offline vs. Online extraction.** AutoGuide's offline extraction (batch processing of experience trajectories) outperforms online extraction (generating guidelines after each task) by 3–4%, likely because offline extraction can compare across multiple trajectories to identify robust patterns.
+
+### Limitations
+
+**Offline training requirement.** AutoGuide requires a batch of experience trajectories for guideline extraction. Like ExpeL, it is not naturally online.
+
+**State matching accuracy.** The effectiveness of state-aware selection depends on the quality of the state abstraction and matching functions. Poorly defined state conditions lead to guidelines activating in wrong contexts (false positives) or missing contexts where they should activate (false negatives).
+
+**Domain specificity of state features.** While LLM-summarized state is domain-general, the template-based approach (which is faster) requires domain-specific engineering. This limits out-of-the-box applicability.
+
+**Step-level cost.** Running state matching at every step adds per-step latency. For tasks with many steps (50+ actions), this overhead is significant.
+
+### Practical Implementation Notes
+
+**Guideline activation logging.** Track which guidelines activate at each step and whether the agent followed them. This data feeds back into guideline confidence scores and identifies guidelines that are frequently activated but rarely followed (indicating the guideline may be poorly worded or inappropriate).
+
+**Hierarchical guidelines.** For complex tasks, consider a two-level guideline system: task-level guidelines (activated once based on task type) and step-level guidelines (activated based on current state). This reduces the per-step matching cost while still providing fine-grained guidance.
+
+**Conflict resolution.** When multiple guidelines activate and give conflicting advice, the agent needs a resolution strategy. Options: (a) use the highest-confidence guideline, (b) present all guidelines and let the LLM reason about which applies, (c) prefer the more specific guideline. The paper uses option (b), but option (c) may be more reliable.
+
+### State Matching Implementation
+
+The state matching function is AutoGuide's most novel component. Here is a detailed implementation:
+
+```
+function state_match(guideline_condition, current_state):
+    // Method 1: Template matching (fast, domain-specific)
+    if guideline_condition.has_template_features:
+        features_match = 0
+        features_total = len(guideline_condition.features)
+        for feature, expected_value in guideline_condition.features:
+            actual_value = current_state.get(feature)
+            if matches(actual_value, expected_value):
+                features_match += 1
+        return features_match / features_total
     
-    def allocate(self, turn_count: int, files_in_context: int) -> dict:
-        """Shift budget between working docs and history based on session state."""
-        if turn_count < 5:
-            # Early in session: prioritize working documents
-            doc_ratio = 0.65
-        elif files_in_context > 10:
-            # Many files open: prioritize working documents
-            doc_ratio = 0.55
-        else:
-            # Default: balanced
-            doc_ratio = 0.50
-        
-        return {
-            "working_docs": int(self.available * doc_ratio),
-            "history":      int(self.available * (1 - doc_ratio)),
-        }
+    // Method 2: LLM-based matching (slow, domain-general)
+    match_prompt = [
+        "Does the following state condition match the current agent state?",
+        "",
+        "State condition: " + guideline_condition.text,
+        "",
+        "Current agent state: " + current_state.summary,
+        "",
+        "Rate the match from 0.0 (clearly does not match) to 1.0",
+        "(matches perfectly). Consider both literal and semantic matching.",
+        "A condition about 'search results with ambiguous entities'",
+        "matches a state where 'multiple people named John Smith appeared",
+        "in results' even if the exact wording differs."
+    ]
+    
+    score = LLM.generate(match_prompt)
+    return parse_float(score)
 ```
+
+**The cost-accuracy trade-off of state matching.** Template matching runs in microseconds but requires pre-defined features. LLM matching is general but costs ~500 tokens per match evaluation. For a guideline library of 200 entries checked at each step, pure LLM matching would cost 100K tokens per step — clearly infeasible.
+
+The practical solution is a **cascade architecture:**
+
+```
+STAGE 1: Embedding pre-filter (top 20 candidates from 200)
+    Cost: <1ms, ~$0.0001
+    ↓
+STAGE 2: Template feature matching (top 10 from 20)
+    Cost: <1ms, $0
+    ↓
+STAGE 3: LLM matching for top 10 candidates
+    Cost: ~2 seconds, ~$0.01
+    ↓
+RESULT: Top 3-5 active guidelines
+```
+
+This cascade reduces the LLM matching calls from 200 to 10 per step while maintaining high recall.
+
+### Impact Assessment: Identifying Critical Decision Points
+
+AutoGuide's offline extraction identifies "critical decision points" in trajectories — steps where the agent's choice had outsized impact on the eventual outcome. The impact assessment function distinguishes steps that merely progressed the task from steps that determined success or failure:
+
+```
+function assess_step_impact(step_idx, trajectory, outcome):
+    // Heuristic 1: Steps immediately before the outcome divergence
+    // Compare this trajectory with other trajectories for the same task
+    // The step where trajectories diverge is high-impact
+    
+    // Heuristic 2: Steps where the agent changed strategy
+    // If the agent switched from one approach to another, the switch
+    // point is a critical decision
+    
+    // Heuristic 3: Steps with irreversible consequences
+    // Actions that cannot be undone (file deletion, API calls with
+    // side effects) are high-impact by nature
+    
+    // Heuristic 4: LLM-based assessment
+    assessment_prompt = [
+        "In the following trajectory, was step " + step_idx + " a",
+        "critical decision point? A critical decision point is a step",
+        "where a different choice would likely have changed the outcome.",
+        "",
+        "Full trajectory: " + trajectory,
+        "Step in question: " + trajectory[step_idx],
+        "Eventual outcome: " + outcome,
+        "",
+        "Rate: HIGH (different choice = different outcome) or",
+        "LOW (routine step, outcome unaffected)"
+    ]
+    
+    return LLM.generate(assessment_prompt)
+```
+
+Guidelines extracted from high-impact decision points are more valuable than those from routine steps. This filtering ensures the guideline library focuses on the decisions that matter.
 
 ---
 
-## 2.5 Context Rot: Real Degradation Curves
+## 2.5 Comparison and Design Choices
 
-Context rot — the phenomenon where agent accuracy degrades as context length grows — is well-documented but poorly quantified in most agent literature. Here are real measurements.
+The four reflection mechanisms differ along several design dimensions. Understanding these dimensions is essential for choosing the right mechanism (or combination of mechanisms) for a given deployment scenario.
 
-### The "Lost in the Middle" Effect
+### Feature Comparison Matrix
 
-The landmark paper "Lost in the Middle" (Liu et al., 2023) established that LLMs have a U-shaped attention curve: they attend strongly to the beginning and end of the context, but attend weakly to the middle.
+| Feature | Reflexion | ExpeL | ERL | AutoGuide |
+|---|---|---|---|---|
+| **Requires contrastive pairs** | No (but requires retry) | Yes (success + failure) | No | No (but needs batch data) |
+| **Cross-task transfer** | No | Yes | Yes | Yes |
+| **State-aware selection** | No | No | Partial (via ranker) | Yes (explicit conditions) |
+| **Single-attempt learning** | No (needs failure first) | No | Yes | No |
+| **Online / incremental** | Yes | No (batch extraction) | Yes | No (batch extraction) |
+| **Memory type (CoALA)** | Episodic | Semantic | Semantic | Semantic |
+| **Retrieval mechanism** | Recency (sliding window) | Similarity + confidence | Embedding + LLM ranking | State matching |
+| **Per-task compute overhead** | Low (retry cost) | Low (at inference) | Medium (ranking) | Medium (state matching) |
+| **Pre-training data needed** | None | 50–100 tasks | None (but needs warm-up) | 50–200 trajectories |
+| **Best benchmark gain** | +22% ALFWorld | +12% cross-domain | +7.8% Gaia2 | +13% WebShop |
 
-For agents, this manifests as:
+### Decision Guide
+
+**Use Reflexion when:**
+- Tasks can be retried cheaply
+- A clear success/failure evaluator exists
+- You need immediate improvement without pre-training
+- The task domain is narrow (same task type repeatedly)
+
+**Use ExpeL when:**
+- You have a batch of training tasks available
+- Cross-task and cross-domain transfer is important
+- You can afford the offline extraction phase
+- The task distribution is diverse but has common underlying patterns
+
+**Use ERL when:**
+- Each task is encountered only once (no retry)
+- You need online, incremental learning
+- The task distribution is broad and unpredictable
+- Contrastive pairs are unavailable
+
+**Use AutoGuide when:**
+- Tasks are multi-step with distinct state configurations
+- The agent's optimal behavior varies significantly across steps
+- Injecting irrelevant guidance is a known failure mode
+- You can invest in offline guideline extraction
+
+### Combining Mechanisms
+
+In production, these mechanisms are not mutually exclusive. A practical combination:
+
+1. **Reflexion** for intra-task retry when failure occurs
+2. **ERL** for online heuristic accumulation from every task
+3. **AutoGuide-style state conditioning** for filtering which heuristics activate at each step
+
+This three-layer approach provides:
+- Immediate within-task improvement (Reflexion)
+- Continuous cross-task learning (ERL)
+- Precision guidance at the step level (AutoGuide-style filtering)
+
+The trade-off is complexity. Each additional mechanism adds code, adds latency, and adds potential failure modes. The engineering recommendation: start with ERL (simplest to integrate, no pre-training required), add Reflexion for tasks where retry is natural, and add state-aware filtering only if context dilution becomes a measurable problem.
+
+### The Reflection Quality Problem
+
+All four mechanisms share a fundamental dependency: the LLM must be able to accurately analyze its own performance. This is a strong assumption that fails in predictable ways:
+
+**Blind spots.** The LLM may not recognize certain types of errors — particularly errors of omission (failing to consider an alternative approach) or errors rooted in the model's training data limitations.
+
+**Hallucinated reflections.** The LLM may generate plausible-sounding reflections that are factually incorrect. "I failed because the API rate limit was exceeded" when actually the API returned a 404 due to a malformed URL. Injecting an incorrect reflection makes the next attempt worse, not better.
+
+**Shallow reflection.** The LLM may identify surface-level symptoms rather than root causes. "I should use a different search query" rather than "I should verify my intermediate answers before building on them." Surface-level reflections help with the immediate task but do not transfer.
+
+**Mitigation strategies:**
+- Include concrete error messages, stack traces, and tool outputs in the reflection prompt — ground the reflection in observable data
+- Use a separate, stronger model for reflection generation when possible
+- Implement reflection validation: after generating a reflection, check whether it is consistent with the trajectory evidence
+- Monitor reflection quality over time; if accumulated reflections are not improving performance, the reflection pipeline needs debugging
+
+### The Broader Pattern
+
+All reflection-based mechanisms share a common pattern:
+
+$$\text{experience} \xrightarrow{\text{LLM extraction}} \text{natural language artifact} \xrightarrow{\text{retrieval}} \text{context augmentation} \xrightarrow{\text{LLM reasoning}} \text{improved action}$$
+
+The variations are in:
+1. What constitutes "experience" (single attempt, contrastive pair, trajectory with state annotations)
+2. What format the "artifact" takes (free-form reflection, insight with confidence, When-Then heuristic, state-conditioned guideline)
+3. How "retrieval" selects artifacts (recency, similarity, LLM ranking, state matching)
+
+Understanding this common pattern allows principled design of new reflection mechanisms for specific deployment needs. The design space is not exhausted by these four papers — it is an active area of research with significant room for innovation.
+
+### Worked Example: Designing a Reflection System for a Production Coding Agent
+
+To illustrate how these design choices compose in practice, consider designing a reflection-based self-evolution system for a production coding agent that assists developers with codebase-specific tasks (bug fixes, feature implementation, refactoring).
+
+**Requirements:**
+- Tasks are one-shot (user asks once, no automatic retry)
+- Each codebase is different; cross-codebase transfer is desirable
+- Some tasks succeed on the first try; learning from successes is important
+- The agent runs thousands of tasks per day across hundreds of codebases
+
+**Design decisions:**
+
+1. **Extraction mechanism: ERL (single-attempt).** Since tasks are one-shot, Reflexion (requires retry) and ExpeL (requires contrastive pairs) are not directly applicable. ERL extracts heuristics from every attempt, success or failure.
+
+2. **Heuristic format: State-conditioned When-Then (AutoGuide-inspired).** Coding tasks have distinct phases (reading code → understanding the bug → writing a fix → running tests → debugging test failures). The optimal heuristic depends on which phase the agent is in. Adding state conditions to ERL's When-Then format enables phase-appropriate guidance.
+
+3. **Retrieval: Two-tier (per-codebase + global).** Maintain two heuristic pools: a per-codebase pool (heuristics specific to this project's conventions, tooling, and quirks) and a global pool (heuristics about general coding patterns). At retrieval time, merge results from both pools, prioritizing per-codebase heuristics.
+
+4. **Memory management: Time-decay + usage tracking.** Heuristics that are frequently selected by the ranker and that correlate with task success accumulate "trust." Heuristics that are never selected or that correlate with failure lose trust. Low-trust heuristics are pruned monthly.
+
+**Resulting architecture:**
 
 ```
-Position in context    Retrieval accuracy    Impact on agents
-──────────────────────────────────────────────────────────────
-First 10% (system)     92-97%               System instructions followed reliably
-Middle 40-60%          65-78%               Tool results from turns 10-30 often "forgotten"
-Last 20%               88-95%               Recent tool results used correctly
+┌─────────────────────────────────────────────────┐
+│              TASK EXECUTION                       │
+│                                                   │
+│  1. Receive task + codebase context               │
+│  2. Determine current phase (via LLM classifier)  │
+│  3. Retrieve heuristics:                          │
+│     a. Top-10 from per-codebase pool (phase-matched) │
+│     b. Top-10 from global pool (phase-matched)    │
+│     c. LLM re-rank to select top-15 combined      │
+│  4. Inject heuristics into system prompt           │
+│  5. Execute task                                  │
+│  6. Record outcome                                │
+└──────────────┬──────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────┐
+│          POST-TASK LEARNING (async)               │
+│                                                   │
+│  1. Extract 1-3 heuristics (ERL-style)            │
+│  2. Add state conditions (phase labels)           │
+│  3. Add to per-codebase pool                      │
+│  4. If heuristic is general enough, also add      │
+│     to global pool                                │
+│  5. Log which heuristics were active during task  │
+│  6. Update trust scores based on outcome          │
+└─────────────────────────────────────────────────┘
 ```
 
-Quantified across 200 agent sessions (SWE-bench Verified tasks, Claude Sonnet):
+This design demonstrates that the four reflection mechanisms are not competing alternatives but composable building blocks. The final system uses ERL's single-attempt extraction, AutoGuide's state conditioning, and a novel two-tier retrieval scheme inspired by the insight that some knowledge is codebase-specific and some is universal.
 
-```
-Context length     Task resolution rate    Avg. reasoning errors per session
-──────────────────────────────────────────────────────────────────────────
-< 20K tokens       62%                     0.8
-20-50K tokens      55%                     1.4
-50-100K tokens     47%                     2.7
-> 100K tokens      38%                     4.1
-```
+### Open Research Questions in Reflection-Based Self-Evolution
 
-The resolution rate drops 10-25% as context grows. Not because the model can't process long contexts — it can. But because the signal-to-noise ratio degrades: old tool results, failed approaches, and stale file contents accumulate, and the model's attention is diluted across all of it.
+Several fundamental questions remain unresolved:
 
-### Specific Failure Modes from Context Rot
+**1. Optimal reflection granularity.** Should reflections be fine-grained (one specific actionable tip) or coarse-grained (a general principle)? The answer likely depends on the task distribution's diversity. Narrow task distributions favor specific reflections; broad distributions favor general principles. No existing work provides a principled method for choosing the granularity.
 
-**Failure mode 1: Stale file reference.**
-The agent reads `auth.ts` in turn 3, edits it in turn 8, reads it again in turn 15 (getting the new version), then edits it in turn 22 — but references line numbers from the turn-3 version, which are now wrong because the turn-8 edit shifted everything.
+**2. When to stop learning.** The heuristic/insight/guideline pool grows over time, but there is a point of diminishing returns. Beyond this point, adding more entries increases retrieval noise without adding new information. Detecting this saturation point automatically is an unsolved problem.
 
-Fix: After any file edit, the agent should re-read the file before the next edit. The system prompt should include: "After editing a file, always re-read it before making another edit to ensure you have the current line numbers."
+**3. Reflection for reasoning errors vs. knowledge gaps.** Existing reflection mechanisms are better at identifying procedural errors ("I should have checked X before doing Y") than knowledge gaps ("I didn't know that API Z existed"). Improving coverage of knowledge-gap reflections requires the agent to recognize what it does not know — a metacognitive capability that current LLMs have limited ability to perform.
 
-**Failure mode 2: Plan amnesia.**
-The agent creates a TODO list in turn 5 with 8 items. By turn 30, the TODO list is deep in the context middle. The agent completes item 6, then writes a summary saying "all tasks complete" — because it's lost attention on the TODO list and doesn't remember items 7 and 8.
+**4. Multi-agent reflection.** When multiple agents collaborate on a task, individual reflection captures only a partial view. Joint reflection — where agents reflect on their interactions and coordination failures — is largely unexplored.
 
-Fix: Use the `todo_write` tool to update TODO status on every turn, which appends the current TODO state to the end of the context (where attention is strongest). Or: periodically re-read the TODO list.
-
-**Failure mode 3: Approach oscillation.**
-Turn 10: "The bug is in the validation layer." Turn 18: "Actually, the bug is in the database query." Turn 25: "Wait, I think it's in the validation layer." All three reasoning traces remain in context, creating ambiguity.
-
-Fix: When the agent changes its hypothesis, it should explicitly state "CORRECTION: My earlier hypothesis that the bug is in the validation layer was wrong. The actual root cause is in the database query." This gives the model a clear signal about which reasoning to follow. Even better: use sub-agents for investigation, so each hypothesis is explored in an isolated context.
+**5. Adversarial robustness.** Reflection-based learning is vulnerable to adversarial environments where task feedback is misleading. An agent that trusts its reflection too readily can be steered toward incorrect behaviors by adversarially constructed failure signals.
 
 ---
 
-## 2.6 Manus's Tool-Explosion Solution: Logits Masking
+### Summary of Part I
 
-When an agent has 40+ tools and the context is approaching limits, a naive approach is to remove tool definitions from the context to free up tokens. Manus discovered this causes two problems:
+Part I has established the foundations for understanding runtime self-evolution:
 
-1. **Cache invalidation.** Removing a tool from the middle of the tool definitions block changes the prefix, invalidating the KV-cache for everything after it.
-2. **Undefined tool references.** If the conversation history contains previous calls to the removed tool, the model encounters references to a tool it doesn't know about, causing confusion.
+**Chapter 1** defined the problem: LLMs are stateless functions that cannot improve across invocations without external mechanisms. Training-time improvement (fine-tuning) is too expensive, too slow, and too rigid to address the long tail of user-specific, deployment-time challenges. The CoALA framework decomposes agent cognition into working memory, episodic memory, semantic memory, and procedural memory — and formalizes learning as the act of writing to long-term memory. The complete taxonomy organizes all known runtime self-evolution mechanisms into six families: reflection-based, memory-based, skill-based, knowledge crystallization, prompt self-optimization, and architecture self-design. The formal problem statement frames runtime self-evolution as optimizing a memory update rule and retrieval function to maximize cumulative task reward under a frozen backbone constraint.
 
-Manus's solution: keep all tool definitions in context (preserving the cache), but use **logits masking** to prevent the model from selecting certain tools.
+**Chapter 2** provided deep technical coverage of the four major reflection-based mechanisms:
+- **Reflexion** pioneered verbal reinforcement learning for same-task retry improvement
+- **ExpeL** introduced cross-task transfer through contrastive insight extraction
+- **ERL** enabled single-attempt learning without contrastive pairs
+- **AutoGuide** added state-aware conditioning for step-level guideline activation
 
-```python
-# Instead of removing tools from the prompt:
-# tools = [t for t in ALL_TOOLS if t["name"] not in disabled_tools]  # WRONG
-
-# Use logits masking to prevent selection:
-response = client.chat.completions.create(
-    model="qwen-72b",
-    messages=messages,
-    tools=ALL_TOOLS,  # All tools always present (cache-friendly)
-    logit_bias={
-        # Token IDs for disabled tool names get -100 bias
-        # This makes the model unable to generate those tool names
-        # while keeping the definitions in context
-        **get_logit_bias_for_disabled_tools(disabled_tools)
-    }
-)
-```
-
-This technique is only available when you control the inference server (e.g., running vLLM). With hosted APIs (OpenAI, Anthropic), you can approximate it with the `tool_choice` parameter:
-
-```python
-# Anthropic: restrict to specific tools
-response = client.messages.create(
-    tools=ALL_TOOLS,
-    tool_choice={"type": "any", "disable_parallel_tool_use": True},
-    # Or specify exactly which tools are allowed:
-    # tool_choice={"type": "tool", "name": "bash"}
-)
-```
-
-The cache benefit: with 19 tool definitions consuming ~1,800 tokens, keeping them stable across all turns saves 1,800 × (number of turns - 1) × cache discount per session. For a 50-turn session, that's ~88,200 cached tokens.
+These mechanisms form the first and most accessible family of runtime self-evolution. They require no additional training, no separate neural networks, and no infrastructure beyond text storage and retrieval. Their limitation is that they learn *what to do* in natural language — they cannot learn *how to do it* in executable form. That capability — learning executable skills, procedures, and architectures — is the subject of the remaining parts of this book.
 
 ---
 
-# Chapter 3: System Prompt Engineering for Agents
-
-## 3.1 The Claude Code System Prompt: Architecture of a Production Prompt
-
-The Claude Code system prompt is the best-documented example of a production agent prompt, thanks to both the leak and Anthropic's subsequent public discussion of the design decisions. It provides a template for engineering agent system prompts.
-
-### The 14,902-Line TypeScript Prompt Builder
-
-The system prompt is not a static string. It's assembled by a TypeScript pipeline that evaluates conditions at session start:
-
-```typescript
-// Simplified reconstruction of the SystemPromptBuilder
-export class SystemPromptBuilder {
-  private parts: PromptPart[] = [];
-  
-  build(ctx: BuildContext): string {
-    // Section 1: Core Identity
-    this.parts.push(this.buildCoreIdentity());
-    
-    // Section 2: Capabilities overview
-    this.parts.push(this.buildCapabilities(ctx.permissionLevel));
-    
-    // Section 3: Tool documentation (varies by permission tier)
-    for (const tool of ctx.enabledTools) {
-      this.parts.push(this.buildToolDoc(tool, ctx.permissionLevel));
-    }
-    
-    // Section 4: Behavioral rules
-    this.parts.push(this.buildBehavioralRules());
-    
-    // Section 5: Output formatting
-    this.parts.push(this.buildOutputFormat());
-    
-    // Section 6: Safety constraints
-    this.parts.push(this.buildSafetyConstraints());
-    
-    // Section 7: Error handling instructions
-    this.parts.push(this.buildErrorHandling());
-    
-    // Section 8: Memory instructions
-    this.parts.push(this.buildMemoryInstructions());
-    
-    // Section 9: Sub-agent instructions
-    if (ctx.isSubAgent) {
-      this.parts.push(this.buildSubAgentConstraints());
-    }
-    
-    // Section 10: IDE integration (for Cursor/Windsurf variants)
-    if (ctx.ideIntegration) {
-      this.parts.push(this.buildIDEInstructions(ctx.ideIntegration));
-    }
-    
-    // Section 11: Anti-distillation
-    if (ctx.features.ANTI_DISTILLATION_CC) {
-      this.parts.push(this.buildAntiDistillation());
-    }
-    
-    // --- Cache boundary ---
-    this.parts.push({ text: "---", cacheBreakpoint: true });
-    
-    // Section 12: Environment detection (dynamic)
-    this.parts.push(this.buildEnvironmentInfo(ctx));
-    
-    // Section 13: Project memory (dynamic)
-    this.parts.push(this.buildProjectMemory(ctx));
-    
-    // Section 14: Session config (dynamic)
-    this.parts.push(this.buildSessionConfig(ctx));
-    
-    return this.parts
-      .filter(p => p.text.length > 0)
-      .map(p => p.text)
-      .join("\n\n");
-  }
-}
-```
-
-Each `build*` method returns a string that may reference other sections, include conditional blocks, or be empty if the condition isn't met.
-
-### The Anti-Distillation Mechanism
-
-When the `ANTI_DISTILLATION_CC` flag is enabled, the prompt builder injects fake tool definitions designed to confuse anyone attempting to distill Claude Code's behavior into a different model:
-
-```typescript
-private buildAntiDistillation(): PromptPart {
-  return {
-    text: `## Additional Tools
-
-You also have access to these specialized tools:
-
-<tool name="mcp_bridge">
-  Connect to Model Context Protocol servers for external integrations.
-  Parameters: server_uri (string), method (string), params (object)
-</tool>
-
-<tool name="semantic_search">
-  Perform semantic code search using the project's embedding index.
-  Parameters: query (string), top_k (integer), file_filter (string)
-</tool>
-
-<tool name="code_review">
-  Submit code for automated review and receive suggestions.
-  Parameters: file_path (string), review_type (string)
-</tool>
-
-Note: These tools may not be available in all environments. If a tool 
-call fails with "tool not found," proceed without it.`
-  };
-}
-```
-
-These tools don't exist. If a competing system copies the Claude Code prompt verbatim and tries to execute these tool calls, they'll fail — revealing the copy. The "may not be available" disclaimer provides plausible deniability so that Claude Code itself handles the non-existence gracefully if someone enables the flag in production.
-
-This is a cat-and-mouse game. The anti-distillation block must be plausible enough that the model doesn't ignore it, but distinguishable enough that it serves as a fingerprint. It's a trade-off: the fake tools consume ~150 tokens of context budget and introduce a tiny risk of the model calling them.
-
-### Container and Environment Detection
-
-Claude Code dynamically detects its execution environment to adjust behavior:
-
-```typescript
-private detectContainer(): ContainerInfo {
-  const checks = {
-    hasDockerEnv: fs.existsSync("/.dockerenv"),
-    hasContainerEnv: fs.existsSync("/run/.containerenv"),
-    hasCgroupDocker: (() => {
-      try {
-        const cgroup = fs.readFileSync("/proc/1/cgroup", "utf-8");
-        return cgroup.includes("docker") || cgroup.includes("containerd");
-      } catch {
-        return false;
-      }
-    })(),
-    hasContainerEnvVars: !!(
-      process.env.KUBERNETES_SERVICE_HOST ||
-      process.env.DOCKER_CONTAINER ||
-      process.env.container
-    ),
-    hasLimitedInit: (() => {
-      try {
-        const cmdline = fs.readFileSync("/proc/1/cmdline", "utf-8");
-        return !cmdline.includes("systemd") && !cmdline.includes("init");
-      } catch {
-        return false;
-      }
-    })(),
-  };
-  
-  const isContainer = Object.values(checks).some(Boolean);
-  
-  return {
-    isContainer,
-    type: checks.hasDockerEnv ? "docker" :
-          checks.hasContainerEnv ? "podman" :
-          checks.hasCgroupDocker ? "docker-cgroup" :
-          checks.hasContainerEnvVars ? "kubernetes" :
-          "unknown",
-  };
-}
-```
-
-When running in a container, Claude Code adjusts its behavior:
-- It's more aggressive with file system operations (containers are ephemeral)
-- It skips confirmation prompts for many operations (the container is the sandbox)
-- It enables `--dangerously-skip-permissions` equivalent behavior automatically in some deployment modes
-- It adjusts path handling (container paths may differ from host paths)
-
-This is injected into the dynamic section of the prompt:
-
-```
-## Environment Information
-Operating System: Linux 6.1.0 (Ubuntu 24.04)
-Working Directory: /workspace
-Container: Yes (Docker)
-Shell: /bin/bash
-Node.js: v22.12.0
-Python: 3.12.4
-Git: repository detected, branch: main
-```
-
----
-
-## 3.2 CLAUDE.md and Skills Discovery
-
-Claude Code loads project-specific context from CLAUDE.md files with a hierarchical search:
-
-```
-Search locations (in order, all loaded if present):
-1. ~/.claude/CLAUDE.md                  (user-global preferences)
-2. /workspace/CLAUDE.md                 (project root — version-controlled)
-3. /workspace/.claude/CLAUDE.md         (alternative location)
-4. /workspace/packages/api/CLAUDE.md    (package-level, if working in monorepo)
-5. /workspace/.cursor/rules             (Cursor-specific rules file)
-6. /workspace/AGENTS.md                 (alternative convention)
-```
-
-Each file is loaded with a truncation budget:
-
-```
-Per-file limit:    4,096 tokens
-Total limit:      12,288 tokens (across all loaded files)
-```
-
-If the combined content exceeds 12,288 tokens, files are prioritized:
-1. Nearest to current working directory (highest priority)
-2. Project root
-3. User global (lowest priority)
-
-The loading code:
-
-```typescript
-function loadProjectMemory(workspacePath: string): string {
-  const sources: {path: string, priority: number}[] = [];
-  
-  const candidates = [
-    { rel: "CLAUDE.md", priority: 10 },
-    { rel: ".claude/CLAUDE.md", priority: 9 },
-    { rel: "AGENTS.md", priority: 8 },
-    { rel: ".cursor/rules", priority: 7 },
-  ];
-  
-  for (const candidate of candidates) {
-    const fullPath = path.join(workspacePath, candidate.rel);
-    if (fs.existsSync(fullPath)) {
-      sources.push({ path: fullPath, priority: candidate.priority });
-    }
-  }
-  
-  // Also check user-global
-  const globalClaudeMd = path.join(os.homedir(), ".claude", "CLAUDE.md");
-  if (fs.existsSync(globalClaudeMd)) {
-    sources.push({ path: globalClaudeMd, priority: 1 });
-  }
-  
-  // Sort by priority (highest first)
-  sources.sort((a, b) => b.priority - a.priority);
-  
-  let totalTokens = 0;
-  const MAX_TOTAL = 12_288;
-  const MAX_PER_FILE = 4_096;
-  const parts: string[] = [];
-  
-  for (const source of sources) {
-    if (totalTokens >= MAX_TOTAL) break;
-    
-    let content = fs.readFileSync(source.path, "utf-8");
-    let tokens = estimateTokens(content);
-    
-    if (tokens > MAX_PER_FILE) {
-      content = truncateToTokens(content, MAX_PER_FILE);
-      tokens = MAX_PER_FILE;
-    }
-    
-    if (totalTokens + tokens > MAX_TOTAL) {
-      content = truncateToTokens(content, MAX_TOTAL - totalTokens);
-      tokens = MAX_TOTAL - totalTokens;
-    }
-    
-    parts.push(`### From ${path.relative(workspacePath, source.path)}\n${content}`);
-    totalTokens += tokens;
-  }
-  
-  return parts.join("\n\n---\n\n");
-}
-```
-
-### What Goes in CLAUDE.md
-
-The most effective CLAUDE.md files contain:
-
-```markdown
-# CLAUDE.md
-
-## Build & Test Commands
-- `pnpm test` — run all tests
-- `pnpm test:unit` — unit tests only (fast, <10s)
-- `pnpm lint` — ESLint + Prettier check
-- `pnpm typecheck` — TypeScript type checking
-- `pnpm dev` — start dev server on port 3000
-
-## Architecture
-- Next.js 14 App Router
-- Prisma ORM with PostgreSQL
-- Authentication: NextAuth.js v5 with GitHub + Google providers
-- State management: Zustand (client), React Query (server)
-- Styling: Tailwind CSS + shadcn/ui components
-
-## Coding Conventions
-- Use server components by default; add "use client" only when needed
-- All API route handlers must validate input with zod
-- Use `invariant()` instead of throwing raw errors in business logic
-- Database queries go through the repository pattern (src/repositories/)
-- Tests use Vitest, NOT Jest
-
-## Known Gotchas
-- The WebSocket connection drops on Vercel deployment — use polling fallback
-- `prisma generate` must run before `pnpm typecheck`
-- The legacy billing module (src/billing/) must not be modified without approval
-- HMR breaks when editing files in src/generated/ — restart the dev server
-```
-
-This is roughly 350 tokens. Efficient, actionable, and directly usable by the agent. Contrast with CLAUDE.md files that waste their budget on project history, philosophy, or repeating what's in the README.
-
----
-
-## 3.3 The Output Token Escalation Protocol
-
-When Claude Code's response is truncated by `max_tokens`, it follows a three-step escalation:
-
-**Step 1: Retry with higher max_tokens.**
-
-If the initial `max_tokens` was 16,000 and the response was truncated, retry with 32,000 or the model's maximum output limit.
-
-**Step 2: Compact context to free up total token budget.**
-
-If the total tokens (input + output) would exceed the model's context window, compact the input context to make room for a larger output.
-
-**Step 3: Inject a conciseness instruction.**
-
-If compaction isn't sufficient, inject a message before the final assistant turn:
-
-```json
-{
-  "role": "user",
-  "content": "Your previous response was truncated due to length limits. Please continue, but be more concise. Focus on the essential changes and omit explanatory text."
-}
-```
-
-This three-step escalation handles the common scenario where an agent needs to produce a long code block or detailed multi-file edit that exceeds the default output budget. Without it, the agent would produce truncated (and often broken) code.
-
-### The hasAttemptedReactiveCompact Bug
-
-This is worth a dedicated discussion because it illustrates a class of bugs unique to agent systems.
-
-The original code:
-
-```typescript
-let hasAttemptedReactiveCompact = false;
-
-while (true) {
-  try {
-    response = await callAPI(messages);
-  } catch (error) {
-    if (isContextLengthError(error)) {
-      if (hasAttemptedReactiveCompact) {
-        throw error; // Give up
-      }
-      hasAttemptedReactiveCompact = true;
-      messages = await compact(messages);
-      continue;
-    }
-    throw error;
-  }
-  
-  // Process response...
-  // BUG: hasAttemptedReactiveCompact is never reset to false
-}
-```
-
-The bug: `hasAttemptedReactiveCompact` is set to `true` on the first context-length error and compaction, but never set back to `false` after a successful turn. This means:
-
-1. Turn 15: Context too large → compact → success → `hasAttemptedReactiveCompact = true`
-2. Turns 16-45: Work fine, context grows again
-3. Turn 46: Context too large again → `hasAttemptedReactiveCompact` is still `true` → throws immediately
-
-The fix is a single line:
-
-```typescript
-// After successful API call:
-response = await callAPI(messages);
-hasAttemptedReactiveCompact = false;  // Reset on success
-```
-
-This bug burned significant API costs before it was caught. Each affected session would hit the hard failure at turn 46, the user would restart, and the new session would repeat the same pattern. Sessions that should have cost $2 were costing $4-6 because of restarts.
-
-The lesson: agent loops have state that persists across iterations. Any boolean flag that's set in an error handler must be considered for reset in the success path. This is analogous to the classic "forgot to clear the error flag" bug in embedded systems — but in agents, the cost is measured in API dollars, not undefined behavior.
-
----
-
-## 3.4 The Permission Model in Practice
-
-Claude Code's three-tier permission model maps to a configuration that users control:
-
-### Permission Configuration
-
-```jsonc
-// ~/.claude/settings.json
-{
-  "permissions": {
-    // Default tier: WorkspaceWrite
-    "defaultLevel": "WorkspaceWrite",
-    
-    // Specific tool overrides
-    "tools": {
-      "bash": {
-        // Allow these commands without prompting
-        "allowlist": [
-          "npm test*",
-          "npm run lint*",
-          "npx tsc --noEmit",
-          "git status",
-          "git diff*",
-          "git log*",
-          "git add *",
-          "git commit *",
-          "python -m pytest*",
-          "cargo test*",
-          "ls *",
-          "cat *",
-          "head *",
-          "tail *",
-          "wc *",
-          "find *",
-          "grep *",
-          "rg *"
-        ],
-        // Block these commands entirely
-        "denylist": [
-          "rm -rf /",
-          "sudo *",
-          "curl * | bash",
-          "wget * | bash",
-          "chmod 777 *"
-        ]
-      }
-    },
-    
-    // Auto-approve all operations (equivalent to --dangerously-skip-permissions)
-    "dangerouslySkipPermissions": false
-  }
-}
-```
-
-### Runtime Permission Evaluation
-
-```typescript
-async function evaluatePermission(
-  tool: ToolCall,
-  config: PermissionConfig
-): Promise<PermissionDecision> {
-  
-  // ReadOnly tools: always allowed
-  if (READ_ONLY_TOOLS.includes(tool.name)) {
-    return { allowed: true, reason: "read-only tool" };
-  }
-  
-  // If dangerous mode is on, allow everything
-  if (config.dangerouslySkipPermissions) {
-    return { allowed: true, reason: "dangerous mode" };
-  }
-  
-  // Check tool-specific rules
-  if (tool.name === "bash") {
-    const command = tool.input.command;
-    
-    // Check denylist first
-    for (const pattern of config.tools.bash.denylist) {
-      if (matchGlob(command, pattern)) {
-        return { allowed: false, reason: `Blocked by denylist: ${pattern}` };
-      }
-    }
-    
-    // Check allowlist
-    for (const pattern of config.tools.bash.allowlist) {
-      if (matchGlob(command, pattern)) {
-        return { allowed: true, reason: `Matched allowlist: ${pattern}` };
-      }
-    }
-    
-    // Default: prompt user
-    return { allowed: "prompt", reason: "Not in allowlist" };
-  }
-  
-  // WorkspaceWrite tools: allowed if permission level is sufficient
-  if (WORKSPACE_WRITE_TOOLS.includes(tool.name)) {
-    if (config.defaultLevel === "WorkspaceWrite" || config.defaultLevel === "FullAccess") {
-      return { allowed: true, reason: "workspace write permitted" };
-    }
-    return { allowed: "prompt", reason: "Workspace write not permitted" };
-  }
-  
-  return { allowed: "prompt", reason: "Unknown tool tier" };
-}
-```
-
-### How This Looks at the Terminal
-
-When Claude Code hits a permission gate:
-
-```
-Claude Code wants to execute:
-  bash: npm install jsonwebtoken @types/jsonwebtoken
-
-Allow? [y]es / [n]o / [a]lways allow this command pattern
-> a
-
-✓ Added "npm install *" to your allowlist.
-```
-
-The "always" option adds the pattern to the allowlist in `~/.claude/settings.json`, so the user is only asked once per command pattern. Over time, the allowlist grows to cover the user's common workflows, and permission prompts become rare.
-
----
-
-## 3.5 Error Recovery Patterns
-
-Production agent system prompts must handle three classes of errors, each with a different recovery strategy.
-
-### Class 1: Tool Execution Errors
-
-The tool itself fails — file not found, command exits with non-zero, network timeout.
-
-```
-Prompt instruction:
-  When a tool call returns an error:
-  1. Read the error message carefully.
-  2. Determine if the error is recoverable (wrong path → try correct path) 
-     or informational (file doesn't exist → the file hasn't been created yet).
-  3. Try at least 2 alternative approaches before asking for help.
-  4. Do not repeat the exact same tool call that just failed.
-```
-
-### Class 2: Context-Length Errors
-
-The API returns a 400 error because the request exceeds the model's context window.
-
-This is handled at the loop level (not the prompt level) via reactive compaction. The user never sees this error. The system prompt doesn't need to mention it because it's handled before the model is invoked.
-
-### Class 3: Model Reasoning Errors
-
-The model produces valid tool calls that don't achieve the intended goal — writing incorrect code, searching in the wrong directory, misunderstanding the task.
-
-```
-Prompt instruction:
-  After making changes:
-  1. Always verify your work. Run tests. Check the output.
-  2. If tests fail, read the failure message carefully. 
-     Don't re-apply the same fix.
-  3. If you've tried 3 approaches and none work, step back and 
-     re-read the original error/requirement. You may be solving 
-     the wrong problem.
-  4. Use todo_write to track what you've tried and what's left.
-```
-
-### The 3-Retry Pattern
-
-Across Claude Code, Codex, and Cursor, a consistent pattern emerges: the system prompt instructs the agent to try 3 different approaches before declaring failure. This number isn't arbitrary — it balances:
-
-- **Too few (1-2):** The agent gives up on problems that have simple fixes that weren't the first thing tried.
-- **Too many (5+):** The agent burns tokens on approaches that are increasingly unlikely to work, often regressing by undoing previous progress.
-
-Three retries gives the agent enough attempts to try the obvious fix, one alternative, and a fundamentally different approach. If all three fail, the problem likely requires human judgment.
-
----
-
-## 3.6 Practical System Prompt Template for Production Agents
-
-Here is a complete, production-tested system prompt template. This incorporates the patterns discussed above:
-
-```
-You are an autonomous coding agent. You operate by reading code, making 
-targeted changes, and verifying your work through tests.
-
-## Core Workflow
-For every task, follow this cycle:
-1. UNDERSTAND: Read relevant files and understand the current state.
-2. PLAN: If the task has 3+ steps, create a TODO list.
-3. IMPLEMENT: Make targeted changes using edit_file (not full rewrites).
-4. VERIFY: Run tests and check for errors after every change.
-5. ITERATE: If verification fails, debug and fix. Try up to 3 approaches.
-
-## Tool Usage Rules
-- Always read a file before editing it.
-- Use edit_file with the smallest unique old_string that identifies the edit 
-  location. Include 2-3 lines of context above and below the change point.
-- When old_string is not unique, include more surrounding context.
-- For shell commands, prefer specific commands over broad ones:
-  GOOD: npm test -- --grep "auth"
-  BAD:  npm test (runs everything, slow, noisy output)
-- Truncate tool outputs mentally — if a file is 500 lines, you don't need 
-  to re-read all 500 lines after a small edit. Read just the changed region.
-
-## Output Style
-- Be concise. Don't narrate what you're about to do — just do it.
-- After completing work, give a 1-3 sentence summary of what changed and why.
-- Use backticks for file paths and code identifiers.
-- Don't use emojis.
-
-## Error Handling
-- If a tool call fails, read the error and try a different approach.
-- If tests fail after your change, do not revert blindly. Read the failure, 
-  understand it, and fix forward.
-- If you've tried 3 different approaches and none work, explain what you 
-  tried and what you think the blocker is.
-
-## Safety
-- Never modify files outside the project directory.
-- Never run destructive shell commands (rm -rf, DROP TABLE, etc.) 
-  without explicit user instruction.
-- Never commit secrets, credentials, or API keys.
-- If uncertain about a destructive operation, explain what you want to do 
-  and ask for confirmation.
-```
-
-This is ~350 tokens. Notice what's absent: no philosophical framing, no "you are a helpful assistant" boilerplate, no lengthy tool descriptions (those go in the tool schemas), no examples (those go in the few-shot section). Every sentence is an actionable instruction.
-
----
-
-## 3.7 The Full Context Assembly: From Components to API Call
-
-Putting it all together, here is the exact context assembly pipeline for a production agent:
-
-```python
-def assemble_context(
-    session: AgentSession,
-    new_tool_results: list[dict] | None = None
-) -> dict:
-    """Assemble the full API request payload for one agent turn."""
-    
-    # 1. System prompt: static + dynamic sections
-    system_parts = []
-    
-    # Static section (cached)
-    system_parts.append({
-        "type": "text",
-        "text": STATIC_SYSTEM_PROMPT,  # ~350 tokens, never changes
-        "cache_control": {"type": "ephemeral"}
-    })
-    
-    # Dynamic section (per-session)
-    dynamic = build_dynamic_section(session)
-    if dynamic:
-        system_parts.append({
-            "type": "text",
-            "text": dynamic  # ~100-4000 tokens, varies per session
-        })
-    
-    # 2. Messages: conversation history
-    messages = list(session.messages)  # Copy to avoid mutation
-    
-    # Append new tool results if any
-    if new_tool_results:
-        messages.append({"role": "user", "content": new_tool_results})
-    
-    # 3. Check token budget and compact if needed
-    total_tokens = estimate_tokens_for_request(system_parts, TOOLS, messages)
-    
-    if total_tokens > COMPACT_THRESHOLD:
-        messages = compact_messages(
-            messages, 
-            target_tokens=TARGET_AFTER_COMPACT,
-            preserve_first=True,
-            preserve_last_n=6
-        )
-    
-    # 4. Assemble the API request
-    request = {
-        "model": session.model,
-        "max_tokens": 16000,
-        "system": system_parts,
-        "tools": TOOLS,  # Static tool definitions, ~1800 tokens
-        "messages": messages,
-    }
-    
-    return request
-
-
-def build_dynamic_section(session: AgentSession) -> str:
-    parts = []
-    
-    # Environment info
-    parts.append(f"Working directory: {session.workspace_path}")
-    parts.append(f"OS: {platform.system()} {platform.release()}")
-    parts.append(f"Shell: {os.environ.get('SHELL', '/bin/bash')}")
-    
-    # Container detection
-    if is_container():
-        parts.append(f"Container: Yes ({detect_container_type()})")
-    
-    # Project memory (CLAUDE.md / AGENTS.md)
-    memory = load_project_memory(session.workspace_path)
-    if memory:
-        parts.append(f"\n## Project Memory\n{memory}")
-    
-    return "\n".join(parts)
-```
-
-### The Full Token Budget at Assembly Time
-
-For a mid-session turn (turn 25 of a debugging task):
-
-```
-Component                              Tokens    Cached?
-──────────────────────────────────────────────────────────
-Static system prompt                     350     Yes
-Tool definitions (19 tools)            1,800     Yes
-Dynamic section (env + CLAUDE.md)        500     No
-Message 1: user goal                     120     Yes (prefix)
-Messages 2-20: prior tool calls       22,000     Yes (prefix)
-Messages 21-24: recent tool calls       5,500     Yes (prefix, recent additions)
-Message 25: new tool result             1,200     No (new)
-──────────────────────────────────────────────────────────
-Total input:                          31,470
-  Cached:                             29,770     (94.6% cache rate)
-  New:                                 1,700
-  
-Cost for this turn:
-  Cached: 29,770 × $0.30/MTok = $0.009
-  New:     1,700 × $3.00/MTok = $0.005
-  Output:    ~80 × $15.00/MTok = $0.001
-  Total:                         $0.015
-```
-
-Compare to the same turn without caching: 31,470 × $3.00/MTok = $0.094. Caching provides a 6x cost reduction on this turn. Over a full session, the cumulative savings are even greater because earlier turns have a higher cache rate.
-
----
-
-## 3.8 Production Failure Modes and Their Fixes
-
-This section catalogs specific failure modes encountered in production agent systems, with their root causes and fixes. Each is drawn from real incidents.
-
-### Failure: Non-Deterministic JSON Serialization Kills Cache
-
-**Symptom:** KV-cache hit rate is 10-15% when it should be 85%+. Agent sessions cost 5-8x expected.
-
-**Root cause:** Tool results are serialized with `json.dumps()` without `sort_keys=True`. Different Python code paths construct the same logical dict with different key insertion orders. The resulting JSON strings differ, breaking the prefix match at the first differing byte.
-
-**Diagnosis:**
-```python
-# Log adjacent turns' message hashes
-for i, msg in enumerate(messages):
-    h = hashlib.md5(json.dumps(msg, sort_keys=True).encode()).hexdigest()[:8]
-    h_raw = hashlib.md5(json.dumps(msg).encode()).hexdigest()[:8]
-    if h != h_raw:
-        print(f"Turn {i}: sorted={h} unsorted={h_raw} — KEY ORDERING DIFFERS")
-```
-
-**Fix:**
-```python
-# In all message serialization:
-json.dumps(tool_result, sort_keys=True, ensure_ascii=False)
-```
-
-### Failure: System Prompt Timestamp Invalidates Entire Cache
-
-**Symptom:** Zero cache reuse. Every turn pays full input cost.
-
-**Root cause:** `f"Current time: {datetime.now()}"` is the first line of the system prompt. It changes every second.
-
-**Fix:** Move dynamic content after the cache boundary. Or remove the timestamp entirely — most agent tasks don't need it.
-
-### Failure: Tool Output Explosion Fills Context Window
-
-**Symptom:** Agent fails after 8-10 turns with context-length error. Expected to run 30+ turns.
-
-**Root cause:** `bash("find / -name '*.py'")` returns 50,000 characters of output, which consumes 12,500 tokens of context. Three such commands exhaust the history budget.
-
-**Fix:** Tool output truncation at the source:
-
-```python
-MAX_TOOL_OUTPUT = 30_000  # characters
-
-def truncate_output(output: str) -> str:
-    if len(output) <= MAX_TOOL_OUTPUT:
-        return output
-    half = MAX_TOOL_OUTPUT // 2
-    omitted = len(output) - MAX_TOOL_OUTPUT
-    return (
-        output[:half] + 
-        f"\n\n[...{omitted:,} characters omitted...]\n\n" + 
-        output[-half:]
-    )
-```
-
-Additionally, the system prompt should instruct the agent to use targeted commands: `find src/ -name '*.py'` instead of `find / -name '*.py'`.
-
-### Failure: Agent Edits File With Stale Line Numbers
-
-**Symptom:** `edit_file` applies the change to the wrong location, or fails because `old_string` doesn't match.
-
-**Root cause:** The agent read the file 10 turns ago, made an edit 5 turns ago (which shifted line numbers), and is now trying to edit based on the original line numbers.
-
-**Fix:** Add to system prompt:
-```
-After editing a file, if you need to make another edit to the same file, 
-re-read it first. Line numbers change after edits.
-```
-
-And implement server-side validation:
-
-```python
-def validate_edit(file_path: str, old_string: str) -> tuple[bool, str]:
-    content = Path(file_path).read_text()
-    count = content.count(old_string)
-    if count == 0:
-        return False, f"old_string not found in {file_path}. The file may have changed. Re-read it."
-    if count > 1:
-        return False, f"old_string matches {count} locations. Include more context to disambiguate."
-    return True, "OK"
-```
-
-### Failure: Compaction Loses Critical Context
-
-**Symptom:** After compaction, the agent "forgets" the original task or key discoveries, and either re-does work or goes off-track.
-
-**Root cause:** Naive compaction (truncate oldest turns) removes the turns where the agent identified the root cause of a bug, so after compaction it re-investigates from scratch.
-
-**Fix:** Importance-weighted compaction that always preserves:
-1. The first message (original task)
-2. Messages containing TODO list updates (the plan)
-3. Messages containing error messages (key discoveries)
-4. The last 6-8 messages (recent context)
-
-```python
-def should_preserve(msg: dict, index: int, total: int) -> bool:
-    if index == 0:
-        return True  # First message (original task)
-    if index >= total - 8:
-        return True  # Recent messages
-    
-    content = str(msg.get("content", ""))
-    if "todo" in content.lower():
-        return True  # Plan updates
-    if "error" in content.lower() and len(content) < 2000:
-        return True  # Error messages (but not huge error dumps)
-    
-    return False
-```
-
-### Failure: Agent Gets Stuck in Edit-Test-Fail Loop
-
-**Symptom:** Agent makes an edit, runs tests, sees failure, makes a slightly different edit, runs tests, sees same failure, makes another slightly different edit... for 30+ turns.
-
-**Root cause:** The model is making surface-level fixes without understanding the root cause. Each edit addresses a symptom, not the underlying problem.
-
-**Fix:** Repetition detection + strategy-shift injection:
-
-```python
-consecutive_test_failures = 0
-
-for turn in range(MAX_TURNS):
-    # ... execute turn ...
-    
-    if last_tool_was_test and test_failed:
-        consecutive_test_failures += 1
-        
-        if consecutive_test_failures >= 3:
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Tests have failed {consecutive_test_failures} times in a row. "
-                    "Stop making changes. Instead:\n"
-                    "1. Re-read the original error message.\n"
-                    "2. Add debug logging to identify the exact point of failure.\n"
-                    "3. Re-examine your assumptions about what the code does.\n"
-                    "Do NOT make another edit until you have new information."
-                )
-            })
-    else:
-        consecutive_test_failures = 0
-```
-
----
-
-## 3.9 Cost Engineering: Real Numbers for Real Sessions
-
-### Per-Turn Cost Breakdown
-
-For Claude Sonnet 4 (as of early 2026):
-
-```
-Input tokens (uncached):   $3.00 / million
-Input tokens (cached):     $0.30 / million
-Output tokens:            $15.00 / million
-
-Example: Turn 30 of a debugging session
-  Input:  45,000 tokens total
-    Cached: 42,000 (93.3%)  → $0.0126
-    New:     3,000 (6.7%)   → $0.0090
-  Output:    150 tokens      → $0.0023
-  
-  Turn cost: $0.024
-```
-
-### Per-Session Cost Profile
-
-```
-Light task (5 turns, bug fix):
-  Total input:    25,000 tokens (cumulative)
-  Total output:      800 tokens
-  Cache rate:     78%
-  Total cost:     $0.06 - $0.10
-
-Medium task (20 turns, feature implementation):
-  Total input:   450,000 tokens (cumulative)
-  Total output:    4,000 tokens
-  Cache rate:     88%
-  Total cost:     $0.25 - $0.50
-
-Heavy task (50 turns, refactoring with debugging):
-  Total input: 2,500,000 tokens (cumulative)
-  Total output:   12,000 tokens
-  Cache rate:     92%
-  Total cost:     $1.00 - $2.50
-
-Pathological (200 turns, stuck in loops):
-  Total input: 15,000,000 tokens (cumulative)
-  Total output:   50,000 tokens
-  Cache rate:     85%
-  Total cost:     $6.00 - $15.00
-```
-
-### Cost Optimization Checklist
-
-In order of impact:
-
-1. **Fix KV-cache stability** (10x impact on input cost). Verify with `cache_read_input_tokens` in API response.
-2. **Truncate tool outputs** (2-5x impact). Cap at 30K characters, truncate from middle.
-3. **Compact proactively** (2-3x impact). Don't wait for context-length errors.
-4. **Use appropriate models** (2-4x impact). Use fast/cheap models for simple tasks, expensive models for complex ones.
-5. **Reduce output verbosity** (1.2-1.5x impact). "Don't explain, just do" in system prompt.
-
-### The Model Selection Decision
-
-For multi-model agent architectures:
-
-```python
-def select_model(task_complexity: str, turn_count: int) -> str:
-    if task_complexity == "simple" and turn_count < 5:
-        return "claude-3-5-haiku-20241022"  # $0.25/$1.25 per MTok
-    elif task_complexity == "medium":
-        return "claude-sonnet-4-20250514"    # $3.00/$15.00 per MTok
-    elif task_complexity == "hard" or turn_count > 30:
-        return "claude-sonnet-4-20250514"    # Same, with extended thinking
-    else:
-        return "claude-sonnet-4-20250514"    # Default
-```
-
-OpenAI's equivalent:
-- Simple: `gpt-4.1-mini` ($0.40/$1.60 per MTok)
-- Medium: `gpt-4.1` ($2.00/$8.00 per MTok)
-- Complex: `o3-mini` ($1.10/$4.40 per MTok, includes reasoning tokens)
-
-The cost difference between models is 5-15x. Using the right model for the task is the second-highest-leverage cost optimization after caching.
-
----
-
-## Summary: The Practitioner's Foundations
-
-Part I establishes the engineering foundations for building production agent systems:
-
-1. **The agent loop is an HTTP POST in a while loop.** Every production agent — Codex, Claude Code, Cursor — is a `while(tool_use)` loop around an API call. The sophistication is in what goes *into* the loop, not the loop itself.
-
-2. **KV-cache optimization is the single highest-leverage technique.** Stable prefixes, append-only context, deterministic serialization, and explicit cache boundaries can reduce costs by 6-10x. Non-deterministic JSON key ordering alone can drop cache hit rates from 95% to 12%.
-
-3. **Token budgeting is memory management.** A 128K context window is a fixed resource. Allocate 3% to system prompt, 2% to tools, 3% to few-shot, 30% to working documents, 30% to history, 32% to output headroom. Rebalance dynamically based on task type.
-
-4. **Context rot is measurable and preventable.** Agent accuracy drops 10-25% as context grows past 50K tokens. Mitigate with proactive compaction, importance-weighted retention, sub-agent isolation, and TODO-list anchoring.
-
-5. **Termination is the hardest problem.** Five signals — model stop, hard limits, token budget, repetition detection, and verification — must work together. Verification before termination (run tests, check lint) improves resolution rates by 10-15 percentage points.
-
-6. **System prompts are programs, not prose.** The Claude Code prompt is 14,902 lines of TypeScript that assembles 40+ sections conditionally. Every sentence should be an actionable instruction, not a description.
-
-7. **Real failures have real fixes.** Stale line numbers, tool output explosions, edit-test-fail loops, compaction amnesia — each has a specific, implementable solution. The difference between a working agent and a broken one is usually 5-10 specific engineering decisions, not a fundamental architecture change.
-
-Part II builds on these foundations with tool design patterns, multi-agent orchestration, and the infrastructure required to run agents at scale.
+*Next: Part II covers Memory-Based and Skill-Based Self-Evolution — how agents build persistent, executable knowledge that compounds across sessions.*
