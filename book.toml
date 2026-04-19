@@ -1,29 +1,20 @@
 [book]
-title = "The Self-Evolving Agent"
-authors = ["Atum <https://atum.li>"]
-description = "How top-tier production agents — Claude Code, Cursor, Hermes, OpenClaw, Manus, Codex — actually get better through use. Extracted from leaked source, open repos, and shipped products."
+authors = ["Atum"]
 language = "en"
-multilingual = false
 src = "src"
-
-[build]
-build-dir = "_book"
-create-missing = false
+title = "The Self-Evolving Agent"
+description = "How top-tier production agents — Claude Code, Cursor, Hermes, OpenClaw, Manus, Codex — actually get better through use. Extracted from leaked source, open repos, and shipped products."
 
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/A7um/AgentEnvolveBook"
-git-repository-icon = "fa-github"
-edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/{path}"
+edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/src/{path}"
 site-url = "/AgentEnvolveBook/"
-
-[output.html.fold]
-enable = true
-level = 1
+print = { enable = false }
+additional-css = ["book-zoom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "book-zoom.js"]
 
 [output.html.search]
-enable = true
-limit-results = 30
-use-boolean-and = true
-boost-title = 2
+enable = false
+
