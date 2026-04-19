@@ -395,6 +395,44 @@ Each promotion target serves a different function in the agent's cognitive archi
 
 The separation matters because different files have different update frequencies and different blast radii when they contain errors. A bad entry in TOOLS.md causes tool-call failures for specific tools. A bad entry in SOUL.md causes reasoning degradation across all tasks. The taxonomy limits the damage from any single bad learning.
 
+The following diagram illustrates how raw experience flows through the capture-evaluate-promote pipeline and ultimately reaches persistent memory:
+
+```mermaid
+graph TD
+    EXP["Agent encounters<br/>task outcome"]
+    CAPTURE[".learnings/<br/>LEARNINGS.md<br/>ERRORS.md<br/>FEATURE_REQUESTS.md"]
+    EVAL{"3+ related<br/>issues<br/>accumulated?"}
+    WAIT["Wait for<br/>more evidence"]
+    
+    subgraph "Promotion Targets"
+        AGENTS["AGENTS.md<br/>Workflow improvements"]
+        TOOLS["TOOLS.md<br/>Tool gotchas"]
+        SOUL["SOUL.md<br/>Behavioral patterns"]
+        CLAUDE["CLAUDE.md<br/>Universal learnings"]
+    end
+    
+    PERSIST["Loaded in EVERY<br/>future session"]
+    
+    EXP --> CAPTURE
+    CAPTURE --> EVAL
+    EVAL -->|No| WAIT
+    EVAL -->|Yes| AGENTS
+    EVAL -->|Yes| TOOLS
+    EVAL -->|Yes| SOUL
+    EVAL -->|Yes| CLAUDE
+    AGENTS --> PERSIST
+    TOOLS --> PERSIST
+    SOUL --> PERSIST
+    CLAUDE --> PERSIST
+    
+    style CAPTURE fill:#ffa94d
+    style PERSIST fill:#37b24d,color:#fff
+    style AGENTS fill:#4dabf7,color:#fff
+    style TOOLS fill:#4dabf7,color:#fff
+    style SOUL fill:#4dabf7,color:#fff
+    style CLAUDE fill:#4dabf7,color:#fff
+```
+
 #### Heartbeat-Driven Promotion
 
 Learnings don't get promoted immediately. They accumulate in `.learnings/` as raw entries, and a periodic *heartbeat* process scans for entries that have been validated multiple times:
@@ -559,6 +597,28 @@ def verify_integrity(manifest_path: str, managed_files: list[str]) -> list[str]:
 ```
 
 These five mitigations are not theoretical. They were developed in response to actual incidents reported by OpenClaw users during the skill's beta period (November 2025 — January 2026). The rate-limiting mitigation, in particular, was added after an early adopter's agent entered a self-modification loop that rewrote SOUL.md 47 times in one hour, progressively making the agent more verbose and less capable.
+
+The complete self-improving-agent evolution cycle, from gap perception through solidification, is summarized below:
+
+```mermaid
+graph TD
+    PERCEIVE["1. Perceive Gap<br/>Task failures, repeated errors,<br/>user feedback, slow tasks"]
+    SEARCH["2. Search Solutions<br/>Engineering blogs, GitHub,<br/>SkillHub/ClawHub"]
+    DESIGN["3. Design Experiment<br/>Hypothesis: If X then Y<br/>improves by Z%"]
+    RUN["4. Run Experiment<br/>Execute improvement,<br/>measure before/after"]
+    SELECT{"5. Select Winner<br/>Improvement ><br/>threshold?"}
+    SOLIDIFY["6. Solidify<br/>Promote to AGENTS.md /<br/>TOOLS.md / SOUL.md"]
+    RETRY["Try alternative<br/>approach"]
+    
+    PERCEIVE --> SEARCH --> DESIGN --> RUN --> SELECT
+    SELECT -->|Yes| SOLIDIFY
+    SELECT -->|No| RETRY --> SEARCH
+    SOLIDIFY -->|"Next iteration"| PERCEIVE
+    
+    style PERCEIVE fill:#ff6b6b,color:#fff
+    style SOLIDIFY fill:#37b24d,color:#fff
+    style SELECT fill:#ffa94d
+```
 
 ---
 
@@ -1087,6 +1147,27 @@ Three design choices are critical:
 2. **Explicit score labels.** Each prior attempt is paired with its exact score. This gives the optimizer quantitative feedback, not just qualitative ordering. The optimizer can distinguish between a 1% improvement and a 20% improvement.
 
 3. **Diversity encouragement.** The instruction explicitly asks for text that is "different from all the texts above." Without this, the optimizer tends to make minor variations on the current best prompt, getting trapped in local optima.
+
+The iterative optimization loop at the heart of OPRO is visualized below, along with a typical score progression across iterations:
+
+```mermaid
+graph TD
+    META["Meta-Prompt<br/>Problem + history of<br/>prior solutions + scores"]
+    GEN["LLM generates<br/>new candidate prompts"]
+    EVAL2["External evaluator<br/>scores each candidate"]
+    RANK["Rank by score<br/>Keep top performers"]
+    UPDATE["Update history<br/>with new results"]
+    
+    META --> GEN --> EVAL2 --> RANK --> UPDATE --> META
+    
+    ITER1["Iteration 1<br/>Score: 72%"] --> ITER5["Iteration 5<br/>Score: 81%"] --> ITER10["Iteration 10<br/>Score: 88%"]
+    
+    style META fill:#4dabf7,color:#fff
+    style RANK fill:#37b24d,color:#fff
+    style ITER1 fill:#ff6b6b,color:#fff
+    style ITER5 fill:#ffa94d
+    style ITER10 fill:#37b24d,color:#fff
+```
 
 #### Results
 
@@ -1645,6 +1726,29 @@ def backpropagate(node: TreeNode, value: float) -> None:
 
 This is identical to standard MCTS backpropagation. The cumulative values guide future selection toward high-value branches while maintaining exploration of under-visited branches.
 
+The four MCTS phases as adapted by LATS are summarized in the following diagram:
+
+```mermaid
+graph TD
+    ROOT2["Root State"]
+    ROOT2 --> SELECT2["1. SELECT<br/>UCB1 formula<br/>V/N + c·√(ln N_p/N)"]
+    SELECT2 --> NODE["Promising<br/>Node"]
+    NODE --> EXPAND["2. EXPAND<br/>LLM generates<br/>possible actions"]
+    EXPAND --> CHILD1["Child 1"]
+    EXPAND --> CHILD2["Child 2"]
+    EXPAND --> CHILD3["Child 3"]
+    CHILD1 --> EVAL3["3. EVALUATE<br/>LLM value function +<br/>self-reflection"]
+    CHILD2 --> EVAL3
+    CHILD3 --> EVAL3
+    EVAL3 --> BACK["4. BACKPROPAGATE<br/>Update values<br/>up the tree"]
+    BACK --> ROOT2
+    
+    style SELECT2 fill:#4dabf7,color:#fff
+    style EXPAND fill:#ffa94d
+    style EVAL3 fill:#69db7c
+    style BACK fill:#da77f2,color:#fff
+```
+
 #### The Complete LATS Algorithm
 
 Putting all four phases together:
@@ -2042,6 +2146,23 @@ The flywheel has several important properties:
 **It accelerates.** Each revolution adds knowledge that makes the next revolution faster. An agent with 100 skills crystallizes new knowledge faster than an agent with 10 skills, because the existing knowledge prevents repeated failures and allows the agent to focus on genuinely novel problems.
 
 **It compounds.** The value of the flywheel is not linear in the number of revolutions — it is exponential. Each skill interacts with every other skill (a rate-limiting skill makes an API-integration skill more effective, which enables a more complex workflow skill, etc.). The combinatorial interactions produce capability that grows faster than the knowledge base.
+
+The virtuous cycle at the core of the experience flywheel:
+
+```mermaid
+graph TD
+    IMPROVE["Agent improves<br/>at tasks"]
+    TRUST["Users trust agent<br/>with harder tasks"]
+    SIGNAL["More learning<br/>signal from<br/>harder tasks"]
+    FASTER["Faster<br/>improvement"]
+    
+    IMPROVE --> TRUST --> SIGNAL --> FASTER --> IMPROVE
+    
+    style IMPROVE fill:#37b24d,color:#fff
+    style TRUST fill:#4dabf7,color:#fff
+    style SIGNAL fill:#ffa94d
+    style FASTER fill:#da77f2,color:#fff
+```
 
 **It has network effects.** In ecosystems like ClawHub, the flywheel operates at the community level. One agent's learning (published as a skill) benefits all agents that install it. The community flywheel spins faster than any individual agent's flywheel because it aggregates learning signal from millions of agent-hours of operation.
 
