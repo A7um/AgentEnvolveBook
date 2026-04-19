@@ -81,6 +81,24 @@ n=20: 25 tool calls →  7 tool calls  (-72%)
 
 The learning curve diagnostic is the single most important metric for evaluating runtime self-evolution mechanisms. Throughout this book, every mechanism is evaluated by the shape of the learning curve it produces.
 
+```mermaid
+graph LR
+    subgraph "Stateless Agent"
+        T1a["Task 1<br/>25 tool calls"] --> T2a["Task 2<br/>25 tool calls"] --> T3a["Task 3<br/>25 tool calls"] --> TNa["Task N<br/>25 tool calls"]
+    end
+    subgraph "Self-Evolving Agent"
+        T1b["Task 1<br/>25 tool calls"] --> T2b["Task 2<br/>18 tool calls"] --> T3b["Task 3<br/>12 tool calls"] --> TNb["Task N<br/>8 tool calls"]
+    end
+    style T1a fill:#ff6b6b
+    style T2a fill:#ff6b6b
+    style T3a fill:#ff6b6b
+    style TNa fill:#ff6b6b
+    style T1b fill:#ff6b6b
+    style T2b fill:#ffa94d
+    style T3b fill:#69db7c
+    style TNb fill:#37b24d
+```
+
 ### The Statelessness Problem Is Getting Worse, Not Better
 
 A common misconception is that larger context windows solve the statelessness problem. Models with 128K, 200K, or even 1M+ token context windows can hold more information per invocation — but they still start from zero on each new invocation. A larger context window is a larger scratchpad, not a persistent memory.
@@ -241,6 +259,29 @@ Procedural memory supports:
 - *Composition:* skills can call other skills, forming hierarchical procedures
 - *Versioning:* skills evolve over time as the agent discovers improvements
 
+```mermaid
+graph TB
+    subgraph "CoALA Memory Architecture"
+        WM["Working Memory<br/>(Context Window)"]
+        subgraph "Long-Term Memory"
+            EM["Episodic Memory<br/>Past experiences"]
+            SM["Semantic Memory<br/>Facts & knowledge"]
+            PM["Procedural Memory<br/>Skills & procedures"]
+        end
+    end
+    WM -->|"retrieve"| EM
+    WM -->|"retrieve"| SM
+    WM -->|"retrieve"| PM
+    EM -->|"write (learn)"| EM
+    SM -->|"write (learn)"| SM
+    PM -->|"write (learn)"| PM
+    
+    style WM fill:#4dabf7,color:#fff
+    style EM fill:#ffa94d
+    style SM fill:#69db7c
+    style PM fill:#da77f2
+```
+
 ### The Learning Action
 
 The critical insight of CoALA for runtime self-evolution is the formalization of **learning as an internal action**. In the CoALA action space, the agent can perform:
@@ -368,6 +409,42 @@ RUNTIME SELF-EVOLUTION (frozen backbone, no weight updates)
 └── ARCHITECTURE SELF-DESIGN
     ├── Meta Agent Search (ADAS, ICLR 2025)
     └── Hybrid Agentic Workflow Evolution (HyEvo, 2026)
+```
+
+```mermaid
+graph TD
+    ROOT["Runtime Self-Evolution<br/>(Frozen Backbone)"]
+    ROOT --> R["Reflection-Based"]
+    ROOT --> M["Memory-Based"]
+    ROOT --> S["Skill-Based"]
+    ROOT --> K["Knowledge Crystallization"]
+    ROOT --> P["Prompt Self-Optimization"]
+    ROOT --> A["Architecture Self-Design"]
+    
+    R --> R1["Reflexion<br/>NeurIPS 2023"]
+    R --> R2["ExpeL<br/>AAAI 2024"]
+    R --> R3["ERL<br/>ICLR 2026"]
+    R --> R4["AutoGuide<br/>NeurIPS 2024"]
+    
+    M --> M1["MemRL<br/>arXiv 2026"]
+    M --> M2["RetroAgent<br/>arXiv 2026"]
+    M --> M3["Memento-II<br/>arXiv 2025"]
+    M --> M4["Honcho<br/>2026"]
+    
+    S --> S1["Voyager<br/>TMLR 2024"]
+    S --> S2["SkillWeaver<br/>arXiv 2025"]
+    S --> S3["Hermes Agent<br/>2026"]
+    S --> S4["AgentFactory<br/>arXiv 2026"]
+    S --> S5["ASG-SI<br/>arXiv 2025"]
+    
+    K --> K1["RKC<br/>2026"]
+    K --> K2["OpenClaw<br/>2026"]
+    
+    P --> P1["OPRO<br/>2023"]
+    P --> P2["EvoTool<br/>2026"]
+    
+    A --> A1["ADAS<br/>ICLR 2025"]
+    A --> A2["HyEvo<br/>2026"]
 ```
 
 ### Family 1: Reflection-Based
@@ -644,6 +721,20 @@ Procedure:
       memory_buffer.append(reflection)
   
   return (FAILURE, best_trajectory, max_trials)
+```
+
+```mermaid
+graph TD
+    START["Task"] --> EXEC["Execute with<br/>Memory Buffer"]
+    EXEC --> EVAL{"Success?"}
+    EVAL -->|Yes| DONE["Return Result"]
+    EVAL -->|No| REFLECT["LLM Self-Reflection<br/>What went wrong?"]
+    REFLECT --> STORE["Append reflection<br/>to memory buffer"]
+    STORE --> EXEC
+    
+    style DONE fill:#37b24d,color:#fff
+    style REFLECT fill:#ffa94d
+    style STORE fill:#4dabf7,color:#fff
 ```
 
 ### Architecture Components
@@ -1018,6 +1109,22 @@ Procedure:
   
   trajectory = Agent.execute(context)
   return trajectory
+```
+
+```mermaid
+graph LR
+    subgraph "Stage 1: Gather"
+        S1["Trial & Error<br/>on tasks"] --> PAIRS["Success/Failure<br/>trajectory pairs"]
+    end
+    subgraph "Stage 2: Extract"
+        PAIRS --> COMPARE["LLM compares<br/>pairs"] --> INSIGHTS["Heuristic pool<br/>ADD/UPVOTE/EDIT"]
+    end
+    subgraph "Stage 3: Infer"
+        NEW["New task"] --> RETRIEVE["Retrieve top-k<br/>insights"] --> AUGMENT["Augment context"] --> SOLVE["Execute"]
+    end
+    
+    style INSIGHTS fill:#69db7c
+    style AUGMENT fill:#4dabf7,color:#fff
 ```
 
 ### Insight Format
@@ -1920,6 +2027,21 @@ The variations are in:
 3. How "retrieval" selects artifacts (recency, similarity, LLM ranking, state matching)
 
 Understanding this common pattern allows principled design of new reflection mechanisms for specific deployment needs. The design space is not exhausted by these four papers — it is an active area of research with significant room for innovation.
+
+```mermaid
+graph TD
+    subgraph "Evolution of Reflection Mechanisms"
+        REF["Reflexion (2023)<br/>Same-task retry<br/>Needs multiple attempts"]
+        EXP["ExpeL (2024)<br/>Cross-task heuristics<br/>Needs success/failure pairs"]
+        ERL_D["ERL (2026)<br/>Cross-task heuristics<br/>Single attempt sufficient"]
+    end
+    REF -->|"adds cross-task<br/>transfer"| EXP
+    EXP -->|"removes pair<br/>requirement"| ERL_D
+    
+    style REF fill:#ff6b6b,color:#fff
+    style EXP fill:#ffa94d
+    style ERL_D fill:#37b24d,color:#fff
+```
 
 ### Worked Example: Designing a Reflection System for a Production Coding Agent
 
