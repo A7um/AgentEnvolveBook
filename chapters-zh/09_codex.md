@@ -1,8 +1,8 @@
 # Codex — 记忆、子 Agent 与压缩
 
-OpenAI 的 Codex 是业界文档最完善的 Agent 循环。Responses API 是公开的，CLI 是开源的，压缩机制是显式的——不像 Claude Code 那样隐藏在客户端封装之后。这种透明性使 Codex 成为理解基于 LLM 的进化基本限制的最佳系统。
+OpenAI 的 Codex 是业界文档最完善的 Agent 循环。Responses API 公开可用，CLI 开源，压缩机制也是显式的——不像 Claude Code 那样藏在客户端封装背后。这种透明性使 Codex 成为研究基于 LLM 的进化根本局限的最佳样本。
 
-本章内容来源于 Responses API 文档、开源的 Codex CLI（`openai/codex`）、OpenAI 的开发者博客文章，以及对压缩端点的实测行为。
+本章内容来源于 Responses API 文档、开源的 Codex CLI（`openai/codex`）、OpenAI 开发者博客，以及对压缩端点的实测观察。
 
 ---
 
@@ -10,7 +10,7 @@ OpenAI 的 Codex 是业界文档最完善的 Agent 循环。Responses API 是公
 
 ### 文件概述
 
-Codex Agent 会读取仓库根目录下的 `AGENTS.md` 文件。这是 Codex 版本的 Claude Code `CLAUDE.md`——随仓库一起携带的持久化项目指引，在会话启动时加载到 Agent 的系统提示词中。
+Codex Agent 会读取仓库根目录下的 `AGENTS.md`。这是 Codex 版的 Claude Code `CLAUDE.md`——一份随仓库携带的持久化项目指引，在会话启动时加载到 Agent 的系统 prompt 中。
 
 ```markdown
 # AGENTS.md
@@ -62,20 +62,20 @@ Session 4+:
   Agent avoids the Stripe issue automatically
 ```
 
-这是跨会话进化的最简形式：Agent 本身并不学习，但人类的纠正不断累积在一个持久化文件中，Agent 每次会话都会读取它。文件就是记忆；人类就是学习机制。
+这是跨会话进化的最简形式：Agent 本身并不学习，但人类的纠正持续积累在一个持久化文件中，Agent 每次会话都会读取。文件就是记忆，人类就是学习机制。
 
 ### 当 Agent 反复犯同一个错误
 
-驱动 AGENTS.md 增长的模式：
+驱动 AGENTS.md 增长的模式很典型：
 
 1. Agent 犯了错误 X
-2. 人类纠正 Agent
-3. 下一次会话：Agent 再次犯错误 X（没有对纠正的记忆）
-4. 人类意识到：这需要写进 AGENTS.md
-5. 人类将纠正内容添加到 AGENTS.md
-6. 所有未来的会话：Agent 读取 AGENTS.md，避免错误 X
+2. 人类纠正
+3. 下一次会话：Agent 又犯错误 X（对之前的纠正毫无记忆）
+4. 人类意识到：这得写进 AGENTS.md
+5. 人类把纠正内容加入 AGENTS.md
+6. 此后所有会话：Agent 读取 AGENTS.md，不再犯错误 X
 
-反复犯错模式是判断什么应该写入 AGENTS.md 的最强信号。如果你纠正了 Agent 一次且这很重要，就把它写进文件。如果你纠正了两次，那它绝对应该在里面。
+"反复犯同一个错"是判断什么该写入 AGENTS.md 的最强信号。纠正过一次且这件事很重要——写进去。纠正过两次——那必须在里面。
 
 ### AGENTS.md 与 CLAUDE.md 对比
 
@@ -88,7 +88,7 @@ Session 4+:
 | 作用范围 | 单个仓库 | 用户级 + 项目级 + 目录级 |
 | 自动生成 | `/init` 命令（已提议） | `/init` 生成初始文件 |
 
-关键的哲学差异：Claude Code 允许 Agent 编写自己的 CLAUDE.md，从而实现自主学习。Codex 保持 AGENTS.md 仅由人类编写，优先保证精确性而非自主性。Cursor 对 `.cursor/rules/*.mdc` 采用了同样的仅人类编写方式。
+关键的哲学分歧：Claude Code 允许 Agent 编写自己的 CLAUDE.md，从而实现自主学习；Codex 则坚持 AGENTS.md 仅由人类编写，牺牲自主性换取精确性。Cursor 对 `.cursor/rules/*.mdc` 也采用了同样的"人类专属"策略。
 
 ---
 
@@ -96,20 +96,20 @@ Session 4+:
 
 ### 跨会话记忆
 
-2026 年 4 月，OpenAI 为 Codex 发布了 Memory Preview——能够在会话之间保留上下文的能力，类似于 ChatGPT 的记忆功能，但专为编码 Agent 设计。
+2026 年 4 月，OpenAI 为 Codex 发布了 Memory Preview——跨会话保留上下文的能力，类似 ChatGPT 的记忆功能，但专为编码 Agent 量身定制。
 
 已公布的功能：
 
 | 功能 | 描述 |
 |---------|-------------|
 | 会话记忆 | 保留先前会话中的事实、偏好和决策 |
-| 定时任务 | 可以安排未来的任务并自动唤醒执行 |
+| 定时任务 | 可安排未来任务，到时自动唤醒执行 |
 | 项目连续性 | 记住项目状态、待解决问题和进行中的工作 |
-| 记忆管理 | 用户可以查看、编辑和删除存储的记忆 |
+| 记忆管理 | 用户可查看、编辑和删除已存储的记忆 |
 
 ### 与 AGENTS.md 的区别
 
-AGENTS.md 是静态的——只有人类编辑时才会改变。Memory Preview 是动态的——Agent 根据交互自动存储记忆：
+AGENTS.md 是静态的——只在人类编辑时才变。Memory Preview 是动态的——Agent 根据交互自动存储记忆：
 
 ```
 AGENTS.md (static):
@@ -123,11 +123,11 @@ Memory Preview (dynamic):
   Available to this user's future sessions (not repo-wide)
 ```
 
-两者的结合非常强大：AGENTS.md 用于适用于所有开发者的项目级事实，Memory Preview 用于跟随个人的用户级偏好。
+两者的组合威力很大：AGENTS.md 承载适用于所有开发者的项目级事实，Memory Preview 记录跟随个人的用户级偏好。
 
 ### 自动唤醒与定时任务
 
-Memory Preview 中最新颖的功能：可以安排未来工作的 Agent。
+Memory Preview 中最新颖的功能是：Agent 可以为自己安排未来的工作。
 
 ```
 User: "Run the integration test suite every night at 2am
@@ -141,13 +141,13 @@ Agent: [stores scheduled task]
        [goes back to sleep]
 ```
 
-这是迈向持久 Agent 身份的一步——Agent 不仅记住过去的会话，还为未来的会话做规划。但实现细节（记忆如何存储、定时如何工作、token 预算是多少）尚未完全公开。
+这朝着持久 Agent 身份迈出了一步——Agent 不仅记得过去的会话，还能为未来的会话做规划。但具体实现细节（记忆如何存储、定时如何触发、token 预算多大）尚未完全公开。
 
 ---
 
 ## 压缩问题
 
-### Codex 如何进行压缩
+### Codex 如何压缩
 
 Responses API 提供了一个显式的压缩端点：
 
@@ -170,11 +170,11 @@ Response:
 }
 ```
 
-`encrypted_content` 是一个不透明的加密数据块——Agent 代码无法检查或修改它。它保留了足够的潜在状态，使模型能够继续对话，但具体保留哪些信息由 OpenAI 的压缩算法控制。
+`encrypted_content` 是一个不透明的加密数据块——Agent 代码无法查看或修改。它保留了足以让模型继续对话的潜在状态，但具体保留哪些信息完全由 OpenAI 的压缩算法决定。
 
 ### 什么会丢失
 
-通过对 Codex 会话样本的测量，压缩大约保留原始信息的 **13.7%**：
+根据对 Codex 会话样本的测量，压缩大约保留原始信息的 **13.7%**：
 
 ```
 Original conversation:
@@ -206,7 +206,7 @@ What's lost:
 
 ### 复合损失
 
-问题会随着反复压缩而恶化。在长时间运行的会话中：
+反复压缩会让问题越来越严重。在长时间运行的会话中：
 
 ```
 Compaction 1:  45,000 tokens → 6,200 tokens  (13.7% retained)
@@ -218,11 +218,11 @@ After 3 compactions:
   The agent has effectively "forgotten" the beginning of the session
 ```
 
-每次压缩都是有损的，而且损失会复合累积。来自早期轮次的信息在第一次压缩后作为摘要存活，但该摘要本身在第二次压缩中被再次压缩。到第三次压缩时，原始细节已经消失。
+每次压缩都有损，而且损失逐级累积。早期轮次的信息在第一次压缩后以摘要形式残存，但这个摘要在第二次压缩中又被再度压缩。三轮之后，原始细节基本消失殆尽。
 
 ### 为什么这限制了进化
 
-压缩是 Codex 会话内进化的根本限制：
+压缩是 Codex 会话内进化的根本瓶颈：
 
 ```
 Without compaction limits:
@@ -237,7 +237,7 @@ With compaction:
   Patterns from turns 1-50 are gone unless externalized to files
 ```
 
-这就是为什么 WAL 模式（第 7 章）对 Codex Agent 至关重要：如果关键状态没有在压缩之前写入文件，它就会丢失。文件系统是唯一能完整经受压缩的持久记忆。
+这就是为什么 WAL 模式（第 7 章）对 Codex Agent 至关重要：关键状态如果没有在压缩之前写入文件，就会丢失。文件系统是唯一能完整扛住压缩的持久记忆。
 
 ### Claude Code 的压缩对比
 
@@ -247,13 +247,13 @@ Claude Code 面临同样的问题，但处理方式不同：
 |--------|-------|------------|
 | 触发条件 | 显式 API 调用或自动触发 | 主动（接近上限时）+ 被动（错误恢复） |
 | 机制 | 服务端加密数据块 | 客户端摘要生成 |
-| 透明度 | 不透明（无法检查） | 可见（摘要在对话中） |
-| 错误处理 | 干净（API 管理） | 复杂（hasAttemptedReactiveCompact bug） |
-| 信息损失 | 每次压缩约 86% | 相当，但 Agent 控制摘要内容 |
+| 透明度 | 不透明（无法查看） | 可见（摘要留在对话中） |
+| 错误处理 | 干净（API 托管） | 复杂（hasAttemptedReactiveCompact bug） |
+| 信息损失 | 每次约 86% | 大致相当，但 Agent 可控制摘要内容 |
 
-Claude Code 的优势：Agent 参与摘要生成过程，可以优先保留重要内容。Codex 的优势：压缩由服务端管理，不消耗输出 token 来生成摘要。
+Claude Code 的优势在于 Agent 参与摘要生成，可以优先保留重要内容。Codex 的优势在于压缩由服务端管理，不需要消耗输出 token 来生成摘要。
 
-两者都没有解决根本问题：压缩是有损的，而且损失会复合累积。
+两者都没有解决根本问题：压缩是有损的，损失会逐级累积。
 
 ---
 
@@ -261,7 +261,7 @@ Claude Code 的优势：Agent 参与摘要生成过程，可以优先保留重�
 
 ### 架构
 
-Codex 子 Agent 使用管理者-工作者模式：
+Codex 子 Agent 采用管理者-工作者模式：
 
 ```
 ┌───────────────────────────────────────────┐
@@ -286,9 +286,9 @@ Codex 子 Agent 使用管理者-工作者模式：
 
 | 类型 | 权限 | 用途 | 典型用法 |
 |------|--------|---------|-------------|
-| `explorer` | 只读文件系统，无写入权限 | 调查、代码分析、依赖映射 | "理解这个代码库中认证是如何工作的" |
+| `explorer` | 只读文件系统，无写入权限 | 调查、代码分析、依赖关系梳理 | "搞清楚这个代码库里认证是怎么实现的" |
 | `worker` | 完整读写权限，终端访问 | 实现、测试、部署 | "实现速率限制中间件" |
-| `default` | 可配置 | 通用子任务执行 | 视任务而定 |
+| `default` | 可配置 | 通用子任务 | 视任务而定 |
 
 ### 生成子 Agent
 
@@ -346,7 +346,7 @@ Execution:
 
 ### 通过 .codex/agents/*.toml 自定义 Agent
 
-团队可以定义自定义 Agent 类型：
+团队可以定义自己的 Agent 类型：
 
 ```toml
 # .codex/agents/security-reviewer.toml
@@ -372,11 +372,11 @@ allowed = ["file_read", "search", "grep"]
 denied = ["file_write", "terminal"]
 ```
 
-自定义 Agent 继承项目的 AGENTS.md 上下文，但拥有自己的系统提示词和工具权限限制。这实现了基于角色的专业化，无需修改核心 Agent 代码。
+自定义 Agent 继承项目的 AGENTS.md 上下文，但拥有独立的系统 prompt 和工具权限约束。这样就能做到基于角色的专业化分工，而无需改动核心 Agent 代码。
 
 ### spawn_agents_on_csv 批量操作
 
-用于在多个文件或记录上执行重复任务：
+用于对多个文件或记录批量执行重复任务：
 
 ```python
 # Process a CSV of migration tasks
@@ -389,9 +389,9 @@ await spawn_agents_on_csv(
 )
 ```
 
-CSV 每行提供一个任务。每行生成一个子 Agent，将该行数据替换到提示模板中。最多 6 个同时运行。
+CSV 的每一行就是一个任务。每行生成一个子 Agent，把该行数据填入 prompt 模板，最多 6 个并发运行。
 
-这就是批量进化：相同的转换应用于多个目标，每个子 Agent 独立工作。管理者汇总结果并报告失败。
+这就是批量进化：同样的变换应用于多个目标，每个子 Agent 独立工作，管理者汇总结果并报告失败。
 
 ---
 
@@ -399,7 +399,7 @@ CSV 每行提供一个任务。每行生成一个子 Agent，将该行数据替�
 
 ### 为什么隔离对进化至关重要
 
-每个子 Agent 拥有自己的上下文窗口。这对进化质量有直接影响：
+每个子 Agent 拥有独立的上下文窗口，这直接影响进化质量：
 
 ```
 Single agent (no subagents):
@@ -415,11 +415,11 @@ Manager + subagents:
   Each agent has FOCUSED context — no dilution from unrelated phases
 ```
 
-隔离防止了错误传播问题：如果一个探索者走错了方向，只有该探索者的上下文被污染。管理者只接收探索者的最终输出，而不是失败探索的完整轨迹。
+隔离杜绝了错误传播问题：某个探索者走偏了，只有它的上下文被污染。管理者只看到探索者的最终产出，而非失败探索的完整轨迹。
 
 ### 压缩的交互影响
 
-子 Agent 隔离部分缓解了压缩问题：
+子 Agent 隔离在一定程度上缓解了压缩问题：
 
 ```
 Without subagents:
@@ -436,7 +436,7 @@ With subagents:
   No compaction cascading between phases
 ```
 
-每个子 Agent 都从全新的上下文窗口开始。复合损失问题在每个子 Agent 边界处被重置。
+每个子 Agent 都从全新的上下文窗口开始。复合损失在每个子 Agent 边界处被重置。
 
 ---
 
@@ -472,6 +472,6 @@ With subagents:
 └──────────────────────────────────────────────┘
 ```
 
-Codex 是对自身局限性最透明的 Agent 系统。压缩端点使信息损失变得显而易见。子 Agent 架构提供了结构性的缓解方案。但根本挑战依然存在：Agent 在会话中学到的大部分内容，在会话结束或压缩时都会丢失。
+Codex 是对自身局限最坦诚的 Agent 系统。压缩端点让信息损失一目了然，子 Agent 架构提供了结构性的缓解方案。但根本挑战不变：Agent 在会话中学到的大部分东西，都会在会话结束或压缩时丢失。
 
-文件系统——AGENTS.md、进度文件、外部化状态——是唯一能完整经受压缩的进化机制。对于 Codex Agent 来说，写入文件不是可选的；它是唯一持久的记忆。
+文件系统——AGENTS.md、进度文件、外部化状态——是唯一能完整扛住压缩的进化机制。对 Codex Agent 来说，写文件不是可选项，而是唯一持久的记忆。
