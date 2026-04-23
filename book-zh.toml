@@ -1,16 +1,16 @@
 [book]
 authors = ["Atum"]
-language = "en"
-src = "src"
-title = "The Self-Evolving Agent"
-description = "How top-tier production agents — Claude Code, Cursor, Hermes, OpenClaw, Manus, Codex — actually get better through use. Extracted from leaked source, open repos, and shipped products."
+language = "zh"
+src = "src-zh"
+title = "自进化 Agent"
+description = "顶级生产 Agent — Claude Code、Cursor、Hermes、OpenClaw、Manus、Codex — 如何在使用中不断进化。提取自泄漏源码、开源仓库和已发布产品。"
 
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/A7um/AgentEnvolveBook"
 edit-url-template = "https://github.com/A7um/AgentEnvolveBook/edit/main/{path}"
-site-url = "/AgentEnvolveBook/"
+site-url = "/AgentEnvolveBook/zh/"
 print = { enable = false }
 additional-css = ["book-zoom.css", "lang-switch.css"]
 additional-js = ["mermaid.min.js", "mermaid-init.js", "book-zoom.js", "lang-switch.js"]
@@ -20,4 +20,3 @@ enable = false
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
-

@@ -1,0 +1,44 @@
+.lang-switch {
+    position: fixed;
+    top: 10px;
+    right: 16px;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--sidebar-bg);
+    border: 1px solid var(--sidebar-non-existant);
+    border-radius: 6px;
+    overflow: hidden;
+    font-size: 0.8rem;
+    line-height: 1;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+
+.lang-switch a {
+    display: block;
+    padding: 6px 12px;
+    text-decoration: none;
+    color: var(--sidebar-fg);
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+}
+
+.lang-switch a:hover {
+    background: var(--sidebar-active);
+    color: var(--sidebar-fg);
+}
+
+.lang-switch a.active {
+    background: var(--sidebar-active);
+    font-weight: 600;
+    pointer-events: none;
+}
+
+@media (max-width: 1080px) {
+    .lang-switch {
+        top: auto;
+        bottom: 12px;
+        right: 12px;
+    }
+}

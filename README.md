@@ -2,7 +2,7 @@
 
 **How top-tier production agents actually get better through use.**
 
-> **[Read the book online →](https://a7um.github.io/AgentEnvolveBook/)**
+> **[Read the book online →](https://a7um.github.io/AgentEnvolveBook/)** | **[阅读中文版 →](https://a7um.github.io/AgentEnvolveBook/zh/)**
 
 Extracted from shipped products, leaked source code, open repos, and the ClawHub skill ecosystem — not academic papers.
 
@@ -49,13 +49,34 @@ Extracted from shipped products, leaked source code, open repos, and the ClawHub
 | Devin | Self-verification + auto-fix (2.2) + DeepWiki | Official blog |
 | Manus | Context engineering iteration ("Stochastic Graduate Descent") | Published blog posts |
 
+## Multi-Language Support
+
+The book is available in **English** and **Chinese (简体中文)**. A language switcher in the top-right corner of each page allows one-click toggling between languages.
+
+| Language | Source Chapters | Source TOC | Config |
+|----------|----------------|-----------|--------|
+| English | `chapters/` | `src/SUMMARY.md` | `book.toml` |
+| 简体中文 | `chapters-zh/` | `src-zh/SUMMARY.md` | `book-zh.toml` |
+
 ## Build locally
 
 This is an [mdBook](https://rust-lang.github.io/mdBook/). Chapter source lives under [`chapters/`](chapters/introduction.md); [`src/SUMMARY.md`](src/SUMMARY.md) is the table of contents.
 
 ```bash
 cargo install mdbook mdbook-mermaid
+
+# Build English
 mdbook serve
+
+# Build Chinese
+mdbook serve book-zh.toml --dest-dir book/zh
+```
+
+To build both for deployment:
+
+```bash
+mdbook build
+mdbook build book-zh.toml --dest-dir book/zh
 ```
 
 See **[UPDATE_GUIDE.md](UPDATE_GUIDE.md)** for layout details and how to add chapters.
