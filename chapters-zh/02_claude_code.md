@@ -1,18 +1,18 @@
 # Claude Code — 记忆、技能与泄露的内部实现
 
-2026 年 3 月，Anthropic 发布了 `@anthropic-ai/claude-code` npm 包的一次常规更新。随之附带的——意外地——是一份完整的 source map：512,000 行 TypeScript 代码，Claude Code 完整的客户端实现。
+2026 年 3 月，Anthropic 照例更新了 `@anthropic-ai/claude-code` npm 包。但这次更新意外附带了一份完整的 source map——512,000 行 TypeScript，Claude Code 客户端的全部实现。
 
-社区在数小时内获得了源代码。source map 在一天内被撤下。但代码已经在数十个仓库和博客文章中被分析、记录和讨论。
+几小时内，社区就拿到了源代码。source map 一天内被撤下，但代码早已散布在数十个仓库和博客文章里，被反复分析和讨论。
 
-本章基于该泄露的源代码，并与 Anthropic 的官方文档、博客文章以及公开发布的 Claude Agent SDK 进行了交叉验证。每一个论断都可追溯到特定的代码路径、配置常量或已记录的行为。
+本章基于这份泄露的源代码，并与 Anthropic 官方文档、博客文章和公开的 Claude Agent SDK 做了交叉验证。每个结论都能追溯到具体的代码路径、配置常量或已有文档。
 
 ---
 
 ## CLAUDE.md — 手动记忆层
 
-CLAUDE.md 是一个 markdown 文件。由你创建。由你编写。Claude Code 在每次会话开始时读取它，并将内容注入到系统提示中。这就是全部机制。
+CLAUDE.md 就是一个 markdown 文件——你自己创建，自己编写。Claude Code 在每次会话开始时读取它，把内容注入系统提示。机制就这么简单。
 
-使它值得在本书中单独成节的是*层级结构*——Claude Code 不是加载一个文件。它从多个位置加载一条文件链，每个文件的作用域对应不同的具体层级。
+值得单独拿出来讲的是它的*层级结构*——Claude Code 不只加载一个文件，而是从多个位置加载一整条文件链，每个文件对应不同的作用域。
 
 ### 层级加载
 
@@ -25,7 +25,7 @@ Discovery order (all loaded at session start):
 4. .claude/CLAUDE.local.md          Personal — your local overrides (gitignored)
 ```
 
-泄露的 `SystemPromptBuilder` 中的发现逻辑：
+泄露源代码中 `SystemPromptBuilder` 的发现逻辑：
 
 ```typescript
 async function discoverMemoryFiles(cwd: string): Promise<ClaudeMemoryFile[]> {
@@ -80,7 +80,7 @@ async function discoverMemoryFiles(cwd: string): Promise<ClaudeMemoryFile[]> {
 | 单文件 | 4,096 token | 截断并提示：*"[truncated — file exceeds 4K token limit]"* |
 | 所有文件总计 | 12,288 token | 最低优先级的文件被整体丢弃 |
 
-这些限制在 `SystemPromptBuilder` 中是硬编码的。它们占用上下文窗口——CLAUDE.md 的每一个 token 都是 Agent 无法用于对话、工具结果或推理的 token。
+这些限制在 `SystemPromptBuilder` 中是硬编码的。它们直接占用上下文窗口——CLAUDE.md 多用一个 token，Agent 能用于对话、工具调用和推理的空间就少一个 token。
 
 ### /init 命令
 
@@ -97,11 +97,11 @@ async function discoverMemoryFiles(cwd: string): Promise<ClaudeMemoryFile[]> {
     - Detected conventions
 ```
 
-生成的文件是一个起点。真正的价值随着你不断添加架构决策、编码规范和 Agent 无法从代码库中推断出的项目特定上下文而逐渐积累。
+生成的文件只是起点。真正的价值来自你后续不断添加的内容：架构决策、编码规范，以及 Agent 无法从代码库中自行推断的项目上下文。
 
 ### CLAUDE.md 中应该放什么
 
-来自 Anthropic 文档和社区经验的最佳实践：**最多 50-200 行。**
+综合 Anthropic 文档和社区经验，最佳实践是：**控制在 50-200 行。**
 
 ```markdown
 # CLAUDE.md
@@ -130,11 +130,11 @@ async function discoverMemoryFiles(cwd: string): Promise<ClaudeMemoryFile[]> {
   `async with pool.acquire() as conn:` pattern, never raw pool.execute()
 ```
 
-*不应*放入的内容：与 README 重复的文档、生成的 API 参考、冗长的代码示例。该文件会注入到每个提示中——臃肿的内容在每一轮对话都会消耗 token。
+*不应*放入的内容：与 README 重复的文档、自动生成的 API 参考、大段代码示例。这个文件每次提示都会注入——内容越臃肿，每轮对话浪费的 token 就越多。
 
 ### .claude/CLAUDE.local.md 的灵活出口
 
-`.claude/CLAUDE.local.md` 按照约定被 gitignore。这是你放置不应与团队共享的个人偏好的地方：
+`.claude/CLAUDE.local.md` 按照约定被 gitignore，用来存放不需要与团队共享的个人偏好：
 
 ```markdown
 # CLAUDE.local.md
@@ -145,13 +145,13 @@ async function discoverMemoryFiles(cwd: string): Promise<ClaudeMemoryFile[]> {
 - I prefer explicit over concise — spell out variable names
 ```
 
-它以相同的每文件 4K 预算加载，并计入 12K 总额。
+它和其他 CLAUDE.md 一样受 4K 单文件预算限制，也计入 12K 总预算。
 
 ---
 
-## 自动记忆 — Claude 无需指示即可学习
+## 自动记忆 — 不用你教，Claude 自己学
 
-CLAUDE.md 是手动的——由你编写。自动记忆则相反：Claude Code 自动写入观察结果，无需你的指示。
+CLAUDE.md 靠你手写。自动记忆正好反过来：Claude Code 自己写入观察结果，不需要你下任何指令。
 
 ### 存储位置
 
@@ -161,11 +161,11 @@ CLAUDE.md 是手动的——由你编写。自动记忆则相反：Claude Code �
   └── ... (additional auto-generated files)
 ```
 
-路径由项目根目录派生，因此每个项目都有自己的记忆存储。文件存储在用户的 home 目录中，而非项目中——自动记忆不会被提交到版本控制中。
+路径根据项目根目录生成，每个项目有独立的记忆空间。文件存放在用户 home 目录而非项目目录——自动记忆不会进入版本控制。
 
 ### 存储内容
 
-自动记忆捕获 Agent 在会话中观察到的模式：
+自动记忆记录的是 Agent 在会话中观察到的模式：
 
 | 类别 | 示例 |
 |----------|---------|
@@ -175,11 +175,11 @@ CLAUDE.md 是手动的——由你编写。自动记忆则相反：Claude Code �
 | 用户偏好 | *"User prefers functional style over class-based components"* |
 | 环境事实 | *"Project requires Node 20 — nvm use 20 before running"* |
 
-Agent 在学到新东西的会话结束时写入这些观察。触发是隐式的——Agent 根据交互内容决定什么值得记住。
+会话结束时，如果 Agent 认为学到了新东西，就会写入这些观察。写入时机是隐式的——Agent 自行判断哪些交互值得记住。
 
 ### 会话启动时的加载
 
-自动记忆与 CLAUDE.md 一起在每次会话开始时加载：
+每次会话开始时，自动记忆和 CLAUDE.md 一起加载：
 
 ```
 Session start:
@@ -189,17 +189,17 @@ Session start:
   4. Begin conversation
 ```
 
-200 行 / 25KB 的上限防止自动记忆无限增长。与 CLAUDE.md 的每文件 4K token 预算不同，自动记忆有一个更简单的行数截断——最近的观察排在最前面。
+200 行 / 25KB 的上限防止自动记忆无限膨胀。和 CLAUDE.md 按 token 计量不同，自动记忆用更简单的行数截断——最新的观察排在最前面。
 
 ### Agent 自动写入
 
-与 CLAUDE.md 的关键区别：你不需要主动请求。在你纠正 Agent 的会话之后（"不，我们这里用 pnpm，不是 npm"），Agent 会记录纠正内容。下次会话时，它已经知道了。
+和 CLAUDE.md 的关键区别是：你不需要主动要求。当你在会话中纠正了 Agent（"不，我们这里用 pnpm，不是 npm"），Agent 会自动记录。下次会话，它就知道了。
 
-这是被动提取——Agent 从交互中观察模式并持久化。它不需要显式指令或特殊命令。
+这是一种被动学习——Agent 从交互中发现模式并记下来，不需要显式指令，也不需要特殊命令。
 
 ### 提议的自我改进循环
 
-一个更雄心勃勃的自动记忆用法已经被原型化（但尚未作为默认功能发布）：
+一种更有野心的自动记忆玩法已经做出了原型（但还没有作为正式功能发布）：
 
 ```
 ┌─────────────────────────────────┐
@@ -225,15 +225,15 @@ Session start:
 └─────────────────────────────────┘
 ```
 
-在原型分析中，摩擦检测通道识别出 **42% 的摩擦率**——近一半的会话包含至少一次重复的纠正或失败的命令，而这些本可以通过 CLAUDE.md 条目来预防。提议的循环将分析 `~/.claude/usage-data/facets/` 中的这些模式，并建议向 CLAUDE.md 添加条目，弥合 Agent 知道什么（自动记忆）和 Agent 被*告知*什么（CLAUDE.md）之间的差距。
+原型分析中，摩擦检测通道发现 **42% 的摩擦率**——将近一半的会话包含至少一次重复纠正或失败命令，而这些本可以通过 CLAUDE.md 条目预防。设想中的闭环会分析 `~/.claude/usage-data/facets/` 里的这些模式，然后建议往 CLAUDE.md 添加条目，补上 Agent 实际知道的（自动记忆）和明确被告知的（CLAUDE.md）之间的缺口。
 
-这尚未作为自动化功能发布。数据已就绪；反馈循环尚未闭合。
+这还没有正式发布。数据已经有了，但反馈闭环还没接上。
 
 ---
 
 ## Agent 技能 — .claude/skills/*.md
 
-技能是教会 Claude Code 特定流程的 markdown 文件。CLAUDE.md 存储事实和规范，技能则存储*操作指南*知识——Agent 可以遵循的分步工作流。
+技能是用来教 Claude Code 特定流程的 markdown 文件。CLAUDE.md 存的是事实和规范，技能存的是*操作指南*——Agent 可以按步骤执行的工作流。
 
 ### 格式
 
@@ -278,7 +278,7 @@ metadata:
 
 ### 渐进式披露
 
-技能不会一次性全部加载。Claude Code 使用三级加载策略：
+技能不会一股脑全加载。Claude Code 采用三级渐进式加载：
 
 ```
 Level 0: Skill index (always in context)
@@ -297,7 +297,7 @@ Level 2: Section-specific (loaded on demand)
   → For follow-up questions about a specific part
 ```
 
-匹配仅基于技能的 `name` 和 `description` 字段——正文内容从不被搜索。这就是描述为何重要的原因：一个描述含糊的技能（"database stuff"）不会在具体查询（"how do I run an Alembic migration?"）时被激活。
+匹配只看 `name` 和 `description` 字段——正文不参与搜索。所以描述写得好不好至关重要：描述含糊的技能（"database stuff"）在遇到具体问题（"how do I run an Alembic migration?"）时根本不会被激活。
 
 Token 节省：
 
@@ -323,7 +323,7 @@ Token 节省：
     test-coverage.md →  /test-coverage
 ```
 
-每个命令文件是一个支持变量替换的 markdown 模板：
+每个命令文件就是一个支持变量替换的 markdown 模板：
 
 ```markdown
 <!-- .claude/commands/review.md -->
@@ -338,23 +338,23 @@ File to review: $ARGUMENTS
 Provide a structured report with severity levels.
 ```
 
-当用户输入 `/review src/auth.py` 时，Claude Code 读取模板，将 `$ARGUMENTS` 替换为 `src/auth.py`，并将结果作为用户消息注入。斜杠命令是用户编写的技能——连接 Agent 通用能力和项目特定工作流的桥梁。
+用户输入 `/review src/auth.py` 时，Claude Code 读取模板，把 `$ARGUMENTS` 替换为 `src/auth.py`，然后作为用户消息注入。斜杠命令本质上是用户自定义的技能，把 Agent 的通用能力和项目特定工作流连接起来。
 
 ### 跨团队和项目共享技能
 
-`.claude/skills/` 中的技能是仓库中的纯 markdown 文件。它们被提交到 git，在 PR 中审查，并通过正常的版本控制共享。团队的技能库随着开发者为项目常见工作流——部署、测试模式、调试流程——添加技能而增长。
+`.claude/skills/` 里的技能就是仓库中的普通 markdown 文件，提交到 git，在 PR 中审查，通过常规版本控制共享。团队的技能库会随着大家不断添加常见工作流——部署、测试模式、调试流程——而逐步壮大。
 
-`agentskills.io` 标准意味着技能是可互操作的：为 Claude Code 编写的技能可以与 Hermes 和 OpenClaw 配合使用，反之亦然。格式相同；发现机制因 Agent 而异。
+由于遵循 `agentskills.io` 标准，技能具备跨工具互操作性：给 Claude Code 写的技能也能用于 Hermes 和 OpenClaw，反之亦然。格式统一，只是各 Agent 的发现机制不同。
 
 ---
 
 ## 泄露的内部实现（2026 年 3 月源代码泄露）
 
-泄露的 512,000 行 TypeScript source map 为我们提供了 Claude Code 实际工作方式的空前可见性。以下是架构上最具意义的发现。
+这份 512,000 行的 TypeScript source map 让我们前所未有地看到了 Claude Code 的内部运作。以下是架构层面最有价值的发现。
 
 ### SystemPromptBuilder：14,902 行
 
-`SystemPromptBuilder` 动态组装系统提示，遵循严格的顺序：
+`SystemPromptBuilder` 按严格顺序动态组装系统提示：
 
 ```
 ┌───────────────────────────────────────────────────┐
@@ -387,9 +387,9 @@ Provide a structured report with severity levels.
 
 ### __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__
 
-这是代码库中商业意义最重大的一行代码。它之上的所有内容是**静态的**——在一个会话的各轮之间保持不变，对于同一个项目的不同会话通常也相同。它之下的内容每轮都会变化。
+这可能是整个代码库中商业价值最高的一行。它上方的内容是**静态的**——同一会话的各轮之间不变，同一项目的不同会话之间通常也不变。它下方的内容则每轮都在变。
 
-Anthropic 的 API 支持提示缓存。静态前缀（约占总提示的 70%）被缓存并以较低成本复用。动态后缀（约 30%）在每轮重新计算。
+Anthropic 的 API 支持 prompt 缓存。静态前缀（约占整个提示的 70%）可以缓存并低成本复用，动态后缀（约 30%）每轮重新计算。
 
 ```typescript
 function buildSystemPrompt(config: SessionConfig): string {
@@ -414,11 +414,11 @@ function buildSystemPrompt(config: SessionConfig): string {
 }
 ```
 
-你的 CLAUDE.md 内容位于边界之上。这意味着项目记忆被缓存——直接的成本优势。
+你的 CLAUDE.md 内容在边界之上，也就是说项目记忆会被缓存——直接省钱。
 
 ### 19 个工具及权限层级
 
-泄露的源代码揭示了 19 个工具，每个分配到三个权限层级之一：
+泄露源代码揭示了 19 个工具，各自归属三个权限层级之一：
 
 | 层级 | 工具 | 能力 |
 |------|-------|-------------|
@@ -426,11 +426,11 @@ function buildSystemPrompt(config: SessionConfig): string {
 | **WorkspaceWrite** | `write_file`、`edit_file`、`create_directory`、`rename` | 可以修改项目内的文件 |
 | **FullAccess** | `bash`、`browser`、`http_request`、`install_package` | 可以执行任意命令、访问网络 |
 
-权限层级在客户端强制执行。用户配置最大层级；Agent 只能使用该层级或更低层级的工具。只读会话确实无法调用 `bash`。
+权限由客户端强制执行。用户设定最大权限层级，Agent 只能调用该层级及以下的工具。只读会话确实无法调用 `bash`。
 
 ### 自动压缩：隐藏的错误恢复
 
-当上下文窗口被填满时，Claude Code 的压缩系统有两条路径：
+上下文窗口快满时，Claude Code 的压缩系统有两条路径：
 
 ```
 Proactive path (normal):
@@ -488,11 +488,11 @@ class ConversationManager {
 
 ### hasAttemptedReactiveCompact
 
-一个布尔值。它修复了早期版本中的无限重试循环——一个无法被充分压缩的对话会陷入循环：压缩 → 重试 → 失败 → 压缩 → 重试 → 失败。修复只需一行代码：在重试之前设置 `this.hasAttemptedReactiveCompact = true`。
+就一个布尔值，却修复了早期版本的无限重试循环——如果对话怎么压缩都不够短，就会陷入死循环：压缩 → 重试 → 失败 → 压缩 → 重试 → 失败。修复方法就一行：重试前先把 `this.hasAttemptedReactiveCompact` 设为 `true`。
 
 ### ANTI_DISTILLATION_CC
 
-一种针对 API 流量拦截的对抗措施：
+一种防止 API 流量被拦截窃取的对抗手段：
 
 ```typescript
 if (config.ANTI_DISTILLATION_CC) {
@@ -512,11 +512,11 @@ function buildDecoyTool(name: string, description: string): ToolDefinition {
 }
 ```
 
-如果竞争对手拦截了 Claude Code 与 Anthropic API 之间的 API 流量，对话数据中会包含这些虚假的工具定义。任何用拦截到的数据训练模型的人都会教其模型调用不存在的工具。这是对抗性防御——系统毒化了训练数据提取过程。
+如果有人拦截了 Claude Code 与 Anthropic API 之间的流量，对话数据里就会混入这些假工具定义。拿这些数据训练模型的人，只会教出一个不断调用不存在工具的模型。这是一种对抗性防御——从源头毒化被窃取的训练数据。
 
 ### 容器检测
 
-Claude Code 检测是否在容器中运行并调整行为：
+Claude Code 会检测是否运行在容器中，并据此调整行为：
 
 ```typescript
 async function detectContainerEnvironment(): Promise<ContainerInfo> {
@@ -544,7 +544,7 @@ async function detectContainerEnvironment(): Promise<ContainerInfo> {
 }
 ```
 
-在容器内：不能使用 `sudo`，不能安装系统软件包，文件路径假设会调整。检测结果被注入到系统提示的动态部分——Agent 了解自己的环境并相应调整。
+在容器内：不能用 `sudo`，不能装系统软件包，文件路径的假设也会随之调整。检测结果注入系统提示的动态部分——Agent 清楚自己在什么环境里，行为自然也会跟着变。
 
 ### CLAUDE.md 加载截断预算
 
@@ -554,16 +554,16 @@ async function detectContainerEnvironment(): Promise<ContainerInfo> {
 |----------|-------|---------|
 | `MEMORY_FILE_TOKEN_BUDGET` | 4,096 | 单个 CLAUDE.md 文件的最大 token 数 |
 | `MEMORY_TOTAL_TOKEN_BUDGET` | 12,288 | 所有记忆文件合计的最大 token 数 |
-| `AUTO_MEMORY_LINE_CAP` | 200 | 从自动记忆加载的最大行数 |
-| `AUTO_MEMORY_BYTE_CAP` | 25,600 | 从自动记忆加载的最大字节数（约 25KB） |
+| `AUTO_MEMORY_LINE_CAP` | 200 | 自动记忆加载的最大行数 |
+| `AUTO_MEMORY_BYTE_CAP` | 25,600 | 自动记忆加载的最大字节数（约 25KB） |
 
-这些值不可配置。它们被编译进 `SystemPromptBuilder` 中。
+这些值不可配置，直接编译在 `SystemPromptBuilder` 里。
 
 ---
 
 ## Claude Code 中的进化实际如何运作
 
-Claude Code 中的进化循环：
+Claude Code 的进化循环：
 
 ```mermaid
 graph TD
@@ -580,7 +580,7 @@ graph TD
     J[User adds slash commands] --> F
 ```
 
-三个来源为下一次会话提供信息：
+三个信息来源共同塑造下一次会话：
 
 | 来源 | 谁来写 | 如何进化 |
 |--------|--------------|---------------|
@@ -590,14 +590,14 @@ graph TD
 
 ### Claude Code 不做什么
 
-Claude Code 中的进化是**被动提取，而非从结果中主动学习。** Agent 观察并记录。它不会：
+Claude Code 的进化方式是**被动提取，不是从结果中主动学习**。Agent 只管观察和记录，不会：
 
-- **从反馈信号中学习** — 不像 Cursor 的 Bugbot 那样根据正面反应提升规则、根据负面反馈降级规则。Claude Code 没有"这个 CLAUDE.md 条目有帮助"vs."这个没有"的机制。
-- **自主创建技能** — 不像 Hermes 那样在检测到重复的工具调用模式后创建 SKILL.md 文件。Claude Code 的技能是人类编写的。
-- **在空闲时间整合记忆** — 不像 OpenClaw 的 Dreaming 过程那样在后台重组记忆。Claude Code 的自动记忆是只追加的；没有修剪过程。
-- **通过实验来填补能力差距** — Agent 不会自己尝试某些事情来看它是否有效。所有学习都来自用户发起的会话。
+- **从反馈信号中学习** — Cursor 的 Bugbot 会根据正面反馈提升规则、根据负面反馈降级规则。Claude Code 没有这种"这条有用"和"这条没用"的区分机制。
+- **自主创建技能** — Hermes 检测到重复的工具调用模式后会自动创建 SKILL.md。Claude Code 的技能只能人工编写。
+- **在空闲时整合记忆** — OpenClaw 有 Dreaming 过程，能在后台重组记忆。Claude Code 的自动记忆只追加，没有修剪和整理。
+- **通过试错填补能力缺口** — Agent 不会自己做实验看看什么管用。一切学习都来自用户发起的会话。
 
-进化模型在设计上是保守的。Agent 编写的记忆可能漂移、积累噪声或编码错误模式的风险，被换成了 CLAUDE.md 保持在人类控制之下的保障。自动记忆添加了轻量级的自动层，但它补充人类记忆而非取代它。
+这种进化模型本身就是保守设计。CLAUDE.md 始终由人类掌控，牺牲了一些自动化能力，但也规避了 Agent 自动写入的记忆可能漂移、积累噪声、甚至固化错误模式的风险。自动记忆只是一层轻量补充，而非替代。
 
 ### 由此产生的成长轨迹
 
@@ -620,6 +620,6 @@ Month 3: CLAUDE.md stable (~150 lines, well-curated).
          Agent behaves like a team member who read the docs.
 ```
 
-这个限制是真实的：没有反馈驱动的学习，改进曲线完全取决于人类投入在管理上的时间。一个维护良好的 CLAUDE.md 能产生一个显著更好的 Agent；一个被忽视的则几乎没有超越基线的改进。
+这个局限是实实在在的：没有反馈驱动的学习，改进曲线完全取决于人类在记忆管理上花多少心思。CLAUDE.md 维护得好，Agent 表现就明显好；放任不管，Agent 几乎不会比初始状态强多少。
 
-下一章介绍 Cursor——一个押注于基础设施级进化、反馈驱动规则学习的系统，也是唯一一个确凿地从大规模真实用户信号中学习的生产系统。
+下一章讲 Cursor——一个在基础设施层面押注进化能力、用反馈驱动规则学习的系统，也是目前唯一有确凿证据表明能从大规模真实用户信号中学习的生产系统。
