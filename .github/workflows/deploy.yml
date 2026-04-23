@@ -35,8 +35,8 @@ jobs:
           sudo install -m 755 mdbook-mermaid /usr/local/bin/mdbook-mermaid
           rm -f mdbook-mermaid
 
-      - name: Build the book
-        run: mdbook build
+      - name: Build books (English + Chinese)
+        run: bash build.sh
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
