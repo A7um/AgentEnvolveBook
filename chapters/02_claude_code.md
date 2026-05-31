@@ -348,6 +348,103 @@ The `agentskills.io` standard means skills are interoperable: a skill written fo
 
 ---
 
+## The Plugin Ecosystem (May 2026)
+
+By May 2026, Claude Code's skills system had grown into a full plugin ecosystem. Anthropic launched an official plugin marketplace on May 22, 2026 (`anthropics/claude-plugins-official`, 20K+ stars in the first week). A community marketplace (`claude-plugins-community`) followed immediately, with an automated review pipeline for submissions.
+
+A plugin is the distribution format. It bundles everything an agent extension needs:
+
+```
+Plugin = distribution package containing:
+  ├── skills/         (SKILL.md files — probabilistic activation)
+  ├── agents/         (subagent definitions)
+  ├── hooks/          (deterministic lifecycle event handlers)
+  ├── mcp-servers/    (Model Context Protocol servers)
+  └── commands/       (slash commands)
+
+Namespaced as /plugin-name:skill-name to prevent conflicts
+```
+
+Skills, hooks, agents, MCP servers, and slash commands — previously scattered across separate directories and configuration files — now ship as a single installable unit. Namespacing (`/plugin-name:skill-name`) prevents conflicts when multiple plugins define skills with similar names.
+
+### The Marketplace Numbers
+
+The ecosystem grew fast:
+
+| Metric | Value (May 2026) |
+|--------|-------------------|
+| Official marketplace plugins | 425+ |
+| Community skills (tonsofskills.com) | 2,810+ |
+| CLI package manager | `ccpi` (Claude Code Plugin Installer) |
+| Open-source marketplace | `jeremylongshore/claude-code-plugins-plus-skills` |
+
+`tonsofskills.com` became the npm-like registry for agent skills, searchable and installable via the `ccpi` CLI. The open-source marketplace (`claude-code-plugins-plus-skills`) serves teams that want to self-host their plugin registry.
+
+Not all of it is safe. A Snyk audit in February 2026 found that **13% of agent-skills packages had critical security flaws** — dependency injection vulnerabilities, unconstrained file system access, and skills that silently exfiltrated context to external endpoints. The community marketplace's automated review pipeline was a direct response.
+
+### Hooks — Deterministic Lifecycle Events
+
+Hooks are the other half of the plugin system, and they solve a fundamental problem with skills: skills are *probabilistic*. The agent decides whether to activate a skill based on its description and the current task. Sometimes it doesn't activate a skill when it should. Sometimes it activates the wrong one.
+
+Hooks are **deterministic**. They fire on specific lifecycle events, every time, unconditionally:
+
+| Event | When It Fires |
+|-------|--------------|
+| `SessionStart` | Session begins — before the first user message is processed |
+| `PreToolUse` | Before any tool call executes |
+| `PostToolUse` | After any tool call completes |
+| `MessageDisplay` | Before assistant message is shown to the user |
+| `prompt-submit` | When the user submits a prompt |
+| `session-stop` | When the session ends |
+| `pre-commit` | Before a git commit is created |
+
+Hooks are configured in `settings.json` (project-local or user-global), not in markdown files. A `SessionStart` hook can return `reloadSkills: true` to force a skill re-scan, or set `sessionTitle` to label the session. A `MessageDisplay` hook can transform or suppress assistant message text before the user sees it.
+
+The key distinction:
+
+| | Skills | Hooks |
+|---|--------|-------|
+| **Activation** | Probabilistic — agent decides | Deterministic — event-driven |
+| **Purpose** | Reusable procedures, multi-step workflows, codified expertise | Guardrails, telemetry, auto-format, blocking unsafe actions |
+| **Reliability** | Agent may not invoke when appropriate | Always fires on the registered event |
+| **Format** | Markdown (SKILL.md) | Code (configured in settings.json) |
+
+Skills teach the agent *how* to do things. Hooks ensure certain things *always happen* — or *never happen*.
+
+### Skills System Updates
+
+The skills system itself matured alongside hooks:
+
+- **`disallowed-tools` frontmatter**: Skills can now declare which tools should be removed from the agent's tool set while the skill is active. A security-review skill can strip `bash` access; a documentation skill can strip `write_file`. This is tool-level sandboxing per skill.
+- **`/reload-skills`**: Re-scans skill directories mid-session without restarting. Useful during skill development or when a hook installs new skills dynamically.
+- **`/code-review --fix`**: Applies review findings automatically instead of just reporting them. The `/simplify` command is syntactic sugar for this.
+- **Security-guidance plugin**: A first-party plugin that performs real-time vulnerability detection on code edits, diffs, and commits. Configurable via `.claude/claude-security-guidance.md` and `.claude/security-patterns.yaml`. Teams using it reported a **30–40% reduction** in security-related PR review comments.
+
+### Superpowers — The Dominant Methodology Plugin
+
+`obra/superpowers` is the most installed plugin in the Claude Code ecosystem: **213K+ stars**, **476K+ installs** on the official marketplace.
+
+Superpowers is a methodology plugin. It doesn't add new capabilities — it forces the agent through a structured workflow:
+
+```
+Superpowers enforced workflow:
+  1. Brainstorming     — explore the problem space
+  2. Design            — choose an approach
+  3. Planning           — break into steps
+  4. Subagent-driven development — execute via subagents
+  5. TDD               — test-driven development
+  6. Code review        — review own output
+  7. Finishing          — cleanup and documentation
+```
+
+The implementation is a `SessionStart` hook that injects the `using-superpowers` skill into context **before the first response**. Every message the agent produces is governed by the methodology. The "1% rule" — if there's even a 1% chance a skill applies, the agent must invoke it — pushes skill activation from best-effort to near-mandatory.
+
+The results are measurable. Before Superpowers, skill execution reliability (the agent actually using a relevant skill when one existed) was approximately **10%**. With Superpowers, it climbed to **66%**. The gain comes not from better skill matching but from the methodology forcing the agent to check its skill inventory at every step.
+
+Superpowers is cross-platform: it also works on Codex CLI, Cursor, Gemini CLI, and Copilot CLI. The plugin format is the same; only the installation path differs.
+
+---
+
 ## Leaked Internals (March 2026 Source Leak)
 
 The leaked 512,000-line TypeScript source map provided unprecedented visibility into how Claude Code actually works. Here are the most architecturally significant findings.
@@ -571,33 +668,37 @@ graph TD
     B --> C[Auto memory extracts observations]
     C --> D["~/.claude/projects/.../memory/ updated"]
     D --> E[Next session starts]
-    E --> F[CLAUDE.md + auto memory loaded into prompt]
+    E --> F[CLAUDE.md + auto memory + plugins loaded into prompt]
     F --> G[Agent starts better informed]
     G --> A
 
     H[User edits CLAUDE.md manually] --> F
     I[User creates skills in .claude/skills/] --> F
     J[User adds slash commands] --> F
+    K[User installs plugins via ccpi] --> F
+    L[SessionStart hooks inject skills/context] --> F
 ```
 
-Three sources feed the next session:
+Five sources feed the next session:
 
 | Source | Who writes it | How it evolves |
 |--------|--------------|---------------|
 | CLAUDE.md | Human (manual) | User adds conventions, corrects mistakes |
 | Auto memory | Agent (automatic) | Agent extracts patterns from interactions |
 | Skills + commands | Human (manual) | User creates reusable procedures |
+| Plugins | Community / first-party | Installed via marketplace; bundle skills, hooks, agents, MCP servers |
+| Hooks | Plugin authors / user | Deterministic lifecycle handlers; inject context, enforce guardrails |
 
 ### What Claude Code Does Not Do
 
 The evolution in Claude Code is **passive extraction, not active learning from outcomes.** The agent observes and records. It does not:
 
 - **Learn from feedback signals** — unlike Cursor's Bugbot, which promotes rules based on positive reactions and demotes rules based on negative feedback. Claude Code has no mechanism for "this CLAUDE.md entry helped" vs. "this one didn't."
-- **Create skills autonomously** — unlike Hermes, which creates SKILL.md files after detecting repeated tool-call patterns. Claude Code's skills are human-authored.
+- **Create skills autonomously** — unlike Hermes, which creates SKILL.md files after detecting repeated tool-call patterns. Claude Code's skills are human-authored or plugin-installed, not agent-generated.
 - **Consolidate memory during idle time** — unlike OpenClaw's Dreaming process, which reorganizes memory in the background. Claude Code's auto memory is append-only; there is no pruning pass.
 - **Experiment to fill capability gaps** — the agent never tries something on its own to see if it works. All learning comes from user-initiated sessions.
 
-The evolution model is conservative by design. The risk of agent-written memory drifting, accumulating noise, or encoding incorrect patterns is traded for the guarantee that CLAUDE.md stays under human control. Auto memory adds a light automatic layer, but it supplements human memory rather than replacing it.
+The plugin ecosystem (May 2026) shifted this picture significantly. Methodology plugins like Superpowers inject structured workflows via hooks, pushing skill execution reliability from ~10% to ~66%. The agent still doesn't *learn* autonomously, but plugins and hooks ensure it *uses what it knows* far more reliably. The evolution model remains conservative — CLAUDE.md stays under human control, auto memory supplements rather than replaces — but the execution layer is now programmable in ways it wasn't before.
 
 ### The Resulting Trajectory
 
@@ -618,8 +719,14 @@ Month 3: CLAUDE.md stable (~150 lines, well-curated).
          Skills directory has 5 project-specific skills.
          Auto memory periodically reviewed by user.
          Agent behaves like a team member who read the docs.
+
+Month 4: Plugin ecosystem installed: Superpowers methodology,
+         security-guidance, team-specific plugins.
+         Hooks enforce guardrails on every tool call.
+         Skill execution reliability at 66% (up from ~10%).
+         Agent follows structured workflows, not just ad-hoc prompts.
 ```
 
-The limitation is real: without feedback-driven learning, the improvement curve depends entirely on the human investing time in curation. A well-maintained CLAUDE.md produces a dramatically better agent; a neglected one produces little improvement over baseline.
+The limitation is real: without feedback-driven learning, the improvement curve depends entirely on the human investing time in curation. A well-maintained CLAUDE.md produces a dramatically better agent; a neglected one produces little improvement over baseline. But the plugin ecosystem has changed the ceiling — installing a methodology plugin like Superpowers produces a step-function improvement without any per-project curation. The security concern is also real: with 13% of community packages flagged for critical flaws (Snyk, February 2026), the plugin supply chain is a new attack surface that didn't exist when Claude Code was skills-only.
 
 The next chapter covers Cursor — a system that bets on infrastructure-level evolution, feedback-driven rule learning, and the only production system that demonstrably learns from real user signals at scale.

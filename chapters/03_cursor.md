@@ -454,6 +454,115 @@ The context engine is the substrate. The evolution features are what grows on it
 
 ---
 
+## Automations and Autonomous Execution (May 2026)
+
+Through early 2026, Cursor's agent operated in a tight loop with the user: propose a change, wait for approval, execute, repeat. Every shell command, every MCP call, every external fetch required explicit permission. This kept the human in control but created a friction tax — experienced users spent more time clicking "Allow" than reviewing output.
+
+Cursor 3.5 (May 20) and 3.6 (May 29) shipped a set of features that moved the system toward sustained autonomous work: longer-running agents, fewer approval prompts, multi-repo reasoning, and parallel execution.
+
+### Auto-review Run Mode (Cursor 3.6, May 29)
+
+Auto-review is a new run mode that lets the agent work longer without stopping for permission on every tool call. It applies to Shell, MCP, and Fetch tool calls — the three categories that previously required explicit user approval.
+
+The system uses a three-step classifier chain:
+
+```
+Tool call intercepted
+  │
+  ├─→ Step 1: Allowlist check
+  │     Match in permissions.json allow_instructions?
+  │     → YES: Execute immediately
+  │     → NO: Continue to Step 2
+  │
+  ├─→ Step 2: Sandbox check
+  │     Can this call run in a sandbox?
+  │     (macOS, Linux, Windows/WSL2)
+  │     → YES: Execute in sandbox
+  │     → NO: Continue to Step 3
+  │
+  └─→ Step 3: LLM Classifier
+        Classifier decides:
+        → ALLOW: Execute
+        → TRY DIFFERENT APPROACH: Agent replans
+        → ASK USER: Fall back to approval prompt
+```
+
+Allowlisted calls run with zero latency. Sandboxable calls run in isolation — the sandbox prevents file system or network damage even if the command is destructive. Everything else goes to an LLM classifier that evaluates risk based on the command, the project context, and the current task.
+
+The classifier is configured via `permissions.json`:
+
+```json
+{
+  "autoRun": {
+    "allow_instructions": "npm test, npm run build, git status, git diff",
+    "block_instructions": "rm -rf, sudo, curl | bash"
+  }
+}
+```
+
+`allow_instructions` and `block_instructions` are natural-language descriptions, not exact command matches — the classifier interprets intent, not syntax. This is explicitly **not a security boundary**. The classifier is non-deterministic; it's a best-effort convenience layer. Security-critical restrictions still require Cursor's existing permission tiers.
+
+### /loop Skill (Cursor 3.5, May 20)
+
+`/loop` runs a prompt repeatedly on a local schedule until the desired outcome is achieved or the user stops it:
+
+```
+/loop "Run the test suite every 5 minutes and fix any failures"
+/loop "Check if the staging deployment is healthy"
+/loop "Monitor the build output and alert me if it fails"
+```
+
+If no fixed interval is specified, the agent decides when to wake — it can back off when nothing changes and check more frequently during active work. `/loop` turns the agent from a request-response tool into a background monitor. It enables use cases that were previously manual: continuous test-fixing, deployment health checks, periodic maintenance tasks.
+
+### Multi-repo Automations (Cursor 3.5, May 20)
+
+Automations — Cursor's headless agent runs — now support multiple repositories:
+
+| Before (single-repo) | After (multi-repo) |
+|----------------------|-------------------|
+| One automation = one repo | One automation = multiple repos |
+| Cross-repo work requires manual coordination | Agent reasons across all attached repos |
+| Separate test/verify steps per repo | Agent works across repos to deliver, test, and verify |
+
+A single automation can now read from a shared library repo, implement changes in a service repo, and update integration tests in a test repo — all in one run, with full cross-repo context.
+
+No-repo automations are also new: monitoring and reporting tasks that don't need a codebase at all. An automation can check external service health, aggregate metrics, or produce reports without being attached to any repository.
+
+Automations moved from a browser-only interface to the **Agents Window** inside the IDE. No more context-switching to a browser tab to manage background agents.
+
+### Parallel Plan Execution
+
+The "Build in Parallel" feature identifies independent steps in the agent's plan and runs them concurrently via async subagents:
+
+```
+Plan with 6 steps:
+  Step 1: Update User model          ─┐
+  Step 2: Update Product model        ├─ Independent → run in parallel
+  Step 3: Update Order model          ─┘
+  Step 4: Update shared types         ← Depends on 1-3 → sequential
+  Step 5: Update API routes           ← Depends on 4 → sequential
+  Step 6: Update tests                ← Depends on 5 → sequential
+```
+
+Steps 1–3 touch separate modules with no shared state — they execute simultaneously. Steps 4–6 depend on prior results and run sequentially. The system identifies these dependency edges automatically from the plan.
+
+For tasks that touch many independent modules — a large refactor, a migration, adding the same pattern to multiple services — parallel execution collapses wall-clock time proportionally to the number of independent branches.
+
+### Infrastructure Updates
+
+Supporting the autonomous execution features:
+
+| Update | What It Does |
+|--------|-------------|
+| **Composer 2.5 model** | Internal model tuned for sustained work and complex multi-step instructions |
+| **Environment version history** | Cloud agent environments now have rollback — revert to any previous state if an agent breaks something |
+| **Audit trails** | Every agent command logged with timestamps; full replay available |
+| **Environment-scoped secrets** | Secrets can be scoped to specific cloud agent environments, not just user/team level |
+
+Environment version history is particularly relevant for autonomous work. When an agent runs for hours without supervision, the ability to roll back to a known-good state is a safety net that makes longer autonomy practical.
+
+---
+
 ## Summary: Cursor's Evolution Stack
 
 ```
@@ -478,6 +587,13 @@ The context engine is the substrate. The evolution features are what grows on it
 │  ├── 52% → 78% resolution rate from rules alone       │
 │  └── @cursor remember for direct teaching              │
 │                                                      │
+│  Automations & Autonomous Execution (May 2026)        │
+│  ├── Auto-review: allowlist → sandbox → LLM classifier│
+│  ├── /loop: repeated prompt execution on schedule     │
+│  ├── Multi-repo automations with cross-repo reasoning │
+│  ├── Parallel plan execution via async subagents      │
+│  └── Environment rollback + audit trails              │
+│                                                      │
 │  Context Engine (infrastructure)                      │
 │  ├── Merkle tree change detection                     │
 │  ├── AST chunking (Tree-sitter)                       │
@@ -499,8 +615,11 @@ Cursor's evolution strategy is layered:
 | Rules (`.mdc`) | Human (manual) | Developer experience |
 | Continual learning | Agent (automatic) | Session transcripts |
 | Bugbot rules | System (automated) | Real user reactions at scale |
+| Automations | Agent (autonomous) | Task outcomes, test results, deployment status |
 
-The bottom layer — Bugbot learned rules — is the most important. It's the only production system where the evolution loop is fully closed: action → feedback → policy update → changed behavior. Every other system in this book either requires human curation (CLAUDE.md), depends on the agent's self-assessment (Hermes 15-call checkpoint), or operates on static rules (most competitors).
+The bottom layer — Bugbot learned rules — remains the most important for *evolution*. It's the only production system where the evolution loop is fully closed: action → feedback → policy update → changed behavior. Every other system in this book either requires human curation (CLAUDE.md), depends on the agent's self-assessment (Hermes 15-call checkpoint), or operates on static rules (most competitors).
+
+The May 2026 automations layer is the most important for *autonomy*. Auto-review, `/loop`, multi-repo automations, and parallel execution collectively move Cursor from an approval-per-action model to sustained autonomous work. The agent can now run for hours, across multiple repositories, with sandbox-backed safety and environment rollback as the safety net. This is the infrastructure that makes the evolution features *compound* — an agent that runs longer and touches more code generates more feedback signals, which feeds the Bugbot learning loop, which improves the next autonomous run.
 
 Bugbot proves that signal-gated rule promotion works at scale. The 26-point improvement in resolution rate (52% → 78%) came from rules, not from a better model. That's the strongest evidence in production that agent self-evolution delivers measurable results.
 
