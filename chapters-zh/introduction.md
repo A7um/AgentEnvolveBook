@@ -6,18 +6,20 @@
 
 书中涵盖的 Agent 不是研究原型，而是：
 
-- **Claude Code** — Anthropic 的编程 Agent（截至 2026 年 3 月，年化收入 25 亿美元）
+- **Claude Code** — Anthropic 的编程 Agent（截至 2026 年 5 月，年化收入 25 亿美元）
 - **Cursor** — AI 优先的 IDE（日均 4 亿+ AI 请求，10 亿美元 ARR）
-- **OpenAI Codex** — 带记忆、子 Agent 和插件的编程 Agent
+- **OpenAI Codex** — 桌面 Agent，集成 Chronicle 环境记忆、hook 和移动端操控
 - **Hermes Agent** — Nous Research 的自我改进 Agent（99K+ GitHub stars）
 - **OpenClaw** — 开源个人 AI Agent（350K+ GitHub stars）
 - **GitHub Copilot** — 微软的编程助手，带 Agent 式记忆
-- **Gemini CLI** — Google 的终端 Agent，内置记忆管理器
+- **Gemini CLI** — Google 的终端 Agent，具备分层记忆、自动记忆和技能系统（105K+ GitHub stars）
 - **Windsurf** — Codeium 的 Cascade Agent，可自动生成记忆
-- **Devin** — Cognition 的自主软件工程师，能自我验证
+- **Devin** — Cognition 的自主软件工程师，具备持久化记忆、Auto Triage 和自我验证
 - **Manus** — 9 个月做到 1 亿美元 ARR 的自主 Agent
 
 这些产品无一例外都构建了自我进化机制。方法各异——文件系统持久化、记忆数据库、学习规则、技能库——但要解决的问题是同一个：不会学习的 Agent，就是永远重复同样错误的 Agent。
+
+自 2026 年 4 月起，一个新的进化方向浮出水面：**跨 Agent 技能生态系统**。Claude Code 插件市场于 2026 年 5 月 22 日上线，社区已产出 2,810+ 技能和 425+ 插件。Superpowers（`obra/superpowers`）是一个跨平台的方法论框架，拥有 213K+ GitHub stars 和 476K+ 安装量，在 Claude Code、Codex CLI、Cursor、Gemini CLI、Copilot CLI 等工具中强制推行结构化工作流——头脑风暴、设计审批、TDD、两阶段审查。这已不只是单个 Agent 从自身会话中学习，而是社区编写的规范在大规模约束 Agent 行为。
 
 本书梳理了它们做了什么、怎么做到的，以及你能从中借鉴什么。
 
@@ -25,15 +27,17 @@
 
 ## 证据标准
 
-书中每一个论断都可追溯到以下四类来源：
+书中每一个论断都可追溯到以下五类来源：
 
 1. **泄露的源代码** — Claude Code npm source map（2026 年 3 月）提供了 512K 行代码，涵盖 `SystemPromptBuilder`、记忆发现逻辑、压缩系统和反蒸馏对抗措施。
 
-2. **开源代码仓库** — Hermes（`NousResearch/hermes-agent`，MIT 许可证）和 OpenClaw 完全公开可读。我们引用了文件路径、函数名和行号范围。
+2. **开源代码仓库** — Hermes（`NousResearch/hermes-agent`，MIT 许可证）和 OpenClaw 完全公开可读。Gemini CLI 完全开源（105K+ stars）。我们引用了文件路径、函数名和行号范围。
 
 3. **官方文档和博客文章** — Cursor 的工程博客、Peak Ji 的"Context Engineering for AI Agents"演讲、OpenAI 的 Codex API 文档、Devin 的产品更新、Windsurf 的架构文章。
 
-4. **已发布产品的行为** — 生产系统中可观察、可复现的行为。如果无法阅读源代码，我们会明确说明，并描述观察到的现象。
+4. **跨 Agent 技能生态系统** — Claude Code 插件市场（`anthropics/claude-plugins-official`，20K+ stars）、社区技能仓库（2,810+ 技能、425+ 插件，来自 tonsofskills.com）以及 Superpowers（213K+ stars，476K+ 安装量）等跨平台框架，直接证明了社区驱动的进化机制的存在。这些都是可检视的产物——带 YAML frontmatter 的技能、有明确生命周期事件的 hook、可观察行为的强制工作流。
+
+5. **已发布产品的行为** — 生产系统中可观察、可复现的行为。如果无法阅读源代码，我们会明确说明，并描述观察到的现象。
 
 我们**不**引用：没有落地产品的学术论文、凭空提出的分类体系、关于 Agent *可能*做什么的猜测、会议海报、综述论文。
 
@@ -47,8 +51,8 @@
 | Cursor | 工程博客 + 开源 Priompt | 架构级 |
 | Manus | 博客文章 + 公开演讲 | 架构级 |
 | Codex | API 文档 + 开源 CLI | API + CLI 源代码 |
-| Copilot | 产品文档 + 可观察行为 | 外部观察 |
-| Gemini CLI | 官方文档 + CLI 源代码 | 文档 + CLI 源代码 |
+| Copilot | 产品文档 + 记忆架构博文 | 架构级 |
+| Gemini CLI | 完整源代码（开源，105K+ stars） | 代码级 |
 | Windsurf | 产品文档 + 可观察行为 | 外部观察 |
 | Devin | 博客文章 + 产品观察 | 外部观察 |
 
