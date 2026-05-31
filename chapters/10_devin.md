@@ -2,7 +2,7 @@
 
 Devin, built by Cognition, was the first product to call itself an "AI software engineer." Launched in early 2025, it pioneered the idea that a coding agent should verify its own work before showing it to a human — running tests, checking output, and iterating until the result is correct.
 
-Devin's approach to evolution is fundamentally different from Claude Code or Hermes. It does not create persistent skills. It does not write memory files. Instead, Devin invests in **within-session improvement** — making each session's output as good as possible through systematic self-verification. And with Devin 2.2 (February 2026), the self-verification loop became the core product differentiator.
+Devin's approach to evolution started fundamentally different from Claude Code or Hermes. It did not create persistent skills. It did not write memory files. Instead, Devin invested in **within-session improvement** — making each session's output as good as possible through systematic self-verification. With Devin 2.2 (February 2026), the self-verification loop became the core product differentiator. Then in 2026, Devin added persistent memory, Auto Triage, and the Windsurf acquisition — closing the cross-session learning gap and expanding from coding agent to engineering teammate.
 
 This chapter also covers DeepWiki, Devin's public code understanding tool, and the context anxiety problem discovered during Devin's Sonnet 4.5 rebuild — a problem with implications for every agent that accumulates memory or skills.
 
@@ -136,6 +136,45 @@ What self-review catches that tests don't:
    - Code works but creates N+1 queries
    - Unbounded list operations on large datasets
 ```
+
+---
+
+## Auto Triage — From Coding Agent to Engineering Teammate
+
+### The Shift
+
+Devin 2.2's self-verification loop was reactive: a human assigns a task, and Devin executes it well. Auto Triage (2026) inverts the model. Devin monitors bugs, logs, and alerts in real time — without manual task assignment — and takes action autonomously.
+
+This is a fundamental shift in what "coding agent" means. The agent isn't helping the engineer. The agent *is* the engineer for a category of work that previously required human attention but not human creativity.
+
+### Automated Workflows
+
+| Workflow | Trigger | Output |
+|----------|---------|--------|
+| Incident postmortems | PagerDuty incident ends | Timeline, root cause analysis, action items — generated automatically |
+| Daily Sentry fixes | Overnight error accumulation | New Sentry errors pulled, fixed PRs opened by morning |
+| Weekly dependency updates | Scheduled scan | Outdated packages identified, tests run, upgrade PRs opened |
+| CI build repair | Failing CI build | Root cause identified, fix committed |
+| Health digests | Daily schedule | DataDog metrics summarized, posted to Slack |
+
+### What This Means for Evolution
+
+Auto Triage represents a different evolutionary axis than self-verification. Self-verification improves the *quality* of individual tasks. Auto Triage expands the *scope* of what the agent handles — it takes on work that would otherwise sit in a queue until a human triaged it.
+
+```
+Before Auto Triage:
+  6:00 AM  Sentry error fires → sits in dashboard
+  9:00 AM  Engineer arrives → reviews errors → picks one
+  9:30 AM  Engineer assigns to Devin (or fixes manually)
+  10:00 AM Fix merged
+
+After Auto Triage:
+  6:00 AM  Sentry error fires → Devin detects it
+  6:05 AM  Devin opens fix PR → runs tests → self-reviews
+  9:00 AM  Engineer arrives → reviews Devin's PR → merges
+```
+
+The engineer's role shifts from triage-then-fix to review-then-merge. The agent absorbs the entire detect-diagnose-fix loop for routine issues.
 
 ---
 
@@ -337,6 +376,67 @@ None of these fully solve the problem. Token budgets are arbitrary (why 12K and 
 
 ---
 
+## Persistent Memory (May 2026)
+
+### Filling the Gap
+
+Earlier in this chapter, we identified Devin's lack of cross-session learning as its critical gap — the CORS-for-15-minutes-twice problem. In 2026, Devin shipped persistent memory that carries across sessions.
+
+The agent now learns from previous sessions and refines internal playbooks. When Devin encounters a problem it has solved before, it draws on that prior experience rather than starting from scratch:
+
+```
+Before persistent memory (the original gap):
+  Session 1: Debug CORS issue → 15 min → fix
+  Session 2: Debug CORS issue → 15 min → fix (identical process)
+
+After persistent memory:
+  Session 1: Debug CORS issue → 15 min → fix → stores resolution
+  Session 2: Recalls CORS resolution → applies fix → 2 min
+```
+
+This closes the gap we described. Devin now has both self-verification (within-session improvement) and persistent memory (cross-session improvement).
+
+### How It Interacts with Context Anxiety
+
+Persistent memory reintroduces the tension described in the context anxiety section: every memory entry loaded at session start consumes tokens. Devin's context window tiers — 128K (Starter), 2M (Pro), 10M+ (Enterprise) — provide headroom, but the fundamental trade-off remains. More memory means better-informed decisions at the cost of thinking space. The 10M+ Enterprise tier suggests Cognition's bet: if the window is large enough, the anxiety threshold is pushed so far out that memory accumulation is a net positive for most tasks.
+
+### Dynamic Re-planning
+
+Alongside persistent memory, Devin gained dynamic re-planning: if the agent hits a roadblock mid-task, it alters its strategy without waiting for human intervention. This is subtler than it sounds. Earlier Devin versions would follow the initial plan stubbornly, retrying failed approaches. Dynamic re-planning means the agent can recognize "this approach isn't working" and pivot — a prerequisite for the kind of adaptive behavior that makes persistent memory useful. Without re-planning, remembered strategies become rigid playbooks. With it, they become starting points that the agent adapts to the current situation.
+
+---
+
+## The Windsurf Acquisition
+
+### What Happened
+
+In mid-2025, Cognition acquired Windsurf (formerly Codeium) — a mature IDE-extension product with an established user base in the pair-programming segment of the market.
+
+### Product Strategy
+
+The acquisition gave Cognition a two-tier product surface:
+
+| Product | Mode | Use Case |
+|---------|------|----------|
+| Devin | Autonomous | Full tasks: tickets, bugs, deployments — agent works independently |
+| Windsurf | Collaborative | IDE pair programming — agent works alongside the developer in real time |
+
+Both share infrastructure: code understanding, search, and indexing. A developer might use Windsurf for real-time coding assistance during the day and assign overnight tasks to Devin's Auto Triage.
+
+### Platform Maturation
+
+The combined platform has matured significantly:
+
+| Capability | Detail |
+|-----------|--------|
+| v3 API | RBAC, service user authentication, session orchestration |
+| Automation builder | File-change triggers for GitHub push events |
+| MCP server | Available in MCP marketplace for tool integration |
+| Platform selection | Linux or Windows default for new sessions |
+| Context windows | 128K (Starter) → 2M (Pro) → 10M+ (Enterprise) |
+
+---
+
 ## What Devin Teaches About Evolution
 
 ### Self-Verification Is Within-Session Evolution
@@ -354,40 +454,21 @@ Generation N: Final implementation
 
 Each iteration improves the output. The agent evolves its solution within the session. This is powerful — Devin's self-caught error rate demonstrates real value.
 
-### But Devin Lacks Cross-Session Learning
+### Cross-Session Learning: Gap Closed
 
-The critical gap: Devin does not get better over time from accumulated experience. Each session starts fresh:
-
-```
-Session 1:
-  Agent encounters CORS issue with new endpoint
-  Agent debugs for 15 minutes
-  Agent finds fix: add cors middleware to route
-  Agent submits PR
-  ← Knowledge of CORS fix exists only in session 1's context
-
-Session 2 (same project, similar task):
-  Agent encounters CORS issue with new endpoint
-  Agent debugs for 15 minutes (same process as session 1)
-  Agent finds fix: add cors middleware to route
-  Agent submits PR
-  ← Same debugging, same time, no learning from session 1
-```
-
-Compare with Hermes:
+When this chapter was first written, we identified Devin's lack of cross-session learning as the critical gap. The contrast with Hermes was stark:
 
 ```
-Session 1:
-  Agent encounters CORS issue
-  Agent debugs → finds fix
-  Agent creates SKILL.md: "cors-endpoint-setup"
-  Agent updates MEMORY.md: "This project requires CORS middleware"
+Devin (before persistent memory):
+  Session 1: Debug CORS issue → 15 min → fix
+  Session 2: Debug same CORS issue → 15 min → fix (no memory)
 
-Session 2:
-  Agent searches skills → finds "cors-endpoint-setup"
-  Agent loads skill → applies procedure
-  Fix applied in 2 minutes instead of 15
+Hermes:
+  Session 1: Debug CORS → fix → create SKILL.md
+  Session 2: Load skill → apply fix → 2 min
 ```
+
+With persistent memory (May 2026), Devin now closes this gap. The agent retains knowledge across sessions and refines its internal playbooks — not through explicit skill files like Hermes, but through a persistent memory store that informs future sessions.
 
 ### The Self-Verification + Learning Combination
 
@@ -396,7 +477,7 @@ The ideal system combines both:
 1. **Self-verification** (Devin): Catches errors before submission
 2. **Cross-session learning** (Hermes): Prevents the same errors in future sessions
 
-No production system implements both at full depth. Devin has the best self-verification but no cross-session learning. Hermes has the best cross-session learning but less sophisticated self-verification (the 15-call checkpoint is lighter than Devin's full review-test-fix cycle).
+Devin is now the first production system to implement both at depth. Self-verification ensures each session's output is high quality. Persistent memory ensures the agent improves across sessions. Hermes still has more sophisticated skill creation (explicit, structured SKILL.md files vs. Devin's implicit memory), but Devin's combination of rigorous self-review, persistent memory, and Auto Triage represents the most complete within-session + cross-session evolution loop in production.
 
 ### Context Anxiety as a Design Constraint
 
@@ -422,10 +503,27 @@ The context anxiety discovery should change how every agent builder thinks about
 │  ├── Screen recordings as evidence           │
 │  └── Mandatory before PR submission          │
 │                                              │
+│  Auto Triage Layer                           │
+│  ├── Real-time monitoring (logs, alerts)     │
+│  ├── Autonomous fix PRs (Sentry, CI, deps)   │
+│  ├── Incident postmortems (PagerDuty)        │
+│  └── No human assignment required            │
+│                                              │
+│  Memory Layer                                │
+│  ├── Persistent memory (cross-session)       │
+│  ├── Internal playbook refinement            │
+│  └── Dynamic re-planning on roadblocks       │
+│                                              │
 │  Knowledge Layer                             │
 │  ├── DeepWiki (auto-indexed repo knowledge)  │
 │  ├── .devin/wiki.json (configuration)        │
 │  └── Ask Devin (conversational code search)  │
+│                                              │
+│  Platform                                    │
+│  ├── Devin (autonomous) + Windsurf (IDE)     │
+│  ├── v3 API with RBAC, session orchestration │
+│  ├── MCP server in marketplace               │
+│  └── Context: 128K / 2M / 10M+ tiers        │
 │                                              │
 │  Discovery                                   │
 │  └── Context anxiety (Sonnet 4.5 rebuild)    │
@@ -433,12 +531,11 @@ The context anxiety discovery should change how every agent builder thinks about
 │      - Parallelism accelerates the problem   │
 │      - Memory/skills consume thinking space  │
 │                                              │
-│  Gap                                         │
-│  └── No cross-session learning               │
-│  └── No skill creation from experience       │
-│  └── No persistent memory files              │
+│  Remaining Gap                               │
+│  └── No structured skill creation (cf. Hermes│
+│      SKILL.md — Devin's memory is implicit)  │
 │                                              │
 └──────────────────────────────────────────────┘
 ```
 
-Devin's contribution to the self-evolution landscape is twofold. First, it proved that self-verification — the agent reviewing and fixing its own work — is a viable and valuable within-session evolution mechanism. Second, it surfaced the context anxiety problem — the fundamental tension between accumulated knowledge and available thinking space that every evolving agent must navigate.
+Devin's contribution to the self-evolution landscape is now threefold. First, it proved that self-verification — the agent reviewing and fixing its own work — is a viable within-session evolution mechanism. Second, it surfaced the context anxiety problem — the fundamental tension between accumulated knowledge and available thinking space. Third, with persistent memory and Auto Triage, it demonstrated that a coding agent can evolve across sessions *and* expand its own scope of responsibility — not just doing assigned work better, but autonomously identifying and completing work that was never explicitly assigned.

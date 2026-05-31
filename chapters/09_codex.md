@@ -92,13 +92,11 @@ The key philosophical difference: Claude Code allows the agent to write its own 
 
 ---
 
-## Memory Preview (April 2026)
+## Memory System
 
 ### Cross-Session Memory
 
-In April 2026, OpenAI announced a Memory Preview for Codex — the ability to retain context across sessions, similar to ChatGPT's memory feature but for coding agents.
-
-The announced capabilities:
+In April 2026, OpenAI launched Memory for Codex — the ability to retain context across sessions, similar to ChatGPT's memory feature but for coding agents. By May 2026, the system had matured significantly.
 
 | Feature | Description |
 |---------|-------------|
@@ -107,9 +105,30 @@ The announced capabilities:
 | Project continuity | Remembers project state, open issues, and in-progress work |
 | Memory management | Users can view, edit, and delete stored memories |
 
+### Storage: SQLite and Versioned Summaries
+
+Memory state moved from in-memory structures to dedicated SQLite databases — a shift that gives memories durability and queryability independent of the agent process. The key architectural change: memory summaries are now versioned and rebuilt when stale. When the underlying memories change (new entries, deletions, contradictions), the summary is regenerated rather than patched. This keeps long-lived memory context leaner and prevents the slow accumulation of obsolete or contradictory entries.
+
+```
+Memory lifecycle:
+  1. Agent stores fact: "This project uses Prisma, not Sequelize"
+  2. Fact written to SQLite → summary marked stale
+  3. Next session: summary rebuilt from current facts
+  4. Stale/contradicted facts pruned during rebuild
+
+Old approach (append-only):
+  Memory grows monotonically → context bloat → anxiety threshold
+
+New approach (versioned summaries):
+  Memory grows → periodic rebuild → only current facts survive
+  Context cost stays proportional to relevant knowledge
+```
+
+Dedicated memory tools are gated in config — teams can enable or disable memory features per deployment, preventing uncontrolled memory growth in environments where it's not wanted.
+
 ### How It Differs from AGENTS.md
 
-AGENTS.md is static — it changes only when a human edits it. Memory Preview is dynamic — the agent stores memories automatically based on interactions:
+AGENTS.md is static — it changes only when a human edits it. Memory is dynamic — the agent stores memories automatically based on interactions:
 
 ```
 AGENTS.md (static):
@@ -117,17 +136,17 @@ AGENTS.md (static):
   Persists until human removes it
   Available to all agents working on this repo
 
-Memory Preview (dynamic):
+Memory (dynamic):
   Agent infers: "This user prefers concise PR descriptions"
   Stored automatically after the interaction
   Available to this user's future sessions (not repo-wide)
 ```
 
-The combination is powerful: AGENTS.md for project-level facts that apply to all developers, Memory Preview for user-level preferences that follow the individual.
+The combination is powerful: AGENTS.md for project-level facts that apply to all developers, Memory for user-level preferences that follow the individual.
 
 ### Auto-Wake and Scheduled Work
 
-The most novel feature in the Memory Preview: agents that can schedule future work.
+Agents can schedule future work:
 
 ```
 User: "Run the integration test suite every night at 2am
@@ -141,7 +160,104 @@ Agent: [stores scheduled task]
        [goes back to sleep]
 ```
 
-This is a step toward persistent agent identity — the agent doesn't just remember past sessions, it plans for future ones. But the implementation details (how memory is stored, how scheduling works, what the token budget is) are not yet fully public.
+This is persistent agent identity — the agent doesn't just remember past sessions, it plans for future ones.
+
+---
+
+## Desktop Agent and Chronicle (May 2026)
+
+### From Sandbox to Desktop
+
+In six weeks (April 16 — May 14, 2026), Codex transformed from a sandboxed code-runner into a desktop agent. The timeline:
+
+| Date | Capability |
+|------|-----------|
+| April 16 | "Codex for (almost) everything" — computer-use on Mac: mouse/keyboard control of any application, local file access, in-app browser, image generation |
+| April 20 | Additional computer-use features |
+| May 14 | Mobile steering preview — ChatGPT mobile app shows live Codex sessions |
+| May 2026 | Computer Use extended to Windows |
+
+This is a fundamental shift in surface area. A sandboxed code-runner operates in a terminal and file system. A desktop agent operates on *anything the user can see* — spreadsheets, design tools, databases with GUI clients, internal admin panels. The agent is no longer constrained to code; it can drive any application.
+
+### Mobile Steering
+
+The May 14 mobile steering preview connected Codex sessions to the ChatGPT mobile app. Users can:
+
+- Watch live terminal output, file diffs, and screenshots from their phone
+- Approve or reject pending commands mid-session
+- Switch models during a run without restarting
+
+Sensitive material stays on the host machine — the mobile app receives rendered views, not raw data. This makes Codex the first major coding agent with asynchronous oversight from a mobile device: start a task at your desk, approve its actions from your pocket.
+
+### Remote SSH
+
+Codex gained secure, persistent SSH tunnels for operating on remote servers — real-time code deployment, diagnostics, and environment management without requiring the user to expose ports or configure VPNs. Combined with computer-use, this means Codex can operate on local GUI applications *and* remote headless servers in the same session.
+
+### Chronicle — Ambient Screen Memory
+
+Chronicle is an opt-in research preview (macOS only, ChatGPT Pro subscribers) that bridges the gap between what the agent remembers and what the user does outside of Codex sessions.
+
+```
+How Chronicle works:
+  1. User grants macOS Screen Recording + Accessibility permissions
+  2. Sandboxed agents run in background
+  3. Agents periodically capture screen images
+  4. Recent activity is distilled into memories:
+     - Files being edited (in any application)
+     - Workflows observed (deploy scripts, CI dashboards)
+     - Tools used (Figma, Notion, Slack, terminal)
+  5. Memories augment the normal Codex memory store
+```
+
+Chronicle's goal is context that the user never has to explicitly provide. Instead of telling the agent "I use Prisma for database migrations and deploy via GitHub Actions," the agent observes the user running Prisma commands and reviewing GitHub Actions logs, and stores those facts automatically.
+
+### Chronicle Risks
+
+| Risk | Detail |
+|------|--------|
+| Rate limit consumption | Background agents burn through API rate limits — Pro subscribers may hit caps faster than expected |
+| Prompt injection | Screen content is untrusted input. A malicious webpage or document displayed on screen could inject instructions into Chronicle's memory pipeline |
+| Storage | Memories are stored unencrypted on device. Anyone with disk access can read them |
+
+Chronicle uses the same model as other Memories, configurable via `consolidation_model`. Teams evaluating Chronicle should weigh the context benefit against the rate-limit cost and the security implications of feeding arbitrary screen content into the memory pipeline.
+
+---
+
+## Hooks and Extensions
+
+### Lifecycle Hooks
+
+Codex now exposes lifecycle hooks that let external systems observe and react to agent behavior:
+
+| Hook Event | Description |
+|-----------|-------------|
+| Subagent start/stop | Fires when a subagent is spawned or completes |
+| Tool execution | Fires before/after any tool call |
+| Turn metadata | Exposes turn-level data (tokens used, model, timing) |
+| Async approval/turn processing | Fires when the agent requests human approval or completes a turn |
+
+### Richer Hook Context
+
+Hooks now receive conversation history and subagent identity:
+
+```
+Hook input for a tool execution event:
+  {
+    "event": "tool_execution",
+    "subagent_id": "worker-3",
+    "subagent_type": "worker",
+    "tool": "file_write",
+    "arguments": { "path": "src/api/auth.ts", ... },
+    "conversation_history": [ ... recent turns ... ],
+    "parent_agent_id": "manager-1"
+  }
+```
+
+Identity-aware hooks allow a manager agent (or an external orchestrator) to track what specific subagents are doing — which tools they call, how many turns they consume, whether they're stuck in retry loops. This is observability infrastructure for multi-agent systems.
+
+### Extension Tools
+
+Extensions can register custom tools that appear in the agent's tool list alongside built-in tools. Extension tools receive the same rich context as hooks: conversation history, subagent identity, and turn metadata. This enables integrations that react to the agent's state — a Slack notifier that posts when a subagent fails, a metrics collector that tracks tool call patterns, a policy engine that blocks certain operations based on the subagent's role.
 
 ---
 
@@ -449,8 +565,21 @@ Each subagent starts with a fresh context window. The compounding loss problem i
 │                                              │
 │  Memory Layer                                │
 │  ├── AGENTS.md (human-written, repo-level)   │
-│  ├── Memory Preview (auto-learned, user-level)│
+│  ├── Memory (SQLite-backed, user-level)      │
+│  ├── Versioned summaries (auto-rebuilt)       │
+│  ├── Chronicle (ambient screen memory)       │
 │  └── Scheduled work (auto-wake for future)   │
+│                                              │
+│  Desktop Agent Layer                         │
+│  ├── Computer-use (Mac + Windows)            │
+│  ├── Mouse/keyboard control of any app       │
+│  ├── Mobile steering (approve from phone)    │
+│  └── Remote SSH (persistent tunnels)         │
+│                                              │
+│  Hooks & Extensions Layer                    │
+│  ├── Lifecycle hooks (tool, subagent, turn)  │
+│  ├── Identity-aware context (subagent ID)    │
+│  └── Extension tools with full context       │
 │                                              │
 │  Compaction Layer                            │
 │  ├── Responses API compaction (server-side)  │
@@ -472,6 +601,6 @@ Each subagent starts with a fresh context window. The compounding loss problem i
 └──────────────────────────────────────────────┘
 ```
 
-Codex is the most transparent agent system about its own limitations. The compaction endpoint makes information loss explicit. The subagent architecture provides a structural mitigation. But the fundamental challenge remains: most of what the agent learns within a session is lost when the session ends or compacts.
+Codex is the most transparent agent system about its own limitations, and the one that has evolved fastest. In six weeks it went from sandboxed code-runner to desktop agent with ambient screen memory, remote server access, and mobile oversight. The compaction endpoint still makes information loss explicit. The subagent architecture still provides a structural mitigation. But the scope of what Codex *does* has widened far beyond code: it now operates on any application, any file, any server the user can reach.
 
-The file system — AGENTS.md, progress files, externalized state — is the only evolution mechanism that survives compaction intact. For Codex agents, writing to files is not optional; it's the only durable memory.
+The fundamental challenge remains — compaction is lossy, and the losses compound. But versioned memory summaries and Chronicle represent a new approach: instead of trying to preserve everything from a session, build durable memory from observation. The file system is still the most reliable evolution mechanism. But Memory, Chronicle, and hooks are narrowing the gap between what the agent forgets and what it retains.
