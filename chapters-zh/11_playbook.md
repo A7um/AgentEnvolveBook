@@ -59,8 +59,9 @@
 |--------|------|------------|
 | Claude Code | `CLAUDE.md` | 是（从当前工作目录向上遍历发现） |
 | Codex | `AGENTS.md` | 是（仓库根目录固定路径） |
-| Gemini | `GEMINI.md` | 是（仓库根目录） |
+| Gemini CLI | `GEMINI.md` | 是（仓库根目录）；分层：`~/.gemini/GEMINI.md`（全局）+ 项目级 |
 | Cursor | `.cursor/rules/*.mdc` | 是（glob 匹配或始终应用） |
+| Copilot | `.github/copilot-instructions.md` + 全局 `.agent.md` | 是（仓库级 + 跨工作区） |
 | 所有 Agent | `README.md` | 通常默认包含在上下文中 |
 
 如果团队同时用多种 AI 工具，可以维护并行文件，也可以统一用 `AGENTS.md`（通用性最强的名称）。
@@ -79,6 +80,65 @@ Claude Code 和 Codex 都提供（或拟提供）一个 `/init` 命令，通过�
 ```
 
 如果你用的工具没有 `/init`，手动创建即可。花 30 分钟写好，之后每次会话都会受益。
+
+---
+
+## 级别 1.5：社区方法论强制执行（第 2 天）
+
+**投入：** 1 小时。**影响：** 从第一次会话起就强制执行结构化工作流。
+
+2025 年初出现、2026 年中成熟的一条新进化路径：Agent 不从经验中学习方法论——而是由社区**直接给定**方法论。Superpowers（截至 2026 年 5 月已有 213K+ 星标、476K+ 安装量）是典型代表，但这种模式不限于特定平台。
+
+### Hook 与技能：两个基本单元
+
+社区编写的方法论强制执行依赖两个互补的基本单元：
+
+| 基本单元 | 类型 | 何时触发 | 示例 |
+|-----------|------|---------------|---------|
+| Hook | 确定性 | 在生命周期事件（启动、停止、提交前、测试后）触发 | "提交前先跑 linter" |
+| 技能 | 概率性 | 模型判断技能与当前任务匹配时触发 | "写 React 组件时遵循这个模式" |
+
+Hook 保证执行——Agent *必须*在指定事件运行它。技能是建议性的——模型自行判断何时相关。二者配合很有力：Hook 强制执行不可跳过的工作流步骤，技能则提供随上下文变化的引导。
+
+### Superpowers 模式
+
+Superpowers 通过 Hook 和技能的组合，强制执行一个七阶段开发工作流：
+
+```
+Phase 1: Brainstorming     ← Skill activation
+Phase 2: Design            ← Skill activation
+Phase 3: Planning          ← Skill activation  
+Phase 4: Implementation    ← Subagent-driven development
+Phase 5: TDD               ← Hook: tests must pass before proceeding
+Phase 6: Code Review       ← Skill activation + hook
+Phase 7: Finishing          ← Hook: cleanup checks
+```
+
+"1% 规则"是一个关键设计选择：即使模型对技能匹配的置信度低至 1%，也会激活该技能。这迫使 Agent 在本想跳过步骤时仍然进入结构化工作流。代价是偶尔误触发，收益是方法论的严格执行。
+
+### 跨平台兼容
+
+同一套方法论包可以在多个 Agent 平台上使用：
+
+| 平台 | Hook 机制 | 技能机制 |
+|----------|---------------|-----------------|
+| Claude Code | settings.json 中的 `hooks` | `.claude/skills/*.md` |
+| Codex CLI | 任务前/后 Hook | `AGENTS.md` 内联技能 |
+| Cursor | `.cursor/rules/*.mdc` 带生命周期触发器 | 规则文件 + glob 匹配 |
+| Gemini CLI | `GEMINI.md` 工作流章节 | `/memory` 技能条目 |
+| Copilot CLI | `.agent.md` 工作流定义 | 指令文件 |
+
+跨平台支持意味着无论团队成员偏好哪种 Agent，都可以统一执行相同的方法论。
+
+### 何时使用这一级别
+
+级别 1.5 介于文件系统记忆和自动学习之间，因为它不需要任何学习基础设施——安装即强制执行。尤其适用于：
+
+- **初次使用 Agent 的初级开发者团队**
+- **跳过测试或评审代价高昂的代码库**
+- **需要在多种 Agent 工具间统一开发方法论的组织**
+
+风险：过度约束的 Agent 在任务不需要时也死板地遵循方法论。改一行配置不需要七个阶段。好的方法论包会为简单任务提供跳过机制。
 
 ---
 
@@ -161,6 +221,54 @@ Memory entry:
 
 Copilot 还引入了 **28 天验证**：28 天内没有被新证据确认的记忆会降级或删除，防止过时记忆越积越多。
 
+### Devin 方案：持久记忆 + Auto Triage
+
+Devin 的持久记忆（2026 年 5 月上线）补上了第 10 章指出的关键短板：缺乏跨会话学习。该系统结合了两种机制：
+
+- **Auto Triage：** 根据历史模式对新任务分类，在执行前就路由到合适的工作流
+- **持久记忆：** 事实、偏好和项目上下文跨会话保留，为后续任务提供参考
+
+意义在于：Devin 曾是唯一没有跨会话学习的主流生产 Agent。这一功能的加入证实，持久记忆已成为基本配置——每个主要 Agent 都已具备。
+
+### Codex Chronicle：基于屏幕捕获的环境记忆
+
+Codex Chronicle 引入了一种新的被动学习方式：定期截取开发者屏幕，从中提取上下文信息：
+
+```
+Screen capture (every N minutes during active development)
+  ↓
+OCR + visual analysis:
+  - IDE state: open files, cursor position, visible errors
+  - Terminal output: build results, test failures
+  - Browser tabs: documentation being consulted
+  ↓
+Context extraction:
+  - "Developer frequently references the Stripe API docs"
+  - "Build failures consistently involve the auth module"
+  - "Developer switches between these 3 files for this feature"
+```
+
+这是一个全新的学习信号类别——Agent 不仅从自身操作中学习，还从*观察开发者的工作方式*中学习。隐私影响显而易见，Codex Chronicle 要求明确的用户授权才能启用。
+
+### Gemini CLI 方案：从会话记录自动提取记忆
+
+Gemini CLI 在每次交互结束后，从会话记录中提取技能和事实：
+
+```
+Session ends
+  ↓
+Transcript analysis:
+  - Extract reusable procedures ("how to deploy to staging")
+  - Extract corrections ("actually use yarn, not npm")
+  - Extract project facts ("the API rate limit is 100/min")
+  ↓
+/memory inbox:
+  - User reviews extracted memories before they become active
+  - Accept, reject, or edit each extracted memory
+```
+
+`/memory inbox` 模式在全自动记忆（Windsurf，约 78% 准确率）和纯手动记忆（级别 1）之间找到了折中点。Agent 负责提取，人类负责审批。既保证了高准确率，又不要求人类从头编写记忆。
+
 ### 对比
 
 | 系统 | 自动学习 | 准确率 | 限制 | 用户可编辑 | 过时处理 |
@@ -169,6 +277,9 @@ Copilot 还引入了 **28 天验证**：28 天内没有被新证据确认的记�
 | Claude Code | 会话进行中 | ~90% | 200 行 / 25KB | 是 | 自动裁剪最旧条目 |
 | Windsurf | 后台处理 | ~78% | 无 | 有限 | 无 |
 | Copilot | 带引用 | ~92% | 未公布 | 是 | 28 天验证 |
+| Devin | Auto Triage + 持久记忆 | ~90% | 未公布 | 是 | 任务驱动刷新 |
+| Gemini CLI | 会话后提取 + 收件箱审核 | ~95%（人工把关） | 未公布 | 是（/memory inbox） | 手动审查 |
+| Codex Chronicle | 环境屏幕捕获 | ~85% | 未公布 | 是 | 按时间衰减加权 |
 
 ---
 
@@ -229,6 +340,40 @@ Popular skills by downloads:
 ```
 
 市场模式意味着 Agent 不必凡事从零开始学。新部署的 Hermes 实例可以直接安装社区技能来应对常见任务，只为项目特有的工作流创建自定义技能即可。
+
+### Gemini CLI 方案：从会话中提取技能
+
+Gemini CLI 内置了一个 `skill-creator` 技能——一个生成新技能的元技能，从会话记录中提炼可复用流程：
+
+```
+User completes a multi-step task
+  ↓
+skill-creator analyzes the transcript:
+  - Identifies reusable multi-step procedures
+  - Extracts error-recovery patterns
+  - Captures tool-call sequences that worked
+  ↓
+Generates a skill in agentskills.io format
+  ↓
+Skill appears in /memory inbox for user review
+```
+
+这形成了从级别 2（自动学习）到级别 3（技能积累）的闭环：Agent 自动把反复出现的操作流程从记忆条目提升为结构化技能。人工审核环节防止低质量技能堆积。
+
+### Superpowers：大规模社区技能供给
+
+并非所有技能都需要从经验中习得。Superpowers（截至 2026 年 5 月已有 213K+ 星标）和类似框架代表了另一条路径：**以安装包形式提供社区编写的技能**。
+
+| 来源 | 可用技能数 | 增长模式 |
+|--------|-----------------|-------------|
+| Claude Code 市场 | 2,810+ 技能，425+ 插件 | 官方 + 社区 |
+| ClawHub | 13,000+ 技能 | 社区 |
+| Superpowers | 内置方法论技能 | 策展框架 |
+| Gemini CLI | 通过 skill-creator 生成 | 按用户 + 共享 |
+
+核心洞察：单个 Agent 不应该凡事从零开始学。新实例可以直接安装社区技能来应对常见任务（部署、测试、CI/CD），把自主技能创建留给项目特有的工作流。
+
+与级别 1.5 的区别：级别 1.5 的 Superpowers 强制执行的是*方法论*（如何工作）。级别 3 的技能编码的是*具体流程*（如何完成特定任务）。两者都可以来自社区，但服务于不同目的。
 
 ### agentskills.io 标准
 
@@ -394,12 +539,39 @@ Agent 可以变异自己的基因（修改可复用的代码模式）并创建�
 
 ---
 
+## 需要避免的陷阱：技能安全问题
+
+Agent 技能生态的快速扩张已经超越了安全实践的跟进速度。2026 年 5 月 Snyk 的一项审计发现，**13% 的公开 Agent 技能包存在严重安全漏洞**——依赖项漏洞、硬编码密钥，或能绕过沙箱的代码执行路径。
+
+### 攻击面
+
+| 攻击向量 | 风险 | 示例 |
+|--------|------|---------|
+| 市场中的恶意技能 | 技能以 Agent 权限执行任意代码 | "docker-cleanup" 技能偷偷外传 `.env` 文件 |
+| 通过技能内容的 prompt 注入 | 技能文本暗藏覆盖 Agent 行为的指令 | 技能描述嵌入"忽略之前的指令"载荷 |
+| 供应链依赖 | 技能依赖一个已被入侵的 npm/pip 包 | 合法技能拉取了木马化的依赖 |
+| 权限过大的 Hook | Hook 在每个生命周期事件触发且拥有完整文件系统访问权 | 提交前 Hook 读取并传输 SSH 密钥 |
+| "1% 规则"作为攻击面 | 低激活阈值使恶意技能在几乎无关时也触发 | 方法论技能在无关任务上激活以注入指令 |
+
+### 防御实践
+
+1. **安装前审计。** 阅读技能源码。社区编写的技能就是代码——像对待第三方依赖一样对待它们。
+2. **固定版本。** 不要自动更新技能。一个原本无害的技能在维护者账号被攻破后可能变成恶意的。
+3. **沙箱执行技能。** 执行命令的技能应在容器或受限 shell 中运行，不能接触凭证。
+4. **优先使用官方市场。** Claude Code 官方市场和策展技能集有审核流程。未经审查的社区来源没有。
+5. **监控技能行为。** 记录技能激活时的操作。异常的网络请求、项目外的文件读取、凭证访问都是危险信号。
+
+13% 的严重漏洞率是生态系统层面的问题，不是单个 Agent 的问题。随着技能成为分发 Agent 能力的主要机制，技能生态的安全态势将变得与 Agent 本身的安全同等重要。
+
+---
+
 ## 决策矩阵
 
 | 你的情况 | 从这里开始 | 然后添加 | 时间线 |
 |---------------|-----------|---------|----------|
 | 独立开发者，单项目 | CLAUDE.md + 自动记忆（级别 1-2） | 常规使用 1 个月后加入技能 | 第 1 天 → 第 1 个月 |
-| 团队，共享仓库 | AGENTS.md + Cursor 持续学习（级别 1-2） | 数据量够了就加 Bugbot 式学习型规则 | 第 1 天 → 第 3 个月以上 |
+| 团队，共享仓库 | AGENTS.md + Superpowers 方法论（级别 1-1.5） | 数据量够了就加 Bugbot 式学习型规则 | 第 1 天 → 第 3 个月以上 |
+| 多工具团队 | AGENTS.md + 方法论强制执行（级别 1-1.5） | 跨平台技能 + 自动学习 | 第 1 天 → 第 1 个月 |
 | 个人助手 Agent | Hermes MEMORY.md + SKILL.md（级别 1-3） | Honcho 用户建模做深度个性化 | 第 1 周 → 第 3 个月 |
 | 自定义 Agent 产品 | 文件系统记忆 + 自动提取（级别 1-2） | 技能库 + 反馈驱动规则 | 第 1 天 → 第 6 个月 |
 | 研究/实验性 | 以上所有级别 | 安全措施到位后再试自我修改（级别 5） | 第 6 个月以上 |
@@ -415,8 +587,9 @@ Agent 可以变异自己的基因（修改可复用的代码模式）并创建�
 | 级别 | 设置成本 | 持续成本 | 失败模式 | 恢复方式 |
 |-------|-----------|-------------|-------------|----------|
 | 1：文件系统记忆 | 30 分钟 | 几乎为零（人工编辑） | 过时的条目 | 编辑文件 |
+| 1.5：方法论强制执行 | 1 小时 | 几乎为零（社区维护） | 工作流过度约束 | 禁用或调整激活阈值 |
 | 2：自动学习 | 1-4 小时 | 提取消耗 token | 噪声/错误条目 | 裁剪 + 设上限 |
-| 3：技能积累 | 数天 | 创建 + 存储消耗 token | 技能与现实脱节 | 编辑/删除技能 |
+| 3：技能积累 | 数天 | 创建 + 存储消耗 token | 技能与现实脱节；**13% 的社区包存在安全漏洞** | 编辑/删除技能；安装前审计 |
 | 4：学习型规则 | 数周 | 基础设施 + 监控 | 降低质量的规则 | 降级机制 |
 | 5：自我修改 | 数月 | 安全基础设施 | 不安全的变异 | Git 回滚 |
 

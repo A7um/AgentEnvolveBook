@@ -2,7 +2,7 @@
 
 Cognition 打造的 Devin 是第一个自称"AI 软件工程师"的产品，2025 年初上线。它率先践行了一条核心理念：编码 Agent 在把结果展示给人类之前，应该先验证自己的工作——跑测试、查输出、反复迭代，直到结果正确。
 
-Devin 的进化路径和 Claude Code、Hermes 截然不同。它不创建持久化技能，也不写记忆文件，而是全力押注**会话内改进**——通过系统化的自验证把每次会话的产出质量拉到最高。到 Devin 2.2（2026 年 2 月），自验证循环已经成为最核心的产品差异点。
+Devin 的进化路径和 Claude Code、Hermes 截然不同。它不创建持久化技能，也不写记忆文件，而是全力押注**会话内改进**——通过系统化的自验证把每次会话的产出质量拉到最高。到 Devin 2.2（2026 年 2 月），自验证循环已经成为最核心的产品差异点。随后在 2026 年，Devin 加入了持久记忆、Auto Triage 和对 Windsurf 的收购——补上了跨会话学习的短板，并从编码 Agent 扩展为工程团队成员。
 
 本章还会介绍 DeepWiki（Devin 的公开代码理解工具），以及 Devin 在迁移到 Sonnet 4.5 时发现的上下文焦虑现象——凡是会积累记忆或技能的 Agent，都绕不开这个问题。
 
@@ -136,6 +136,45 @@ What self-review catches that tests don't:
    - Code works but creates N+1 queries
    - Unbounded list operations on large datasets
 ```
+
+---
+
+## Auto Triage — 从编码 Agent 到工程团队成员
+
+### 角色转变
+
+Devin 2.2 的自验证循环是被动响应式的：人类分配任务，Devin 高质量地执行。Auto Triage（2026 年）颠覆了这个模型。Devin 实时监控 bug、日志和告警——无需人工分配任务——并自主采取行动。
+
+这从根本上改变了"编码 Agent"的含义。Agent 不是在帮工程师干活，而是*自己就是工程师*——针对那些此前需要人类关注但不需要人类创造力的工作类别。
+
+### 自动化工作流
+
+| 工作流 | 触发条件 | 产出 |
+|----------|---------|--------|
+| 事故复盘 | PagerDuty 事故结束 | 自动生成时间线、根因分析和行动项 |
+| 每日 Sentry 修复 | 夜间错误累积 | 拉取新 Sentry 错误，早晨前提交修复 PR |
+| 每周依赖更新 | 定时扫描 | 识别过期包、运行测试、提交升级 PR |
+| CI 构建修复 | CI 构建失败 | 定位根因、提交修复 |
+| 健康摘要 | 每日定时 | 汇总 DataDog 指标，发布到 Slack |
+
+### 对进化的意义
+
+Auto Triage 代表了一条与自验证不同的进化轴线。自验证提升单个任务的*质量*，Auto Triage 扩大 Agent 处理的*范围*——它接手那些原本会在队列中等到有人来分拣的工作。
+
+```
+Before Auto Triage:
+  6:00 AM  Sentry error fires → sits in dashboard
+  9:00 AM  Engineer arrives → reviews errors → picks one
+  9:30 AM  Engineer assigns to Devin (or fixes manually)
+  10:00 AM Fix merged
+
+After Auto Triage:
+  6:00 AM  Sentry error fires → Devin detects it
+  6:05 AM  Devin opens fix PR → runs tests → self-reviews
+  9:00 AM  Engineer arrives → reviews Devin's PR → merges
+```
+
+工程师的角色从"分拣然后修复"变成了"审查然后合并"。对于常规问题，Agent 承接了从发现到诊断到修复的完整闭环。
 
 ---
 
@@ -337,6 +376,67 @@ In numbers:
 
 ---
 
+## 持久记忆（2026 年 5 月）
+
+### 补上短板
+
+本章前面指出了 Devin 缺乏跨会话学习这一关键短板——"CORS 问题调试两次各花 15 分钟"的问题。2026 年，Devin 上线了跨会话的持久记忆。
+
+Agent 现在能从历史会话中学习，并持续优化内部操作手册。遇到解决过的问题时，它会调用先前经验而非从头摸索：
+
+```
+Before persistent memory (the original gap):
+  Session 1: Debug CORS issue → 15 min → fix
+  Session 2: Debug CORS issue → 15 min → fix (identical process)
+
+After persistent memory:
+  Session 1: Debug CORS issue → 15 min → fix → stores resolution
+  Session 2: Recalls CORS resolution → applies fix → 2 min
+```
+
+短板补上了。Devin 现在同时具备自验证（会话内改进）和持久记忆（跨会话改进）。
+
+### 与上下文焦虑的交互
+
+持久记忆重新引入了上下文焦虑那一节描述的张力：每一条在会话启动时加载的记忆都会消耗 token。Devin 的上下文窗口分级——128K（Starter）、2M（Pro）、10M+（Enterprise）——提供了缓冲空间，但根本权衡不变。更多记忆意味着更明智的决策，代价是思考空间缩小。10M+ 的 Enterprise 级别暗示了 Cognition 的判断：只要窗口足够大，焦虑阈值就能被推到足够远，使记忆积累对大多数任务来说收益大于成本。
+
+### 动态重规划
+
+与持久记忆同时上线的还有动态重规划：Agent 在任务执行中遇到障碍时，无需等待人类干预就能调整策略。这比表面看起来更微妙。早期版本的 Devin 会死板地跟着初始计划走，反复重试失败的方案。动态重规划意味着 Agent 能识别出"这条路走不通"并转向——这是让持久记忆真正有用的前提。没有重规划能力，记住的策略会变成僵化的操作手册；有了重规划，记忆变成 Agent 根据当下情况灵活调整的起点。
+
+---
+
+## Windsurf 收购
+
+### 事件
+
+2025 年年中，Cognition 收购了 Windsurf（前身为 Codeium）——一个成熟的 IDE 扩展产品，在结对编程细分市场拥有稳定的用户基础。
+
+### 产品策略
+
+这次收购让 Cognition 获得了双层产品覆盖：
+
+| 产品 | 模式 | 适用场景 |
+|---------|------|----------|
+| Devin | 自主模式 | 完整任务：工单、bug、部署——Agent 独立完成 |
+| Windsurf | 协作模式 | IDE 结对编程——Agent 与开发者实时协同 |
+
+两者共享基础设施：代码理解、搜索和索引。开发者可以白天用 Windsurf 获取实时编码辅助，晚上把任务交给 Devin 的 Auto Triage。
+
+### 平台成熟
+
+整合后的平台已经大幅成熟：
+
+| 能力 | 详情 |
+|-----------|--------|
+| v3 API | RBAC、服务用户认证、会话编排 |
+| 自动化构建器 | GitHub push 事件触发的文件变更触发器 |
+| MCP server | 在 MCP 市场上可用，支持工具集成 |
+| 平台选择 | 新会话默认使用 Linux 或 Windows |
+| 上下文窗口 | 128K（Starter）→ 2M（Pro）→ 10M+（Enterprise） |
+
+---
+
 ## Devin 关于进化的启示
 
 ### 自验证就是会话内进化
@@ -354,40 +454,21 @@ Generation N: Final implementation
 
 每一轮迭代都在改进产出，Agent 在一次会话之内就完成了方案的进化。效果很显著——Devin 的自检捕获率证明了这套机制的价值。
 
-### 但 Devin 缺乏跨会话学习
+### 跨会话学习：短板已补
 
-关键短板：Devin 不会随经验积累而进步。每次会话都从零开始：
-
-```
-Session 1:
-  Agent encounters CORS issue with new endpoint
-  Agent debugs for 15 minutes
-  Agent finds fix: add cors middleware to route
-  Agent submits PR
-  ← Knowledge of CORS fix exists only in session 1's context
-
-Session 2 (same project, similar task):
-  Agent encounters CORS issue with new endpoint
-  Agent debugs for 15 minutes (same process as session 1)
-  Agent finds fix: add cors middleware to route
-  Agent submits PR
-  ← Same debugging, same time, no learning from session 1
-```
-
-对比一下 Hermes：
+本章最初撰写时，我们指出 Devin 缺乏跨会话学习是最关键的短板。和 Hermes 的对比非常鲜明：
 
 ```
-Session 1:
-  Agent encounters CORS issue
-  Agent debugs → finds fix
-  Agent creates SKILL.md: "cors-endpoint-setup"
-  Agent updates MEMORY.md: "This project requires CORS middleware"
+Devin (before persistent memory):
+  Session 1: Debug CORS issue → 15 min → fix
+  Session 2: Debug same CORS issue → 15 min → fix (no memory)
 
-Session 2:
-  Agent searches skills → finds "cors-endpoint-setup"
-  Agent loads skill → applies procedure
-  Fix applied in 2 minutes instead of 15
+Hermes:
+  Session 1: Debug CORS → fix → create SKILL.md
+  Session 2: Load skill → apply fix → 2 min
 ```
+
+有了持久记忆（2026 年 5 月），Devin 补上了这个短板。Agent 现在能跨会话保留知识并优化内部操作手册——不是通过像 Hermes 那样的显式技能文件，而是通过持久记忆存储来指导未来会话。
 
 ### 自验证 + 学习的结合
 
@@ -396,7 +477,7 @@ Session 2:
 1. **自验证**（Devin 的长项）：提交前捕获错误
 2. **跨会话学习**（Hermes 的长项）：防止同样的错误在未来重现
 
-目前没有任何生产系统把两者都做到位。Devin 的自验证最强，但没有跨会话学习；Hermes 的跨会话学习最强，但自验证粒度较粗——每 15 次工具调用设一个检查点，远不如 Devin 的完整审查-测试-修复循环细致。
+Devin 现在是第一个同时在两方面做到深度实现的生产系统。自验证确保每次会话的产出质量，持久记忆确保 Agent 跨会话持续进步。Hermes 的技能创建仍然更精细（显式的结构化 SKILL.md 文件 vs. Devin 的隐式记忆），但 Devin 将严格的自审查、持久记忆和 Auto Triage 三者结合，构成了目前生产环境中最完整的会话内 + 跨会话进化闭环。
 
 ### 上下文焦虑作为设计约束
 
@@ -422,10 +503,27 @@ Session 2:
 │  ├── Screen recordings as evidence           │
 │  └── Mandatory before PR submission          │
 │                                              │
+│  Auto Triage Layer                           │
+│  ├── Real-time monitoring (logs, alerts)     │
+│  ├── Autonomous fix PRs (Sentry, CI, deps)   │
+│  ├── Incident postmortems (PagerDuty)        │
+│  └── No human assignment required            │
+│                                              │
+│  Memory Layer                                │
+│  ├── Persistent memory (cross-session)       │
+│  ├── Internal playbook refinement            │
+│  └── Dynamic re-planning on roadblocks       │
+│                                              │
 │  Knowledge Layer                             │
 │  ├── DeepWiki (auto-indexed repo knowledge)  │
 │  ├── .devin/wiki.json (configuration)        │
 │  └── Ask Devin (conversational code search)  │
+│                                              │
+│  Platform                                    │
+│  ├── Devin (autonomous) + Windsurf (IDE)     │
+│  ├── v3 API with RBAC, session orchestration │
+│  ├── MCP server in marketplace               │
+│  └── Context: 128K / 2M / 10M+ tiers        │
 │                                              │
 │  Discovery                                   │
 │  └── Context anxiety (Sonnet 4.5 rebuild)    │
@@ -433,12 +531,11 @@ Session 2:
 │      - Parallelism accelerates the problem   │
 │      - Memory/skills consume thinking space  │
 │                                              │
-│  Gap                                         │
-│  └── No cross-session learning               │
-│  └── No skill creation from experience       │
-│  └── No persistent memory files              │
+│  Remaining Gap                               │
+│  └── No structured skill creation (cf. Hermes│
+│      SKILL.md — Devin's memory is implicit)  │
 │                                              │
 └──────────────────────────────────────────────┘
 ```
 
-Devin 对自我进化领域有两大贡献。第一，证明了自验证——Agent 审查并修复自己的工作——是切实可行且有价值的会话内进化手段。第二，揭示了上下文焦虑这一根本矛盾：积累的知识越多，留给思考的空间就越少。每个不断进化的 Agent 都必须正视这个问题。
+Devin 对自我进化领域的贡献现在是三重的。第一，证明了自验证——Agent 审查并修复自己的工作——是切实可行的会话内进化手段。第二，揭示了上下文焦虑这一根本矛盾：积累的知识越多，留给思考的空间就越少。第三，通过持久记忆和 Auto Triage，证明了编码 Agent 不仅能跨会话进化，还能自主扩大职责范围——不只是把分配的工作做得更好，而是自主发现并完成从未被显式分配的工作。
