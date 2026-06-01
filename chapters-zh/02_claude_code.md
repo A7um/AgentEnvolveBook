@@ -348,6 +348,103 @@ Provide a structured report with severity levels.
 
 ---
 
+## 插件生态系统（2026 年 5 月）
+
+到 2026 年 5 月，Claude Code 的技能系统已发展为一个完整的插件生态。Anthropic 于 5 月 22 日上线了官方插件市场（`anthropics/claude-plugins-official`，首周 20K+ stars）。社区市场（`claude-plugins-community`）紧随其后，并设有自动审查管道。
+
+插件是分发格式，把 Agent 扩展需要的一切捆绑在一起：
+
+```
+Plugin = distribution package containing:
+  ├── skills/         (SKILL.md files — probabilistic activation)
+  ├── agents/         (subagent definitions)
+  ├── hooks/          (deterministic lifecycle event handlers)
+  ├── mcp-servers/    (Model Context Protocol servers)
+  └── commands/       (slash commands)
+
+Namespaced as /plugin-name:skill-name to prevent conflicts
+```
+
+技能、hook、Agent、MCP 服务器和斜杠命令——此前散落在不同目录和配置文件中——现在作为单一可安装单元发布。命名空间（`/plugin-name:skill-name`）防止多个插件定义相似名称时产生冲突。
+
+### 市场数据
+
+生态增长迅猛：
+
+| 指标 | 数据（2026 年 5 月） |
+|--------|-------------------|
+| 官方市场插件 | 425+ |
+| 社区技能（tonsofskills.com） | 2,810+ |
+| CLI 包管理器 | `ccpi`（Claude Code Plugin Installer） |
+| 开源市场 | `jeremylongshore/claude-code-plugins-plus-skills` |
+
+`tonsofskills.com` 成为了 Agent 技能的 npm 式注册中心，可通过 `ccpi` CLI 搜索和安装。开源市场（`claude-code-plugins-plus-skills`）服务于需要自建插件仓库的团队。
+
+并非一切都安全。Snyk 在 2026 年 2 月的审计中发现 **13% 的 agent-skills 包存在严重安全缺陷**——依赖注入漏洞、不受约束的文件系统访问，以及静默向外部端点泄露上下文的技能。社区市场的自动审查管道正是对此的直接回应。
+
+### Hook — 确定性生命周期事件
+
+Hook 是插件系统的另一半，解决了技能的一个根本问题：技能是*概率性*的。Agent 根据描述和当前任务决定是否激活技能。有时该激活的没激活，有时激活了错误的。
+
+Hook 是**确定性**的。它们在特定生命周期事件上触发，每次都触发，无条件触发：
+
+| 事件 | 何时触发 |
+|-------|--------------|
+| `SessionStart` | 会话开始——在处理第一条用户消息之前 |
+| `PreToolUse` | 任何工具调用执行之前 |
+| `PostToolUse` | 任何工具调用完成之后 |
+| `MessageDisplay` | 助手消息展示给用户之前 |
+| `prompt-submit` | 用户提交 prompt 时 |
+| `session-stop` | 会话结束时 |
+| `pre-commit` | 创建 git commit 之前 |
+
+Hook 在 `settings.json`（项目级或用户全局）中配置，不在 markdown 文件里。`SessionStart` hook 可以返回 `reloadSkills: true` 强制重新扫描技能，或设置 `sessionTitle` 给会话打标签。`MessageDisplay` hook 可以在用户看到之前转换或屏蔽助手消息。
+
+核心区别：
+
+| | 技能 | Hook |
+|---|--------|-------|
+| **激活** | 概率性——Agent 自行判断 | 确定性——事件驱动 |
+| **用途** | 可复用流程、多步骤工作流、专家经验编码 | 护栏、遥测、自动格式化、阻断不安全操作 |
+| **可靠性** | Agent 可能在该用时没用 | 注册事件上必然触发 |
+| **格式** | Markdown（SKILL.md） | 代码（在 settings.json 中配置） |
+
+技能教 Agent *怎么*做事。Hook 确保某些事*一定会发生*——或*绝对不会发生*。
+
+### 技能系统升级
+
+技能系统随 hook 一起走向成熟：
+
+- **`disallowed-tools` frontmatter**：技能现在可以声明在激活期间应从 Agent 工具集中移除哪些工具。安全审查技能可以剥夺 `bash` 访问权限；文档技能可以剥夺 `write_file`。这是按技能粒度的工具级沙箱。
+- **`/reload-skills`**：在会话中途重新扫描技能目录，无需重启。在技能开发过程中或 hook 动态安装新技能时特别有用。
+- **`/code-review --fix`**：自动应用审查发现的问题，而非仅仅报告。`/simplify` 是它的语法糖。
+- **Security-guidance 插件**：一个官方插件，对代码编辑、diff 和 commit 进行实时漏洞检测。通过 `.claude/claude-security-guidance.md` 和 `.claude/security-patterns.yaml` 配置。使用该插件的团队报告安全相关 PR 审查评论**减少了 30-40%**。
+
+### Superpowers — 占据主导地位的方法论插件
+
+`obra/superpowers` 是 Claude Code 生态中安装量最大的插件：**213K+ stars**，官方市场 **476K+ 安装量**。
+
+Superpowers 是一个方法论插件。它不添加新能力——而是强制 Agent 走完结构化工作流：
+
+```
+Superpowers enforced workflow:
+  1. Brainstorming     — explore the problem space
+  2. Design            — choose an approach
+  3. Planning           — break into steps
+  4. Subagent-driven development — execute via subagents
+  5. TDD               — test-driven development
+  6. Code review        — review own output
+  7. Finishing          — cleanup and documentation
+```
+
+实现方式是一个 `SessionStart` hook，在**第一次响应之前**就把 `using-superpowers` 技能注入上下文。Agent 产出的每条消息都受方法论约束。"1% 规则"——只要有 1% 的可能性某个技能适用，Agent 就必须调用——把技能激活从尽力而为推向了近乎强制。
+
+效果可量化。使用 Superpowers 之前，技能执行可靠性（Agent 在存在相关技能时实际使用的比例）约 **10%**。使用后升至 **66%**。提升不是来自更好的技能匹配，而是方法论迫使 Agent 在每一步都检查技能清单。
+
+Superpowers 支持跨平台：Codex CLI、Cursor、Gemini CLI、Copilot CLI 都能用。插件格式相同，只是安装路径不同。
+
+---
+
 ## 泄露的内部实现（2026 年 3 月源代码泄露）
 
 这份 512,000 行的 TypeScript source map 让我们前所未有地看到了 Claude Code 的内部运作。以下是架构层面最有价值的发现。
@@ -571,33 +668,37 @@ graph TD
     B --> C[Auto memory extracts observations]
     C --> D["~/.claude/projects/.../memory/ updated"]
     D --> E[Next session starts]
-    E --> F[CLAUDE.md + auto memory loaded into prompt]
+    E --> F[CLAUDE.md + auto memory + plugins loaded into prompt]
     F --> G[Agent starts better informed]
     G --> A
 
     H[User edits CLAUDE.md manually] --> F
     I[User creates skills in .claude/skills/] --> F
     J[User adds slash commands] --> F
+    K[User installs plugins via ccpi] --> F
+    L[SessionStart hooks inject skills/context] --> F
 ```
 
-三个信息来源共同塑造下一次会话：
+五个信息来源共同塑造下一次会话：
 
 | 来源 | 谁来写 | 如何进化 |
 |--------|--------------|---------------|
 | CLAUDE.md | 人类（手动） | 用户添加规范、纠正错误 |
 | 自动记忆 | Agent（自动） | Agent 从交互中提取模式 |
 | 技能 + 命令 | 人类（手动） | 用户创建可复用的流程 |
+| 插件 | 社区 / 官方 | 通过市场安装；捆绑技能、hook、Agent、MCP 服务器 |
+| Hook | 插件作者 / 用户 | 确定性生命周期处理器；注入上下文、强制护栏 |
 
 ### Claude Code 不做什么
 
 Claude Code 的进化方式是**被动提取，不是从结果中主动学习**。Agent 只管观察和记录，不会：
 
 - **从反馈信号中学习** — Cursor 的 Bugbot 会根据正面反馈提升规则、根据负面反馈降级规则。Claude Code 没有这种"这条有用"和"这条没用"的区分机制。
-- **自主创建技能** — Hermes 检测到重复的工具调用模式后会自动创建 SKILL.md。Claude Code 的技能只能人工编写。
+- **自主创建技能** — Hermes 检测到重复的工具调用模式后会自动创建 SKILL.md。Claude Code 的技能只能人工编写或通过插件安装，不会由 Agent 自动生成。
 - **在空闲时整合记忆** — OpenClaw 有 Dreaming 过程，能在后台重组记忆。Claude Code 的自动记忆只追加，没有修剪和整理。
 - **通过试错填补能力缺口** — Agent 不会自己做实验看看什么管用。一切学习都来自用户发起的会话。
 
-这种进化模型本身就是保守设计。CLAUDE.md 始终由人类掌控，牺牲了一些自动化能力，但也规避了 Agent 自动写入的记忆可能漂移、积累噪声、甚至固化错误模式的风险。自动记忆只是一层轻量补充，而非替代。
+插件生态系统（2026 年 5 月）显著改变了这幅图景。Superpowers 等方法论插件通过 hook 注入结构化工作流，把技能执行可靠性从约 10% 拉到约 66%。Agent 本身仍然不会*自主学习*，但插件和 hook 确保它*更可靠地运用已有知识*。进化模型依然保守——CLAUDE.md 始终由人类掌控，自动记忆是补充而非替代——但执行层现在是可编程的，这在之前做不到。
 
 ### 由此产生的成长轨迹
 
@@ -618,8 +719,14 @@ Month 3: CLAUDE.md stable (~150 lines, well-curated).
          Skills directory has 5 project-specific skills.
          Auto memory periodically reviewed by user.
          Agent behaves like a team member who read the docs.
+
+Month 4: Plugin ecosystem installed: Superpowers methodology,
+         security-guidance, team-specific plugins.
+         Hooks enforce guardrails on every tool call.
+         Skill execution reliability at 66% (up from ~10%).
+         Agent follows structured workflows, not just ad-hoc prompts.
 ```
 
-这个局限是实实在在的：没有反馈驱动的学习，改进曲线完全取决于人类在记忆管理上花多少心思。CLAUDE.md 维护得好，Agent 表现就明显好；放任不管，Agent 几乎不会比初始状态强多少。
+这个局限是实实在在的：没有反馈驱动的学习，改进曲线完全取决于人类在记忆管理上花多少心思。CLAUDE.md 维护得好，Agent 表现就明显好；放任不管，Agent 几乎不会比初始状态强多少。但插件生态改变了天花板——安装 Superpowers 这样的方法论插件，不需要任何项目级维护就能带来阶跃式提升。安全隐患也很现实：Snyk 在 2026 年 2 月发现 13% 的社区包存在严重缺陷，插件供应链是 Claude Code 从纯技能时代没有的全新攻击面。
 
 下一章讲 Cursor——一个在基础设施层面押注进化能力、用反馈驱动规则学习的系统，也是目前唯一有确凿证据表明能从大规模真实用户信号中学习的生产系统。

@@ -92,13 +92,11 @@ Session 4+:
 
 ---
 
-## Memory Preview（2026 年 4 月）
+## Memory 系统
 
 ### 跨会话记忆
 
-2026 年 4 月，OpenAI 为 Codex 发布了 Memory Preview——跨会话保留上下文的能力，类似 ChatGPT 的记忆功能，但专为编码 Agent 量身定制。
-
-已公布的功能：
+2026 年 4 月，OpenAI 为 Codex 推出了 Memory——跨会话保留上下文的能力，类似 ChatGPT 的记忆功能，但专为编码 Agent 设计。到 2026 年 5 月，这套系统已经明显成熟。
 
 | 功能 | 描述 |
 |---------|-------------|
@@ -107,9 +105,30 @@ Session 4+:
 | 项目连续性 | 记住项目状态、待解决问题和进行中的工作 |
 | 记忆管理 | 用户可查看、编辑和删除已存储的记忆 |
 
+### 存储：SQLite 与版本化摘要
+
+记忆状态从内存结构迁移到了专用 SQLite 数据库——这一变化让记忆获得了独立于 Agent 进程的持久性和可查询性。关键架构改动：记忆摘要现在带版本号，过期后会重建。当底层记忆发生变化（新增条目、删除条目、出现矛盾），摘要会整体重新生成而非打补丁。这让长期运行的记忆上下文保持精简，避免了废旧或矛盾条目的缓慢堆积。
+
+```
+Memory lifecycle:
+  1. Agent stores fact: "This project uses Prisma, not Sequelize"
+  2. Fact written to SQLite → summary marked stale
+  3. Next session: summary rebuilt from current facts
+  4. Stale/contradicted facts pruned during rebuild
+
+Old approach (append-only):
+  Memory grows monotonically → context bloat → anxiety threshold
+
+New approach (versioned summaries):
+  Memory grows → periodic rebuild → only current facts survive
+  Context cost stays proportional to relevant knowledge
+```
+
+专用的记忆工具在配置中可开关——团队可以按部署环境启用或禁用记忆功能，防止不需要的环境出现记忆无序增长。
+
 ### 与 AGENTS.md 的区别
 
-AGENTS.md 是静态的——只在人类编辑时才变。Memory Preview 是动态的——Agent 根据交互自动存储记忆：
+AGENTS.md 是静态的——只在人类编辑时才变。Memory 是动态的——Agent 根据交互自动存储记忆：
 
 ```
 AGENTS.md (static):
@@ -117,17 +136,17 @@ AGENTS.md (static):
   Persists until human removes it
   Available to all agents working on this repo
 
-Memory Preview (dynamic):
+Memory (dynamic):
   Agent infers: "This user prefers concise PR descriptions"
   Stored automatically after the interaction
   Available to this user's future sessions (not repo-wide)
 ```
 
-两者的组合威力很大：AGENTS.md 承载适用于所有开发者的项目级事实，Memory Preview 记录跟随个人的用户级偏好。
+两者的组合威力很大：AGENTS.md 承载适用于所有开发者的项目级事实，Memory 记录跟随个人的用户级偏好。
 
 ### 自动唤醒与定时任务
 
-Memory Preview 中最新颖的功能是：Agent 可以为自己安排未来的工作。
+Agent 可以为自己安排未来的工作：
 
 ```
 User: "Run the integration test suite every night at 2am
@@ -141,7 +160,104 @@ Agent: [stores scheduled task]
        [goes back to sleep]
 ```
 
-这朝着持久 Agent 身份迈出了一步——Agent 不仅记得过去的会话，还能为未来的会话做规划。但具体实现细节（记忆如何存储、定时如何触发、token 预算多大）尚未完全公开。
+这就是持久 Agent 身份——Agent 不仅记得过去的会话，还能为未来的会话做规划。
+
+---
+
+## Desktop Agent 与 Chronicle（2026 年 5 月）
+
+### 从沙箱到桌面
+
+六周之内（2026 年 4 月 16 日至 5 月 14 日），Codex 从一个沙箱内的代码执行器蜕变为桌面 Agent。时间线：
+
+| 日期 | 能力 |
+|------|-----------|
+| 4 月 16 日 | "Codex for (almost) everything"——Mac 上的 computer-use：鼠标/键盘控制任意应用、本地文件访问、内置浏览器、图像生成 |
+| 4 月 20 日 | 更多 computer-use 功能 |
+| 5 月 14 日 | 移动端操控预览——ChatGPT 手机端可实时查看 Codex 会话 |
+| 2026 年 5 月 | Computer Use 扩展至 Windows |
+
+这是能力边界的根本性拓展。沙箱代码执行器只能操作终端和文件系统；桌面 Agent 能操作*用户可以看到的一切*——电子表格、设计工具、带 GUI 的数据库客户端、内部管理后台。Agent 不再局限于代码，它可以驱动任何应用。
+
+### 移动端操控
+
+5 月 14 日的移动端操控预览将 Codex 会话接入 ChatGPT 手机端。用户可以：
+
+- 在手机上实时查看终端输出、文件 diff 和截图
+- 在会话中途批准或拒绝待执行的命令
+- 运行过程中切换模型，无需重启
+
+敏感数据留在宿主机上——手机端收到的是渲染后的视图，不是原始数据。这使 Codex 成为第一个支持从移动设备异步监管的主流编码 Agent：在工位启动任务，从口袋里审批操作。
+
+### Remote SSH
+
+Codex 获得了安全、持久的 SSH 隧道能力，可以在远程服务器上进行实时代码部署、诊断和环境管理，无需用户暴露端口或配置 VPN。结合 computer-use，Codex 可以在同一个会话中同时操作本地 GUI 应用*和*远程无头服务器。
+
+### Chronicle — 环境感知屏幕记忆
+
+Chronicle 是一个可选的研究预览功能（仅 macOS，ChatGPT Pro 订阅），弥合 Agent 记忆与用户在 Codex 会话之外所做操作之间的鸿沟。
+
+```
+How Chronicle works:
+  1. User grants macOS Screen Recording + Accessibility permissions
+  2. Sandboxed agents run in background
+  3. Agents periodically capture screen images
+  4. Recent activity is distilled into memories:
+     - Files being edited (in any application)
+     - Workflows observed (deploy scripts, CI dashboards)
+     - Tools used (Figma, Notion, Slack, terminal)
+  5. Memories augment the normal Codex memory store
+```
+
+Chronicle 的目标是提供用户永远不需要主动告知的上下文。与其让用户说"我用 Prisma 做数据库迁移、通过 GitHub Actions 部署"，不如让 Agent 观察到用户在跑 Prisma 命令、在查看 GitHub Actions 日志，然后自动存储这些事实。
+
+### Chronicle 的风险
+
+| 风险 | 详情 |
+|------|--------|
+| 速率限制消耗 | 后台 Agent 消耗 API 速率限制——Pro 订阅者可能比预期更快触及上限 |
+| Prompt 注入 | 屏幕内容是不受信任的输入。屏幕上显示的恶意网页或文档可能向 Chronicle 的记忆管道注入指令 |
+| 存储安全 | 记忆以未加密形式存储在设备上。任何有磁盘访问权限的人都能读取 |
+
+Chronicle 使用与其他 Memory 相同的模型，可通过 `consolidation_model` 配置。评估 Chronicle 的团队应权衡上下文收益与速率限制成本，以及将任意屏幕内容注入记忆管道带来的安全隐患。
+
+---
+
+## Hook 与扩展
+
+### 生命周期 Hook
+
+Codex 现在暴露了生命周期 Hook，允许外部系统观察和响应 Agent 行为：
+
+| Hook 事件 | 描述 |
+|-----------|-------------|
+| 子 Agent 启动/停止 | 子 Agent 创建或完成时触发 |
+| 工具执行 | 任意工具调用前/后触发 |
+| 轮次元数据 | 暴露轮次级别数据（token 用量、模型、耗时） |
+| 异步审批/轮次处理 | Agent 请求人工审批或完成一个轮次时触发 |
+
+### 更丰富的 Hook 上下文
+
+Hook 现在可以获取对话历史和子 Agent 身份信息：
+
+```
+Hook input for a tool execution event:
+  {
+    "event": "tool_execution",
+    "subagent_id": "worker-3",
+    "subagent_type": "worker",
+    "tool": "file_write",
+    "arguments": { "path": "src/api/auth.ts", ... },
+    "conversation_history": [ ... recent turns ... ],
+    "parent_agent_id": "manager-1"
+  }
+```
+
+身份感知的 Hook 让管理者 Agent（或外部编排器）能追踪各个子 Agent 的行为——它们调用了哪些工具、消耗了多少轮次、是否陷入重试死循环。这是多 Agent 系统的可观测性基础设施。
+
+### 扩展工具
+
+扩展可以注册自定义工具，与内置工具并列出现在 Agent 的工具列表中。扩展工具获得与 Hook 相同的丰富上下文：对话历史、子 Agent 身份和轮次元数据。这使得各种与 Agent 状态交互的集成成为可能——子 Agent 失败时发送 Slack 通知、追踪工具调用模式的指标收集器、根据子 Agent 角色阻止特定操作的策略引擎。
 
 ---
 
@@ -449,8 +565,21 @@ With subagents:
 │                                              │
 │  Memory Layer                                │
 │  ├── AGENTS.md (human-written, repo-level)   │
-│  ├── Memory Preview (auto-learned, user-level)│
+│  ├── Memory (SQLite-backed, user-level)      │
+│  ├── Versioned summaries (auto-rebuilt)       │
+│  ├── Chronicle (ambient screen memory)       │
 │  └── Scheduled work (auto-wake for future)   │
+│                                              │
+│  Desktop Agent Layer                         │
+│  ├── Computer-use (Mac + Windows)            │
+│  ├── Mouse/keyboard control of any app       │
+│  ├── Mobile steering (approve from phone)    │
+│  └── Remote SSH (persistent tunnels)         │
+│                                              │
+│  Hooks & Extensions Layer                    │
+│  ├── Lifecycle hooks (tool, subagent, turn)  │
+│  ├── Identity-aware context (subagent ID)    │
+│  └── Extension tools with full context       │
 │                                              │
 │  Compaction Layer                            │
 │  ├── Responses API compaction (server-side)  │
@@ -472,6 +601,6 @@ With subagents:
 └──────────────────────────────────────────────┘
 ```
 
-Codex 是对自身局限最坦诚的 Agent 系统。压缩端点让信息损失一目了然，子 Agent 架构提供了结构性的缓解方案。但根本挑战不变：Agent 在会话中学到的大部分东西，都会在会话结束或压缩时丢失。
+Codex 是对自身局限最坦诚的 Agent 系统，也是进化最快的。六周内从沙箱代码执行器变成了拥有环境感知屏幕记忆、远程服务器访问和移动端监管的桌面 Agent。压缩端点依然让信息损失一目了然，子 Agent 架构依然提供结构性的缓解方案。但 Codex *做什么*的边界已经远远超出了代码：它现在能操作用户可以触及的任何应用、任何文件、任何服务器。
 
-文件系统——AGENTS.md、进度文件、外部化状态——是唯一能完整扛住压缩的进化机制。对 Codex Agent 来说，写文件不是可选项，而是唯一持久的记忆。
+根本挑战不变——压缩是有损的，损失逐级累积。但版本化记忆摘要和 Chronicle 代表了一种新思路：与其试图保留会话中的一切，不如从持续观察中构建持久记忆。文件系统仍然是最可靠的进化机制。但 Memory、Chronicle 和 Hook 正在缩小 Agent 遗忘与留存之间的差距。

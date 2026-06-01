@@ -452,6 +452,115 @@ Embedding 存储在 Turbopuffer（基于 S3 的向量数据库）中。初始向
 
 ---
 
+## 自动化与自主执行（2026 年 5 月）
+
+2026 年初之前，Cursor 的 Agent 始终和用户紧密耦合：提出修改、等待审批、执行、重复。每一条 shell 命令、每一次 MCP 调用、每一次外部请求都需要用户显式授权。这保证了人类的控制权，但也带来了操作摩擦——老手花在点"允许"上的时间比审查输出还多。
+
+Cursor 3.5（5 月 20 日）和 3.6（5 月 29 日）发布了一系列功能，推动系统走向持续自主工作：更长的 Agent 运行时间、更少的审批提示、多仓库推理以及并行执行。
+
+### Auto-review 运行模式（Cursor 3.6，5 月 29 日）
+
+Auto-review 是一种新的运行模式，让 Agent 在工作时不必每次工具调用都停下来请求权限。它覆盖 Shell、MCP 和 Fetch 三类此前需要用户逐一批准的工具调用。
+
+系统采用三级分类器链：
+
+```
+Tool call intercepted
+  │
+  ├─→ Step 1: Allowlist check
+  │     Match in permissions.json allow_instructions?
+  │     → YES: Execute immediately
+  │     → NO: Continue to Step 2
+  │
+  ├─→ Step 2: Sandbox check
+  │     Can this call run in a sandbox?
+  │     (macOS, Linux, Windows/WSL2)
+  │     → YES: Execute in sandbox
+  │     → NO: Continue to Step 3
+  │
+  └─→ Step 3: LLM Classifier
+        Classifier decides:
+        → ALLOW: Execute
+        → TRY DIFFERENT APPROACH: Agent replans
+        → ASK USER: Fall back to approval prompt
+```
+
+在白名单中的调用零延迟执行。可沙箱化的调用在隔离环境中执行——即使命令有破坏性，沙箱也能防止文件系统或网络损害。其余一切交给 LLM 分类器，它根据命令本身、项目上下文和当前任务来评估风险。
+
+分类器通过 `permissions.json` 配置：
+
+```json
+{
+  "autoRun": {
+    "allow_instructions": "npm test, npm run build, git status, git diff",
+    "block_instructions": "rm -rf, sudo, curl | bash"
+  }
+}
+```
+
+`allow_instructions` 和 `block_instructions` 是自然语言描述，不是精确的命令匹配——分类器判断的是意图而非语法。这**不是安全边界**，分类器是非确定性的，只是一个尽力而为的便利层。安全关键的限制仍需使用 Cursor 现有的权限层级。
+
+### /loop 技能（Cursor 3.5，5 月 20 日）
+
+`/loop` 按本地计划反复执行 prompt，直到达到预期结果或用户手动停止：
+
+```
+/loop "Run the test suite every 5 minutes and fix any failures"
+/loop "Check if the staging deployment is healthy"
+/loop "Monitor the build output and alert me if it fails"
+```
+
+如果没有指定固定间隔，Agent 自行决定唤醒频率——无变化时拉长间隔，活跃工作期间加密检查。`/loop` 把 Agent 从请求-响应工具变成了后台监控者，解锁了此前只能手动完成的场景：持续修复失败测试、部署健康检查、定期维护任务。
+
+### 多仓库自动化（Cursor 3.5，5 月 20 日）
+
+自动化——Cursor 的无头 Agent 任务——现在支持多个仓库：
+
+| 之前（单仓库） | 之后（多仓库） |
+|----------------------|-------------------|
+| 一个自动化 = 一个仓库 | 一个自动化 = 多个仓库 |
+| 跨仓库工作需要人工协调 | Agent 跨所有关联仓库统一推理 |
+| 每个仓库各自测试/验证 | Agent 跨仓库完成交付、测试和验证 |
+
+一次自动化可以从共享库仓库读取代码、在服务仓库实现变更、在测试仓库更新集成测试——全在一轮运行中完成，具备完整的跨仓库上下文。
+
+无仓库自动化也是新功能：监控和报告类任务根本不需要代码库。一个自动化可以检查外部服务健康状况、汇总指标或生成报告，无需绑定任何仓库。
+
+自动化从浏览器界面迁移到了 IDE 内的 **Agents Window**。不用再切到浏览器标签页管理后台 Agent 了。
+
+### 并行计划执行
+
+"Build in Parallel" 功能识别 Agent 计划中的独立步骤，通过异步子 Agent 并发执行：
+
+```
+Plan with 6 steps:
+  Step 1: Update User model          ─┐
+  Step 2: Update Product model        ├─ Independent → run in parallel
+  Step 3: Update Order model          ─┘
+  Step 4: Update shared types         ← Depends on 1-3 → sequential
+  Step 5: Update API routes           ← Depends on 4 → sequential
+  Step 6: Update tests                ← Depends on 5 → sequential
+```
+
+步骤 1–3 改动的是互不相关的模块，同时执行。步骤 4–6 依赖先前结果，按顺序运行。系统从计划中自动识别这些依赖边。
+
+对于涉及大量独立模块的任务——大规模重构、迁移、给多个服务添加相同模式——并行执行按独立分支数量成比例地缩短实际耗时。
+
+### 基础设施更新
+
+支撑自主执行功能的配套更新：
+
+| 更新 | 作用 |
+|--------|-------------|
+| **Composer 2.5 模型** | 内部模型，针对持续工作和复杂多步指令调优 |
+| **环境版本历史** | 云端 Agent 环境现在支持回滚——Agent 搞坏东西可以恢复到任意历史状态 |
+| **审计追踪** | 每条 Agent 命令带时间戳记录；支持完整回放 |
+| **环境级 secret** | Secret 可限定到特定云端 Agent 环境，不仅限于用户/团队级别 |
+
+环境版本历史对自主工作尤其重要。当 Agent 无人监管地运行数小时，能回滚到已知良好状态这条安全网，才让更长时间的自主运行切实可行。
+
+---
+
 ## 总结：Cursor 的进化栈
 
 ```
@@ -476,6 +585,13 @@ Embedding 存储在 Turbopuffer（基于 S3 的向量数据库）中。初始向
 │  ├── 解决率从 52% 提升至 78%，纯靠规则                   │
 │  └── @cursor remember 用于直接教导                      │
 │                                                      │
+│  自动化与自主执行（2026 年 5 月）                        │
+│  ├── Auto-review：白名单 → 沙箱 → LLM 分类器            │
+│  ├── /loop：按计划反复执行 prompt                        │
+│  ├── 多仓库自动化，支持跨仓库推理                        │
+│  ├── 通过异步子 Agent 并行执行计划                       │
+│  └── 环境回滚 + 审计追踪                                │
+│                                                      │
 │  上下文引擎（基础设施）                                  │
 │  ├── Merkle 树变更检测                                  │
 │  ├── AST 分块（Tree-sitter）                            │
@@ -497,8 +613,11 @@ Cursor 的进化策略是分层的：
 | 规则（`.mdc`） | 人类（手动） | 开发者经验 |
 | 持续学习 | Agent（自动） | 会话记录 |
 | Bugbot 规则 | 系统（自动化） | 大规模真实用户反应 |
+|| 自动化 | Agent（自主） | 任务结果、测试结果、部署状态 |
 
-最底层——Bugbot 学习规则——是最重要的。它是唯一一个进化闭环完全跑通的生产系统：动作 → 反馈 → 策略更新 → 行为改变。本书涉及的其他系统要么依赖人工维护（CLAUDE.md），要么靠 Agent 自我评估（Hermes 15 次调用检查点），要么一直跑在静态规则上（大多数竞品）。
+最底层——Bugbot 学习规则——对*进化*最重要。它是唯一一个进化闭环完全跑通的生产系统：动作 → 反馈 → 策略更新 → 行为改变。本书涉及的其他系统要么依赖人工维护（CLAUDE.md），要么靠 Agent 自我评估（Hermes 15 次调用检查点），要么一直跑在静态规则上（大多数竞品）。
+
+2026 年 5 月的自动化层对*自主性*最重要。Auto-review、`/loop`、多仓库自动化和并行执行，共同推动 Cursor 从逐次审批模式迈向持续自主工作。Agent 现在可以跨多个仓库连续运行数小时，沙箱安全机制和环境回滚充当安全网。这套基础设施让进化功能形成*复利*——运行更久、触及更多代码的 Agent 会产生更多反馈信号，反馈注入 Bugbot 学习闭环，进而提升下一轮自主运行的表现。
 
 Bugbot 证明了信号门控的规则渐进提升在大规模环境下确实可行。解决率 26 个百分点的跃升（52% → 78%）来自规则，而非更好的模型。这是目前生产环境中 Agent 自进化能带来可衡量收益的最有力证据。
 

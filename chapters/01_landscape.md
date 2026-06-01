@@ -15,11 +15,11 @@ graph TD
 
 The differences are in **what** gets stored, **where** it lives, **how** it's retrieved, and **when** it triggers.
 
-This chapter maps the full product landscape as of April 2026, extracts the five mechanisms that every system uses, and places each product on a maturity spectrum — from manual memory files to experimental self-modification.
+This chapter maps the full product landscape as of May 2026, extracts the five mechanisms that every system uses, and places each product on a maturity spectrum — from manual memory files to experimental self-modification.
 
 ---
 
-## The Product Landscape (April 2026)
+## The Product Landscape (May 2026)
 
 Ten production agents. Ten different bets on how to make agents learn. Here is where they stand:
 
@@ -27,20 +27,20 @@ Ten production agents. Ten different bets on how to make agents learn. Here is w
 |---------|-----------|---------------|-------------|---------------|-------------------|
 | Claude Code | `CLAUDE.md` + auto memory in `~/.claude/projects/` | Yes (auto memory from sessions) | `.claude/skills/*.md` | No (proposed) | Compaction + `init.sh` |
 | Cursor | `.cursor/rules/` + `AGENTS.md` | Yes (continual-learning plugin) | `.cursor/skills/` | Yes (Bugbot: 44K+ rules, 110K repos) | LSP + sandbox |
-| Codex | `AGENTS.md` | Yes (memory preview) | Skills via plugins | No | Sandbox |
+| Codex | `AGENTS.md` | Yes (Chronicle ambient memory + memory preview) | Skills via plugins | No | Sandbox + hooks |
 | Hermes | `MEMORY.md` + `~/.hermes/skills/` | Yes (auto skill creation after tasks) | `SKILL.md` (agentskills.io) | No | Self-test in skills |
 | OpenClaw | `MEMORY.md` | Yes (Dream consolidation) | 13K+ ClawHub skills | Via self-improving-agent skill | Skill-dependent |
-| Copilot | Agentic memory (code-cited) | Yes (deduced from codebase) | No | No (`copilot-instructions.md` manual) | Citation validation |
-| Gemini CLI | `GEMINI.md` | Yes (memory manager subagent) | No | No | No |
+| Copilot | Agentic memory (code-cited, cross-agent) | Yes (deduced from codebase, citation-verified) | No | No (`copilot-instructions.md` manual) | Citation validation |
+| Gemini CLI | `GEMINI.md` (4-layer tiered) | Yes (auto memory from idle transcripts) | Yes (agent skills + `skill-creator`) | No | No |
 | Windsurf | `~/.codeium/windsurf/memories/` | Yes (auto-generated ~48hr index) | No | Via `.windsurf/rules/` | No |
-| Devin | Internal wiki (DeepWiki) | No (manual) | No | No | Yes (self-verification + auto-fix) |
+| Devin | Internal wiki (DeepWiki) + persistent memory | Yes (persistent memory across sessions) | No | No | Yes (self-verification + auto-fix + Auto Triage) |
 | Manus | Internal context | No (framework-level iteration) | No | No | Planner/Verifier agents |
 
 Three things jump out of this table:
 
-1. **Every product has some form of persistent memory.** The file format varies — markdown files, JSON stores, internal databases — but none of these agents start from zero every session.
-2. **Auto-learning is the new default.** Six of ten products now extract learnings from sessions without requiring user action. A year ago, only Hermes did this.
-3. **Skill systems and learned rules are rare.** Only three products have formal skill libraries. Only one — Cursor — operates learned rules at scale.
+1. **Every product has some form of persistent memory.** The file format varies — markdown files, JSON stores, internal databases — but none of these agents start from zero every session. Devin, previously the notable holdout, shipped persistent memory in May 2026.
+2. **Auto-learning is the new default.** Nine of ten products now extract learnings from sessions without requiring user action. A year ago, only Hermes did this. The May 2026 additions — Devin's persistent memory, Codex's Chronicle, Gemini CLI's auto memory — closed most remaining gaps.
+3. **Skill systems are proliferating but learned rules are still rare.** Four products now have formal skill libraries — Gemini CLI joined in 2026 with its agent skills system and `skill-creator` skill. Only one — Cursor — operates learned rules at scale.
 
 ---
 
@@ -60,12 +60,12 @@ Markdown files loaded at session start. The agent reads them, follows the instru
 | Hermes | `MEMORY.md`, `USER.md` | Agent | Fixed path relative to data directory |
 | OpenClaw | `MEMORY.md`, daily notes | Agent + Dreaming | Fixed path, daily notes per session |
 | Copilot | `copilot-instructions.md` | Human | Project root |
-| Gemini CLI | `GEMINI.md` | Human + Memory Manager | Project root + `~/.gemini/GEMINI.md` |
+| Gemini CLI | `GEMINI.md` (4 layers) | Human + Memory Manager + Auto Memory | `./GEMINI.md` → subdirectory `GEMINI.md` → private `MEMORY.md` → `~/.gemini/GEMINI.md` |
 | Windsurf | `~/.codeium/windsurf/memories/` | Agent (auto-generated) | Directory scan, ~48hr index cycle |
 
 This is the most universal mechanism. Every product supports it. The differences are in who writes (human vs. agent vs. both), how files are discovered (walk upward vs. fixed path vs. glob), and what budget limits apply.
 
-Claude Code's approach — walking upward from CWD and enforcing a 4K-per-file, 12K-total token budget — is the most engineered. Gemini CLI's approach — a memory manager subagent that decides what to persist — is the most autonomous. Cursor's approach — human-only authoring with activation conditions — is the most controlled.
+Claude Code's approach — walking upward from CWD and enforcing a 4K-per-file, 12K-total token budget — is the most engineered. Gemini CLI's approach is now the most layered: a 4-tier markdown system (`./GEMINI.md` → subdirectory files → private `MEMORY.md` → global `~/.gemini/GEMINI.md`) with an auto memory extractor that distills reusable skills from idle session transcripts. Cursor's approach — human-only authoring with activation conditions — is the most controlled.
 
 ### 2. Auto-Learning
 
@@ -77,8 +77,9 @@ The agent extracts learnings from sessions without the user doing anything. This
 | Cursor | Continual-learning plugin events | Code patterns, linting rules | Internal indexing pipeline |
 | Windsurf | Background process (~48hr cycle) | Code patterns, project context | `~/.codeium/windsurf/memories/` |
 | Copilot | Codebase analysis on repo open | Code conventions, architecture patterns | Agentic memory (code-cited) |
-| Gemini CLI | Memory manager subagent decisions | Key facts, preferences, project context | `GEMINI.md` updates |
-| Codex | Memory preview (experimental) | Task context, code patterns | Internal memory store |
+| Gemini CLI | Auto memory from idle transcripts + memory manager | Reusable skills, key facts, preferences | `GEMINI.md` updates, `/memory inbox` review |
+| Codex | Chronicle (ambient screen capture, opt-in) + memory preview | Application context, workflow patterns, code patterns | Dedicated SQLite databases |
+| Devin | Persistent memory across sessions | Project context, debugging patterns, team conventions | Internal persistent store |
 | Hermes | 15-call checkpoint + task completion | Skills, memory facts, user preferences | `MEMORY.md`, `SKILL.md` files |
 | OpenClaw | Dreaming process (idle consolidation) | Consolidated facts, pruned stale data | `MEMORY.md` (rewritten) |
 
@@ -87,6 +88,9 @@ The critical design question: **when does learning happen?**
 - **Hermes** learns mid-session (every 15 tool calls) — this catches patterns while they're fresh but costs tokens for self-evaluation.
 - **Claude Code** learns at session end — this is cheaper but misses patterns that span multiple sessions without explicit user correction.
 - **OpenClaw** learns during idle time (Dreaming) — this decouples learning from task execution but requires idle periods.
+- **Gemini CLI** learns from idle transcripts (auto memory) — similar to Dreaming, but extracts skills rather than consolidated facts, and surfaces them via `/memory inbox` for human review.
+- **Codex** now learns ambiently via Chronicle — opt-in screen captures that build memory from application context, not just coding sessions. This is the broadest learning surface of any production agent.
+- **Devin** crossed a significant threshold in May 2026 by shipping persistent memory across sessions — previously the only major agent without auto-learning.
 - **Windsurf** learns on a background timer (~48 hours) — this is the most hands-off but the most delayed.
 
 ### 3. Skill Libraries
@@ -97,12 +101,17 @@ Reusable procedures stored as structured documents or code. Retrieved by search 
 |---------|--------|---------|-----------|-------|
 | Hermes | `SKILL.md` (agentskills.io standard) | `~/.hermes/skills/` | FTS5 search on name + description | 200+ built-in |
 | OpenClaw | agentskills.io + ClawHub marketplace | Local + ClawHub CDN | FTS5 + dependency graph | 13K+ on ClawHub |
-| Claude Code | `.claude/skills/*.md` | Project directory | Name + description matching | User-created |
+| Claude Code | `.claude/skills/*.md` + plugin marketplace | Project directory + marketplace | Name + description matching | User-created + 2,810+ community skills |
 | Cursor | `.cursor/skills/` | Project directory | Glob + description matching | User-created |
+| Gemini CLI | Agent skills (markdown-based) | Project + user directories | Skill name matching | Built-in + user-created via `skill-creator` |
 
 The **agentskills.io standard** (shared by Hermes and OpenClaw) is the most mature format — YAML frontmatter with metadata, progressive disclosure (100 tokens for listing → 800 tokens for full content → 300 tokens for specific section), and a verification section that tells the agent how to test whether the skill worked.
 
-Claude Code and Cursor support skill-like files but without the progressive disclosure or verification infrastructure. They are closer to "long-form rules" than to the structured skill format.
+Claude Code's skill ecosystem exploded in May 2026. The official plugin marketplace (`anthropics/claude-plugins-official`) launched May 22, and community repositories now hold 2,810+ skills and 425+ plugins. Plugins bundle skills, agents, hooks, MCP servers, and slash commands. The hooks system (`SessionStart`, `PreToolUse`, `PostToolUse`, `MessageDisplay`) enables skills that enforce workflow discipline, not just provide information.
+
+Gemini CLI's agent skills system (launched January 2026, fully mature by May) takes a different approach: the `skill-creator` skill lets the agent generate new skills from successful task patterns, and auto memory extracts reusable skills from idle session transcripts. This gives Gemini CLI a closed loop from execution → extraction → skill creation.
+
+Cursor supports skill-like files but without the progressive disclosure or verification infrastructure. It is closer to "long-form rules" than to the structured skill format.
 
 ### 4. Learned Rules
 
@@ -170,8 +179,8 @@ graph LR
 | Level | What Happens | Products at This Level |
 |-------|-------------|----------------------|
 | **L1** Manual memory | User writes context files. Agent reads them. Learning is entirely human-driven. | All (every product supports manual context files) |
-| **L2** Auto memory | Agent extracts facts from sessions and persists them. User doesn't have to do anything. | Claude Code, Cursor, Windsurf, Copilot, Gemini CLI, Codex |
-| **L3** Skill accumulation | Agent creates reusable procedures — not just facts but multi-step workflows. | Hermes Agent, OpenClaw (ClawHub), Claude Code (`.claude/skills/`) |
+| **L2** Auto memory | Agent extracts facts from sessions and persists them. User doesn't have to do anything. | Claude Code, Cursor, Windsurf, Copilot, Gemini CLI, Codex, Devin |
+| **L3** Skill accumulation | Agent creates reusable procedures — not just facts but multi-step workflows. | Hermes Agent, OpenClaw (ClawHub), Claude Code (`.claude/skills/`), Gemini CLI (auto memory + `skill-creator`) |
 | **L4** Learned rules | Rules derived from aggregate real-world feedback, not individual sessions. | Cursor Bugbot (only production system with this at scale) |
 | **L5** Self-modification | Agent modifies its own capabilities, tools, or architecture. | OpenClaw (capability-evolver, self-evolve skills) — experimental, security warnings |
 
@@ -179,13 +188,13 @@ graph LR
 
 ```
 Level 1 ██████████  All 10 products
-Level 2 ██████      Claude Code, Cursor, Windsurf, Copilot, Gemini CLI, Codex
-Level 3 ███         Hermes, OpenClaw, Claude Code
+Level 2 ███████     Claude Code, Cursor, Windsurf, Copilot, Gemini CLI, Codex, Devin
+Level 3 ████        Hermes, OpenClaw, Claude Code, Gemini CLI
 Level 4 █           Cursor (Bugbot)
 Level 5 ░           OpenClaw (experimental — not production-stable)
 ```
 
-The jump from L1 to L2 happened in 2025 — most major products now auto-extract memory. The jump from L2 to L3 is where the field is today. L4 requires scale that only Cursor has. L5 is the frontier, with serious safety implications.
+The jump from L1 to L2 happened in 2025 and is now nearly universal — only Manus lacks auto-learning (by design, as a framework-level system). The jump from L2 to L3 is accelerating: Gemini CLI joined in early 2026 with auto memory that extracts skills from idle transcripts and a `skill-creator` skill that closes the loop. The May 2026 cluster of launches (Devin persistent memory, Codex Chronicle, Gemini CLI auto memory) shows L2 is table stakes. L4 requires scale that only Cursor has. L5 is the frontier, with serious safety implications.
 
 ---
 
@@ -217,7 +226,7 @@ Self-modification (L5) is powerful but dangerous. An agent that rewrites its own
 
 ## Cross-Cutting Patterns
 
-Three patterns appear across multiple mechanisms and multiple products:
+Four patterns appear across multiple mechanisms and multiple products:
 
 ### Pattern A: The Static/Dynamic Split
 
@@ -263,27 +272,47 @@ The trend across 2025-2026 is clear: agents that check their own work outperform
 
 Cursor's shadow workspace (2024, infrastructure validates) was replaced by LSP-based self-verification (2025, agent verifies). Devin's self-verification loop has been core since launch. Claude Code now proactively runs tests before returning results.
 
+Copilot introduced a new verification pattern in May 2026: **citation-backed memory with real-time verification**. Stored facts include citations to their source code, and the agent verifies facts against the current codebase before using them. This is not self-verification of *output* but self-verification of *memory* — the agent checks that what it "remembers" is still true. Cross-agent memory (code review agent and coding agent sharing facts) makes the verification surface broader.
+
 The direction is universal: push verification earlier, make the agent responsible for correctness, use the same tools a human developer would use.
+
+### Pattern D: Community-Authored Methodology
+
+A new pattern emerged in May 2026 that doesn't fit neatly into memory, skills, or learned rules: **third-party methodology enforcement across agents**.
+
+**Superpowers** (`obra/superpowers`, 213K+ GitHub stars, 476K+ installs) is the exemplar. It is not a memory system or a skill library — it is a workflow discipline layer that forces agents through a structured development process: brainstorming → design approval → git worktrees → writing plans → subagent-driven development with two-stage review → strict TDD (RED-GREEN-REFACTOR) → code review → finishing/merge/cleanup.
+
+Key mechanisms:
+- **SessionStart hooks** force skill execution at session initialization — the agent cannot opt out.
+- The **"1% rule"**: if there's even a 1% chance a skill applies, the agent must invoke it. This inverts the typical "load on demand" pattern into "load unless you can prove irrelevance."
+- **Cross-platform portability**: works across Claude Code, Codex CLI, Cursor, Gemini CLI, Copilot CLI, OpenCode, and Factory Droid. The same methodology file constrains different agents on different platforms.
+- Skills can set `disallowed-tools` in frontmatter, restricting what the agent is allowed to do — methodology as capability restriction.
+
+This represents a new evolution mechanism: community-authored discipline that neither comes from the base model, the agent's own learning, nor the product platform. It is imposed by third-party practitioners who package their engineering practices as executable constraints. The Claude Code plugin ecosystem (2,810+ skills, 425+ plugins) and the hooks system (`SessionStart`, `PreToolUse`, `PostToolUse`, `MessageDisplay`) provide the infrastructure. A Snyk audit found 13% of agent-skills packages had critical security flaws — the trust and safety implications of this pattern are unresolved.
 
 ---
 
 ## What's Missing
 
-Two patterns are **not yet** in production at scale:
+Two patterns are **not yet** fully realized in production, though both saw significant progress in May 2026:
 
 ### Cross-User Learning
 
-No production agent currently learns from one user's experience and applies it to another user's sessions. Each user's `CLAUDE.md` and `MEMORY.md` files are private. ClawHub's skill marketplace is the closest thing — users share skills explicitly — but the agent doesn't automatically extract and share successful patterns.
+No production agent automatically learns from one user's experience and applies it to another user's sessions. Each user's `CLAUDE.md` and `MEMORY.md` files are private.
 
-**Why it's missing:** Privacy (users don't want their workflows shared), safety (one user's solutions might break another's setup), and liability (whose fault is it when a shared skill causes damage?). Cursor Bugbot gets close — it aggregates signal across repos — but the learned rules are generic coding patterns, not user-specific workflows.
+However, the gap is narrowing. The Claude Code plugin ecosystem (2,810+ skills, 425+ plugins as of May 2026) and cross-platform frameworks like Superpowers (476K+ installs) represent **explicit community-mediated cross-user learning** — practitioners encode successful patterns as skills and share them via marketplaces. Copilot's cross-agent memory (code review and coding agents sharing facts within a single user's scope) is another step, though still user-private.
+
+**Why full automation is missing:** Privacy (users don't want their workflows shared), safety (one user's solutions might break another's setup), and liability (whose fault is it when a shared skill causes damage?). Cursor Bugbot gets close — it aggregates signal across repos — but the learned rules are generic coding patterns, not user-specific workflows.
 
 ### Autonomous Experimentation
 
 Hermes and OpenClaw detect capability gaps, but the experimentation step is still agent-within-session — the agent tries things in the current conversation. No production system runs background experiments: "I noticed I struggle with Kubernetes configs. Let me practice on some sample configs overnight and create skills."
 
-**Why it's missing:** Cost (running experiments costs tokens), safety (unsupervised agent experimentation is risky), and measurement (how do you know if the experiment succeeded without human evaluation?).
+This gap is partially closing. Codex's Chronicle builds ambient memory from screen captures without explicit agent action. Gemini CLI's auto memory extracts skills from idle session transcripts — not experimentation, but unsupervised learning from past behavior. Devin's persistent memory means patterns discovered in one session carry forward, reducing the need to re-learn. The Agentic Harness Engineering paper (arXiv:2604.25850) demonstrates automated harness evolution — 69.7% → 77.0% on Terminal-Bench 2 over 10 iterations — by evolving prompts, tools, and middleware while keeping the base model fixed. This is not yet in a shipped consumer product, but it shows the path.
 
-OpenClaw's Dreaming process is a step toward autonomous experimentation — it reorganizes memory during idle time. But true cross-user learning and autonomous experimentation remain open problems. Chapter 12 explores where these might go.
+**Why full experimentation is missing:** Cost (running experiments costs tokens), safety (unsupervised agent experimentation is risky), and measurement (how do you know if the experiment succeeded without human evaluation?).
+
+True cross-user learning and autonomous experimentation remain open problems. Chapter 12 explores where these might go.
 
 ---
 

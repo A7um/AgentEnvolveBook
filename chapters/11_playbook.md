@@ -59,8 +59,9 @@ From production data across Claude Code, Codex, and Cursor:
 |--------|------|------------|
 | Claude Code | `CLAUDE.md` | Yes (discovered by walking CWD upward) |
 | Codex | `AGENTS.md` | Yes (fixed path at repo root) |
-| Gemini | `GEMINI.md` | Yes (repo root) |
+| Gemini CLI | `GEMINI.md` | Yes (repo root); also tiered: `~/.gemini/GEMINI.md` (global) + per-project |
 | Cursor | `.cursor/rules/*.mdc` | Yes (glob-matched or always-apply) |
+| Copilot | `.github/copilot-instructions.md` + global `.agent.md` | Yes (repo-level + cross-workspace) |
 | All agents | `README.md` | Usually included in context by default |
 
 If your team uses multiple AI tools, maintain parallel files or use a single `AGENTS.md` (the most tool-agnostic name).
@@ -79,6 +80,65 @@ Both Claude Code and Codex offer (or propose) an `/init` command that auto-gener
 ```
 
 If your tool doesn't have `/init`, manually create the file. The 30 minutes you spend is repaid across every future session.
+
+---
+
+## Level 1.5: Community Methodology Enforcement (Day 2)
+
+**Effort:** 1 hour. **Impact:** Forces structured workflows from the first session.
+
+A new evolution vector emerged in early 2025 and matured by mid-2026: the agent doesn't learn methodology from experience — it's **given** a methodology by the community. Superpowers (213K+ stars, 476K+ installs by May 2026) is the leading example, but the pattern is platform-agnostic.
+
+### Hooks vs. Skills: Two Primitives
+
+Community-authored methodology enforcement relies on two complementary primitives:
+
+| Primitive | Type | When It Fires | Example |
+|-----------|------|---------------|---------|
+| Hook | Deterministic | At lifecycle events (start, stop, pre-commit, post-test) | "Before committing, run the linter" |
+| Skill | Probabilistic | When the model matches the skill to the current task | "When writing a React component, follow this pattern" |
+
+Hooks guarantee execution — the agent *must* run them at the specified event. Skills are advisory — the model decides when they're relevant. The combination is powerful: hooks enforce non-negotiable workflow steps while skills provide context-sensitive guidance.
+
+### The Superpowers Pattern
+
+Superpowers enforces a seven-phase development workflow through a combination of hooks and skills:
+
+```
+Phase 1: Brainstorming     ← Skill activation
+Phase 2: Design            ← Skill activation
+Phase 3: Planning          ← Skill activation  
+Phase 4: Implementation    ← Subagent-driven development
+Phase 5: TDD               ← Hook: tests must pass before proceeding
+Phase 6: Code Review       ← Skill activation + hook
+Phase 7: Finishing          ← Hook: cleanup checks
+```
+
+The "1% rule" is a key design choice: skills are activated even when the model's confidence that they're relevant is as low as 1%. This forces the agent into the structured workflow even when it would otherwise skip steps. The trade-off: occasional false activations vs. guaranteed methodology adherence.
+
+### Cross-Platform Compatibility
+
+The same methodology package works across multiple agent platforms:
+
+| Platform | Hook Mechanism | Skill Mechanism |
+|----------|---------------|-----------------|
+| Claude Code | `hooks` in settings.json | `.claude/skills/*.md` |
+| Codex CLI | Pre/post-task hooks | `AGENTS.md` inline skills |
+| Cursor | `.cursor/rules/*.mdc` with lifecycle triggers | Rule files with glob matching |
+| Gemini CLI | `GEMINI.md` workflow sections | `/memory` skill entries |
+| Copilot CLI | `.agent.md` workflow definitions | Instruction files |
+
+This cross-platform reach means a team can enforce the same methodology regardless of which agent individual developers prefer.
+
+### When to Use This Level
+
+Level 1.5 sits between filesystem memory and auto-learning because it requires no learning infrastructure — you install a package and the methodology is enforced immediately. It's particularly valuable for:
+
+- **Teams with junior developers** using agents for the first time
+- **Codebases where skipping tests or reviews is costly**
+- **Organizations standardizing on a development methodology** across multiple agent tools
+
+The risk: over-constrained agents that follow the methodology even when the task doesn't warrant it. A one-line config fix doesn't need seven phases. Good methodology packages include escape hatches for trivial tasks.
 
 ---
 
@@ -161,6 +221,54 @@ Citations serve two purposes:
 
 Copilot also implements **28-day validation**: memories that haven't been confirmed by new evidence in 28 days are demoted or removed. This prevents stale memories from accumulating.
 
+### Devin Approach: Persistent Memory + Auto Triage
+
+Devin's persistent memory (shipped May 2026) addresses what Chapter 10 identified as its critical gap: no cross-session learning. The system combines two mechanisms:
+
+- **Auto Triage:** Classifies incoming tasks against historical patterns and routes them to the appropriate workflow before execution begins
+- **Persistent memory:** Facts, preferences, and project context survive across sessions and inform future task execution
+
+The significance: Devin was the only major production agent without cross-session learning. Its addition confirms that persistent memory has become table stakes — every major agent now has it.
+
+### Codex Chronicle: Ambient Memory from Screen Captures
+
+Codex Chronicle introduces a novel form of passive learning: it captures periodic screenshots of the developer's screen and extracts contextual information:
+
+```
+Screen capture (every N minutes during active development)
+  ↓
+OCR + visual analysis:
+  - IDE state: open files, cursor position, visible errors
+  - Terminal output: build results, test failures
+  - Browser tabs: documentation being consulted
+  ↓
+Context extraction:
+  - "Developer frequently references the Stripe API docs"
+  - "Build failures consistently involve the auth module"
+  - "Developer switches between these 3 files for this feature"
+```
+
+This is a new category of learning signal — the agent learns not just from its own actions but from *observing the developer's workflow*. The privacy implications are significant and Codex Chronicle requires explicit opt-in.
+
+### Gemini CLI Approach: Auto Memory from Session Transcripts
+
+Gemini CLI's auto memory extracts skills and facts from session transcripts after each interaction:
+
+```
+Session ends
+  ↓
+Transcript analysis:
+  - Extract reusable procedures ("how to deploy to staging")
+  - Extract corrections ("actually use yarn, not npm")
+  - Extract project facts ("the API rate limit is 100/min")
+  ↓
+/memory inbox:
+  - User reviews extracted memories before they become active
+  - Accept, reject, or edit each extracted memory
+```
+
+The `/memory inbox` pattern is a deliberate middle ground between fully automatic memory (Windsurf, ~78% accuracy) and fully manual memory (Level 1). The agent does the extraction work; the human approves the results. This achieves high accuracy without requiring the human to write memories from scratch.
+
 ### Comparison
 
 | System | Auto-learns | Accuracy | Limit | User can edit | Staleness handling |
@@ -169,6 +277,9 @@ Copilot also implements **28-day validation**: memories that haven't been confir
 | Claude Code | During session | ~90% | 200 lines / 25KB | Yes | Auto-prune oldest |
 | Windsurf | Background | ~78% | None | Limited | None |
 | Copilot | With citations | ~92% | Not published | Yes | 28-day validation |
+| Devin | Auto Triage + persistent | ~90% | Not published | Yes | Task-driven refresh |
+| Gemini CLI | Post-session + inbox review | ~95% (human-gated) | Not published | Yes (/memory inbox) | Manual review |
+| Codex Chronicle | Ambient screen capture | ~85% | Not published | Yes | Recency-weighted |
 
 ---
 
@@ -229,6 +340,40 @@ Popular skills by downloads:
 ```
 
 The marketplace model means agents don't need to learn everything from scratch. A new Hermes instance can install community skills for common tasks and only create custom skills for project-specific workflows.
+
+### Gemini CLI Approach: Skill Extraction from Sessions
+
+Gemini CLI includes a `skill-creator` skill — a meta-skill that generates new skills from session transcripts:
+
+```
+User completes a multi-step task
+  ↓
+skill-creator analyzes the transcript:
+  - Identifies reusable multi-step procedures
+  - Extracts error-recovery patterns
+  - Captures tool-call sequences that worked
+  ↓
+Generates a skill in agentskills.io format
+  ↓
+Skill appears in /memory inbox for user review
+```
+
+This closes the loop between Level 2 (auto-learning) and Level 3 (skill accumulation): the agent automatically promotes repeated procedures from memory entries into structured skills. The human review step prevents low-quality skills from accumulating.
+
+### Superpowers: Community-Provided Skills at Scale
+
+Not all skills need to be learned from experience. Superpowers (213K+ stars by May 2026) and similar frameworks represent a different path: **community-authored skills installed as packages**.
+
+| Source | Skills Available | Growth Model |
+|--------|-----------------|-------------|
+| Claude Code marketplace | 2,810+ skills, 425+ plugins | Official + community |
+| ClawHub | 13,000+ skills | Community |
+| Superpowers | Bundled methodology skills | Curated framework |
+| Gemini CLI | Generated via skill-creator | Per-user + shared |
+
+The insight: individual agents shouldn't learn everything from scratch. A new agent instance can install community skills for common tasks (deployment, testing, CI/CD) and reserve autonomous skill creation for project-specific workflows.
+
+The distinction from Level 1.5: Superpowers at Level 1.5 enforces *methodology* (how to work). Skills at Level 3 encode *procedures* (how to do specific tasks). Both can come from the community, but they serve different purposes.
 
 ### The agentskills.io Standard
 
@@ -394,12 +539,39 @@ No production system has solved this trade-off. The safe path: run Levels 1-4 we
 
 ---
 
+## What to Avoid: The Skills Security Problem
+
+The rapid growth of agent-skills ecosystems has outpaced security practices. A May 2026 Snyk audit of public agent-skills packages found that **13% contained critical security flaws** — dependency vulnerabilities, hardcoded secrets, or code execution paths that bypass sandboxing.
+
+### The Attack Surface
+
+| Vector | Risk | Example |
+|--------|------|---------|
+| Malicious skill in marketplace | Skill executes arbitrary code with agent permissions | A "docker-cleanup" skill that exfiltrates `.env` files |
+| Prompt injection via skill content | Skill text contains hidden instructions that override agent behavior | Skill description embeds "ignore previous instructions" payload |
+| Supply-chain dependency | Skill depends on a compromised npm/pip package | Legitimate skill pulls a trojanized dependency |
+| Over-permissive hooks | Hook fires on every lifecycle event with full filesystem access | Pre-commit hook reads and transmits SSH keys |
+| The "1% rule" as attack surface | Low activation thresholds mean malicious skills fire even when barely relevant | Methodology skill activates on unrelated tasks to inject instructions |
+
+### Defensive Practices
+
+1. **Audit before install.** Read the skill source. Community-authored skills are code — treat them like any third-party dependency.
+2. **Pin versions.** Don't auto-update skills. A benign skill can become malicious after a maintainer account is compromised.
+3. **Sandbox skill execution.** Skills that execute commands should run in containers or restricted shells with no access to credentials.
+4. **Prefer official marketplaces.** Claude Code's official marketplace and curated skill sets have review processes. Unvetted community sources do not.
+5. **Monitor skill behavior.** Log what skills do when they activate. Unexpected network calls, file reads outside the project, or credential access are red flags.
+
+The 13% critical flaw rate is an ecosystem problem, not a per-agent problem. As skills become the primary distribution mechanism for agent capabilities, the security posture of the skills ecosystem becomes as important as the security of the agents themselves.
+
+---
+
 ## The Decision Matrix
 
 | Your Situation | Start With | Then Add | Timeline |
 |---------------|-----------|---------|----------|
 | Solo developer, one project | CLAUDE.md + auto memory (Level 1-2) | Skills after 1 month of regular use | Day 1 → Month 1 |
-| Team, shared repo | AGENTS.md + Cursor continual-learning (Level 1-2) | Bugbot-style learned rules if volume supports it | Day 1 → Month 3+ |
+| Team, shared repo | AGENTS.md + Superpowers methodology (Level 1-1.5) | Bugbot-style learned rules if volume supports it | Day 1 → Month 3+ |
+| Multi-tool team | AGENTS.md + methodology enforcement (Level 1-1.5) | Cross-platform skills + auto-learning | Day 1 → Month 1 |
 | Personal assistant agent | Hermes MEMORY.md + SKILL.md (Level 1-3) | Honcho user modeling for deep personalization | Week 1 → Month 3 |
 | Custom agent product | Filesystem memory + auto extraction (Level 1-2) | Skill library + feedback-driven rules | Day 1 → Month 6 |
 | Research / experimental | All above levels | Self-modification with full safety measures (Level 5) | Month 6+ |
@@ -415,8 +587,9 @@ Start with Level 1. It takes 30 minutes and provides more value per token than a
 | Level | Setup Cost | Ongoing Cost | Failure Mode | Recovery |
 |-------|-----------|-------------|-------------|----------|
 | 1: Filesystem Memory | 30 min | ~0 (human edits) | Stale entries | Edit the file |
+| 1.5: Methodology Enforcement | 1 hour | ~0 (community maintains) | Over-constrained workflow | Disable or tune activation thresholds |
 | 2: Auto-Learning | 1-4 hours | Tokens for extraction | Noisy/wrong entries | Prune + cap |
-| 3: Skill Accumulation | Days | Tokens for creation + storage | Skills drift from reality | Edit/delete skills |
+| 3: Skill Accumulation | Days | Tokens for creation + storage | Skills drift from reality; **13% of community packages have security flaws** | Edit/delete skills; audit before install |
 | 4: Learned Rules | Weeks | Infrastructure + monitoring | Rules that reduce quality | Demotion mechanism |
 | 5: Self-Modification | Months | Security infrastructure | Unsafe mutations | Git rollback |
 
